@@ -82,10 +82,10 @@ void MX_RTC_Init(void)
   /* USER CODE BEGIN RTC_Init 2 */
   HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
 
-  // 3600 секунд = 1 час, LSE 32.768 кГц, предделители уже настроены
-  // Используем RTC_WAKEUPCLOCK_CK_SPRE_16BITS (1 сек шаг)
+  // LSE 32.768 кГц, предделители уже настроены -> RTC_WAKEUPCLOCK_CK_SPRE_16BITS даёт шаг 1 сек.
+  // Интервал задан в rtc.h (RTC_WAKEUP_INTERVAL_SEC) — сейчас тестовое значение, для поля переключить на 3600.
   if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc,
-                                  /*3600*/10,
+                                  RTC_WAKEUP_INTERVAL_SEC,
                                   RTC_WAKEUPCLOCK_CK_SPRE_16BITS) != HAL_OK)
   {
       Error_Handler();

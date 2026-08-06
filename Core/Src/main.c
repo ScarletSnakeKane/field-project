@@ -47,6 +47,14 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+/* TEST-ONLY: deliberate hold-awake window after each sample, so STOP-mode current
+ * is easy to see as a clean step on an ammeter/scope, and to leave a window for
+ * ST-Link access without needing a reset-based connect. Remove/shrink for production. */
+#define TEST_AWAKE_HOLD_MS   10000U
+
+/* Время на стабилизацию питания датчиков (AHT20/DS18B20/почва) после включения PA0. */
+#define SENSOR_POWERUP_DELAY_MS   500U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -163,7 +171,7 @@ int main(void)
       res = f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE);
       if (res == FR_OK)
       {
-          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum\r\n", &file);
+          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum,usb_state,aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms,t_sensors_ms,t_write_ms,aht_status\r\n", &file);
           f_close(&file);
       }
   }
@@ -212,17 +220,73 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   uint8_t usb_mode = 0;
+  uint32_t last_write_ms = 0;   /* TEST-ONLY: длительность записи в флеш прошлого цикла */
   while (1)
   {
-	  HAL_Delay(5000);
+	  /* --- уход в сон: STOP mode, будим только по RTC Wakeup Timer ---
+	   * Таймер перевзводим заново перед каждым входом в STOP, чтобы длительность сна
+	   * была стабильной (RTC_WAKEUP_INTERVAL_SEC) каждый цикл, а не "плавала" от фазы
+	   * свободно бегущего таймера относительно переменной длины активной фазы. */
+	  HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+	  HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, RTC_WAKEUP_INTERVAL_SEC, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+
+	  HAL_SuspendTick();
+	  HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+	  /* --- пробуждение: ядро на HSI без PLL, обязательно поднять клоки прежде чем
+	   * трогать что-либо ещё (I2C/SPI/ADC/DWT-задержки зависят от реальной частоты) --- */
+	  SystemClock_Config();
+	  HAL_ResumeTick();
+
+	  uint32_t t_wake = HAL_GetTick();   /* TEST-ONLY: засекаем длительность активной фазы */
+
+	  /* --- включаем датчики (PA0 = LOW) --- */
+	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+	  HAL_Delay(50);   /* минимальная пауза на нарастание питания перед опросом шины */
+
+	  /* Датчик на шине I2C1 только что был полностью обесточен. Жёстко сбрасываем саму
+	   * периферию I2C1 через RCC перед повторным использованием — иначе она может остаться
+	   * в залипшем BUSY-состоянии после неудачной транзакции прошлого цикла и больше
+	   * никогда не восстановиться сама (обычный DeInit/Init этого не гарантирует). */
+	  HAL_I2C_DeInit(&hi2c1);
+	  __HAL_RCC_I2C1_FORCE_RESET();
+	  __HAL_RCC_I2C1_RELEASE_RESET();
+	  MX_I2C1_Init();
+
+	  /* Ждём, пока AHT20 реально начнёт подтверждать свой адрес на шине, вместо слепой
+	   * фиксированной паузы. aht_ready_ms — сколько мс от подачи питания это заняло
+	   * (9999 = так и не ответил за отведённое время). */
+	  uint32_t t_power_on = HAL_GetTick();
+	  uint16_t aht_ready_ms = 9999;
+	  for (uint16_t i = 0; i < 80; i++)   /* до ~2 секунд ожидания */
+	  {
+	      if (HAL_I2C_IsDeviceReady(&hi2c1, AHT20_ADDR, 1, 10) == HAL_OK)
+	      {
+	          aht_ready_ms = (uint16_t)(HAL_GetTick() - t_power_on);
+	          break;
+	      }
+	      HAL_Delay(25);
+	  }
+
+	  /* AHT20 теряет калибровку при каждом отключении питания — обязательно
+	   * заново инициализировать после каждого включения PA0, иначе показания мусорные. */
+	  HAL_StatusTypeDef aht_init_st = AHT20_Init(&hi2c1);
+
+	  uint8_t aht_status = 0;   /* TEST-ONLY: бит 0x08 = откалиброван, 0x80 = занят */
+	  AHT20_ReadStatusByte(&hi2c1, &aht_status);
 
 	  uint8_t usb_state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_9);  // 0 или 1
 
 	  AHT20_Data aht;
-	  if (AHT20_ReadData(&hi2c1, &aht) != HAL_OK)
+	  uint32_t aht_i2c_err = 0;
+	  /* TEST-ONLY: диагностика чередующихся сбоев AHT20 — код ошибки I2C пишем в CSV,
+	   * чтобы понять, что именно происходит на "провальных" циклах. Убрать после отладки. */
+	  HAL_StatusTypeDef aht_read_st = AHT20_ReadData(&hi2c1, &aht);
+	  if (aht_read_st != HAL_OK)
 	  {
 	      aht.temperature = 0.0f;
 	      aht.humidity    = 0.0f;
+	      aht_i2c_err = HAL_I2C_GetError(&hi2c1);
 	  }
 
 	  float soil_temp;
@@ -234,23 +298,46 @@ int main(void)
 	  char ts[32];
 	  Time_GetTimestamp(ts, sizeof(ts));
 
+	  uint32_t t_sensors_ms = HAL_GetTick() - t_wake;   /* TEST-ONLY */
+
 	  FIL file;
 	  res = f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE);
 	  if (res == FR_OK)
 	  {
-	      char line[160];
+	      char line[224];
+	      /* TEST-ONLY: хвостовые поля — диагностика сбоев AHT20 и профиль времени цикла:
+	       *   aht_ready_ms  — через сколько мс после подачи питания датчик ответил (9999 = не ответил)
+	       *   t_sensors_ms  — время от пробуждения до записи (I2C + DS18B20 + ADC)
+	       *   t_write_ms    — сколько заняла запись в флеш на ПРОШЛОМ цикле
+	       * Убрать вместе с соответствующей логикой после отладки. */
 	      snprintf(line, sizeof(line),
-	               "%s,%.2f,%.2f,%.2f,%.2f,%d\r\n",
+	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%lu,%u,%lu,%lu,0x%02X\r\n",
 	               ts,
 	               aht.temperature,
 	               aht.humidity,
 	               soil_temp,
 	               soil_hum,
-	               usb_state);   // ← добавили состояние PA9
+	               usb_state,   // ← добавили состояние PA9
+	               (int)aht_init_st,
+	               (int)aht_read_st,
+	               (unsigned long)aht_i2c_err,
+	               (unsigned)aht_ready_ms,
+	               (unsigned long)t_sensors_ms,
+	               (unsigned long)last_write_ms,
+	               (unsigned)aht_status);
 
+	      uint32_t t_w0 = HAL_GetTick();
 	      f_puts(line, &file);
 	      f_close(&file);
+	      last_write_ms = HAL_GetTick() - t_w0;
 	  }
+
+	  /* --- выключаем датчики перед сном (PA0 = HIGH) --- */
+	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
+
+	  /* TEST-ONLY: держим МК бодрствующим ещё TEST_AWAKE_HOLD_MS перед следующим STOP —
+	   * см. TEST_AWAKE_HOLD_MS выше. */
+	  HAL_Delay(TEST_AWAKE_HOLD_MS);
 	}
     /* USER CODE END WHILE */
 

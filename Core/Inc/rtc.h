@@ -36,6 +36,10 @@ extern RTC_HandleTypeDef hrtc;
 
 /* USER CODE BEGIN Private defines */
 
+/* Periodic sensor-sample wake interval, in seconds (RTC_WAKEUPCLOCK_CK_SPRE_16BITS = 1s ticks).
+ * TEST value for bench-measuring STOP-mode current — switch to 3600 (1 hour) for field deployment. */
+#define RTC_WAKEUP_INTERVAL_SEC   15U
+
 /* USER CODE END Private defines */
 
 void MX_RTC_Init(void);

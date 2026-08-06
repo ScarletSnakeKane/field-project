@@ -12,5 +12,6 @@ typedef struct {
 
 HAL_StatusTypeDef AHT20_Init(I2C_HandleTypeDef *hi2c);
 HAL_StatusTypeDef AHT20_ReadData(I2C_HandleTypeDef *hi2c, AHT20_Data *out);
+HAL_StatusTypeDef AHT20_ReadStatusByte(I2C_HandleTypeDef *hi2c, uint8_t *status);
 
 #endif
