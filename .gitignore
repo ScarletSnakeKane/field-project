@@ -1,0 +1,17 @@
+# STM32CubeIDE build output
+Debug/
+Release/
+
+# Common build artifacts (in case of alternate build dirs)
+*.o
+*.d
+*.elf
+*.map
+*.list
+*.bin
+*.hex
+*.su
+
+# OS cruft
+Thumbs.db
+.DS_Store
