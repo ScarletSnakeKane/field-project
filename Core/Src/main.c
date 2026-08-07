@@ -68,6 +68,7 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 FRESULT res;
 static BYTE work[4096];
 FIL file;
+static uint8_t lse_ok = 0;   /* запустился ли LSE-кварц (иначе метки времени врут) */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -123,16 +124,14 @@ int main(void)
   MX_I2C1_Init();
   MX_SPI1_Init();
   MX_RTC_Init();
-  if (__HAL_RCC_GET_FLAG(RCC_FLAG_LSERDY) == RESET)
-  {
-      // LSE НЕ запустился → RTC работает на LSI → время будет неправильным
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET); // просто маркер
-  }
+  // LSE НЕ запустился → RTC не на кварце → метки времени будут неправильными.
+  // Раньше это "помечалось" записью в PA0, но там теперь вход кнопки — пишем флаг в CSV.
+  lse_ok = (__HAL_RCC_GET_FLAG(RCC_FLAG_LSERDY) != RESET) ? 1U : 0U;
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
-  // Включаем питание датчиков (PA0 = LOW)
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+  // Включаем питание датчиков (LOW)
+  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
 
   // === 0) Один раз выставляем время, если календарь ещё не инициализирован ===
   if (__HAL_RTC_IS_CALENDAR_INITIALIZED(&hrtc) == 0U)
@@ -171,7 +170,7 @@ int main(void)
       res = f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE);
       if (res == FR_OK)
       {
-          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum,usb_state,aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms,t_sensors_ms,t_write_ms,aht_status\r\n", &file);
+          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum,usb_state,aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms,t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err\r\n", &file);
           f_close(&file);
       }
   }
@@ -182,7 +181,7 @@ int main(void)
   }
 
   // === Первое чтение и запись при старте ===
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
   HAL_Delay(200); // дать датчикам стабилизироваться
 
   AHT20_Data aht;
@@ -240,8 +239,8 @@ int main(void)
 
 	  uint32_t t_wake = HAL_GetTick();   /* TEST-ONLY: засекаем длительность активной фазы */
 
-	  /* --- включаем датчики (PA0 = LOW) --- */
-	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+	  /* --- включаем датчики (LOW) --- */
+	  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
 	  HAL_Delay(50);   /* минимальная пауза на нарастание питания перед опросом шины */
 
 	  /* Датчик на шине I2C1 только что был полностью обесточен. Жёстко сбрасываем саму
@@ -277,6 +276,10 @@ int main(void)
 
 	  uint8_t usb_state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_9);  // 0 или 1
 
+	  /* Кнопка KEY: нажата = 0 (замкнута на GND). Пока только читаем и логируем,
+	   * чтобы убедиться в распиновке до того, как вешать на неё EXTI. */
+	  uint8_t btn = HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin);
+
 	  AHT20_Data aht;
 	  uint32_t aht_i2c_err = 0;
 	  /* TEST-ONLY: диагностика чередующихся сбоев AHT20 — код ошибки I2C пишем в CSV,
@@ -292,6 +295,7 @@ int main(void)
 	  float soil_temp;
 	  	  if (!DS18B20_ReadTemp(GPIOA, GPIO_PIN_8, &soil_temp))
 	  	      soil_temp = NAN; // датчик не ответил или CRC не сошёлся
+	  uint8_t ds_err = (uint8_t)DS18B20_LastError();   /* TEST-ONLY: причина отказа 1-Wire */
 
 	  float soil_hum  = Soil_ReadMoisture();
 
@@ -311,7 +315,7 @@ int main(void)
 	       *   t_write_ms    — сколько заняла запись в флеш на ПРОШЛОМ цикле
 	       * Убрать вместе с соответствующей логикой после отладки. */
 	      snprintf(line, sizeof(line),
-	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%lu,%u,%lu,%lu,0x%02X\r\n",
+	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u\r\n",
 	               ts,
 	               aht.temperature,
 	               aht.humidity,
@@ -324,7 +328,10 @@ int main(void)
 	               (unsigned)aht_ready_ms,
 	               (unsigned long)t_sensors_ms,
 	               (unsigned long)last_write_ms,
-	               (unsigned)aht_status);
+	               (unsigned)aht_status,
+	               (unsigned)btn,
+	               (unsigned)lse_ok,
+	               (unsigned)ds_err);
 
 	      uint32_t t_w0 = HAL_GetTick();
 	      f_puts(line, &file);
@@ -332,8 +339,8 @@ int main(void)
 	      last_write_ms = HAL_GetTick() - t_w0;
 	  }
 
-	  /* --- выключаем датчики перед сном (PA0 = HIGH) --- */
-	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
+	  /* --- выключаем датчики перед сном (HIGH) --- */
+	  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_SET);
 
 	  /* TEST-ONLY: держим МК бодрствующим ещё TEST_AWAKE_HOLD_MS перед следующим STOP —
 	   * см. TEST_AWAKE_HOLD_MS выше. */

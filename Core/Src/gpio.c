@@ -50,15 +50,30 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
     /*Configure GPIO pin Output Level */
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0|GPIO_PIN_4, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET); // 1-Wire в состоянии покоя = высокий уровень (отпущена)
+    HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET); // питание датчиков включено
 
-    /*Configure GPIO pins : PA0 PA4 (питание датчиков, CS флешки) */
-    GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_4;
+    /*Configure GPIO pin : PA4 (CS флешки) */
+    GPIO_InitStruct.Pin = GPIO_PIN_4;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /*Configure GPIO pin : PB0 (питание датчиков через транзистор, HIGH = выключено) */
+    GPIO_InitStruct.Pin = SENSOR_PWR_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(SENSOR_PWR_GPIO_Port, &GPIO_InitStruct);
+
+    /*Configure GPIO pin : PA0 (кнопка KEY, замыкает на GND) —
+     * пока просто вход с подтяжкой вверх, EXTI добавим следующим шагом. */
+    GPIO_InitStruct.Pin = WAKE_BTN_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(WAKE_BTN_GPIO_Port, &GPIO_InitStruct);
 
     /*Configure GPIO pin : PA8 (1-Wire шина DS18B20) — open-drain! */
     GPIO_InitStruct.Pin = GPIO_PIN_8;

@@ -60,6 +60,15 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN Private defines */
 
+/* Питание датчиков (AHT20/DS18B20/почва) через транзистор: HIGH = выключено.
+ * Перенесено с PA0 на PB0 — на PA0 физически сидит кнопка KEY этой платы. */
+#define SENSOR_PWR_GPIO_Port   GPIOB
+#define SENSOR_PWR_Pin         GPIO_PIN_0
+
+/* Кнопка KEY на плате: замыкает PA0 на GND через ~325 Ом, т.е. нажатие = LOW. */
+#define WAKE_BTN_GPIO_Port     GPIOA
+#define WAKE_BTN_Pin           GPIO_PIN_0
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
