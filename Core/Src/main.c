@@ -55,6 +55,12 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 /* Время на стабилизацию питания датчиков (AHT20/DS18B20/почва) после включения PA0. */
 #define SENSOR_POWERUP_DELAY_MS   500U
 
+/* Пока кнопка удерживается, МК не уходит в STOP — так USB-сессия не рвётся на время сна.
+ * BTN_HOLD_MAX_MS — страховка на случай залипшей/залитой кнопки в поле: по истечении
+ * этого времени засыпаем принудительно, иначе устройство молча высадит батарею. */
+#define BTN_HOLD_POLL_MS   100U
+#define BTN_HOLD_MAX_MS    300000U   /* 5 минут */
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -69,6 +75,7 @@ FRESULT res;
 static BYTE work[4096];
 FIL file;
 static uint8_t lse_ok = 0;   /* запустился ли LSE-кварц (иначе метки времени врут) */
+static volatile uint8_t woke_by_button = 0;  /* выставляется в EXTI-колбэке кнопки */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -170,7 +177,7 @@ int main(void)
       res = f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE);
       if (res == FR_OK)
       {
-          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum,usb_state,aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms,t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err\r\n", &file);
+          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum,usb_state,aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms,t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err,wake_src,hold_ms\r\n", &file);
           f_close(&file);
       }
   }
@@ -220,14 +227,32 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   uint8_t usb_mode = 0;
   uint32_t last_write_ms = 0;   /* TEST-ONLY: длительность записи в флеш прошлого цикла */
+  uint32_t last_hold_ms  = 0;   /* сколько мс держали кнопку перед прошлым уходом в сон */
   while (1)
   {
+	  /* --- Пока кнопка удерживается, в сон не уходим ---
+	   * Это режим "живого" USB: пользователь держит KEY, пока хост читает файл,
+	   * и устройство не пропадает с шины на время STOP. Датчики при этом уже
+	   * обесточены в конце прошлой итерации, так что лишнего тока не тратим. */
+	  uint32_t t_hold0 = HAL_GetTick();
+	  last_hold_ms = 0;
+	  while (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET)
+	  {
+	      last_hold_ms = HAL_GetTick() - t_hold0;
+	      if (last_hold_ms >= BTN_HOLD_MAX_MS)
+	          break;   /* кнопка залипла — засыпаем, чтобы не высадить батарею */
+
+	      HAL_Delay(BTN_HOLD_POLL_MS);
+	  }
+
 	  /* --- уход в сон: STOP mode, будим только по RTC Wakeup Timer ---
 	   * Таймер перевзводим заново перед каждым входом в STOP, чтобы длительность сна
 	   * была стабильной (RTC_WAKEUP_INTERVAL_SEC) каждый цикл, а не "плавала" от фазы
 	   * свободно бегущего таймера относительно переменной длины активной фазы. */
 	  HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
 	  HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, RTC_WAKEUP_INTERVAL_SEC, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+
+	  woke_by_button = 0;   /* сбрасываем перед сном: интересен источник ЭТОГО пробуждения */
 
 	  HAL_SuspendTick();
 	  HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
@@ -236,6 +261,8 @@ int main(void)
 	   * трогать что-либо ещё (I2C/SPI/ADC/DWT-задержки зависят от реальной частоты) --- */
 	  SystemClock_Config();
 	  HAL_ResumeTick();
+
+	  uint8_t wake_src = woke_by_button;   /* 1 = кнопка, 0 = плановое пробуждение по RTC */
 
 	  uint32_t t_wake = HAL_GetTick();   /* TEST-ONLY: засекаем длительность активной фазы */
 
@@ -315,7 +342,7 @@ int main(void)
 	       *   t_write_ms    — сколько заняла запись в флеш на ПРОШЛОМ цикле
 	       * Убрать вместе с соответствующей логикой после отладки. */
 	      snprintf(line, sizeof(line),
-	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u\r\n",
+	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u,%u,%lu\r\n",
 	               ts,
 	               aht.temperature,
 	               aht.humidity,
@@ -331,7 +358,9 @@ int main(void)
 	               (unsigned)aht_status,
 	               (unsigned)btn,
 	               (unsigned)lse_ok,
-	               (unsigned)ds_err);
+	               (unsigned)ds_err,
+	               (unsigned)wake_src,
+	               (unsigned long)last_hold_ms);
 
 	      uint32_t t_w0 = HAL_GetTick();
 	      f_puts(line, &file);
@@ -400,6 +429,19 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/**
+  * @brief  Колбэк EXTI: нажата кнопка KEY (PA0).
+  *         Само прерывание и будит МК из STOP — здесь только помечаем источник,
+  *         чтобы основной цикл понимал, проснулись мы по таймеру или по кнопке.
+  */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == WAKE_BTN_Pin)
+    {
+        woke_by_button = 1;
+    }
+}
 
 /* USER CODE END 4 */
 

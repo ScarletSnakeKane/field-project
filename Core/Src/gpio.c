@@ -69,11 +69,16 @@ void MX_GPIO_Init(void)
     HAL_GPIO_Init(SENSOR_PWR_GPIO_Port, &GPIO_InitStruct);
 
     /*Configure GPIO pin : PA0 (кнопка KEY, замыкает на GND) —
-     * пока просто вход с подтяжкой вверх, EXTI добавим следующим шагом. */
+     * прерывание по спаду = момент нажатия, оно же будит МК из STOP. */
     GPIO_InitStruct.Pin = WAKE_BTN_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(WAKE_BTN_GPIO_Port, &GPIO_InitStruct);
+
+    /* Приоритет ниже, чем у RTC_WKUP (0,0) — пробуждение по кнопке не должно
+     * вклиниваться в тайминги 1-Wire агрессивнее, чем уже делает RTC. */
+    HAL_NVIC_SetPriority(EXTI0_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
     /*Configure GPIO pin : PA8 (1-Wire шина DS18B20) — open-drain! */
     GPIO_InitStruct.Pin = GPIO_PIN_8;

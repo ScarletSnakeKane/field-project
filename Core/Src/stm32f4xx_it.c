@@ -217,4 +217,12 @@ void RTC_WKUP_IRQHandler(void)
 {
     HAL_RTCEx_WakeUpTimerIRQHandler(&hrtc);
 }
+
+/**
+  * @brief This function handles EXTI line0 interrupt (кнопка KEY на PA0).
+  */
+void EXTI0_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(WAKE_BTN_Pin);
+}
 /* USER CODE END 1 */
