@@ -8,6 +8,11 @@
 #define FLASH_SECTOR_SIZE     4096       // байт (4 KB)
 #define FLASH_SIZE_BYTES      (2 * 1024 * 1024) // 2 MB
 
+/* Таймауты. Устройство стоит в поле без присмотра — любое ожидание должно
+ * быть конечным, иначе единственный сбой связи вешает прошивку навсегда. */
+#define FLASH_SPI_TIMEOUT_MS  100U       // отдельная SPI-транзакция
+#define FLASH_BUSY_TIMEOUT_MS 500U       // ожидание конца записи/стирания (стирание сектора ~25-50 мс)
+
 /* Команды SST26VF016B */
 #define FLASH_CMD_READ        0x03       // Read Data
 #define FLASH_CMD_PP          0x02       // Page Program
