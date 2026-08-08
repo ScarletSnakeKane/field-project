@@ -76,6 +76,7 @@ static BYTE work[4096];
 FIL file;
 static uint8_t lse_ok = 0;   /* запустился ли LSE-кварц (иначе метки времени врут) */
 static volatile uint8_t woke_by_button = 0;  /* выставляется в EXTI-колбэке кнопки */
+static uint8_t fs_ok = 0;    /* смонтирована ли файловая система */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -161,10 +162,11 @@ int main(void)
           res = f_mount(&USERFatFS, USERPath, 1);
   }
 
-  if (res != FR_OK)
-  {
-      while (1); // критическая ошибка
-  }
+  /* Раньше здесь стоял while(1) — отказ монтирования означал вечное зависание
+   * в активном режиме, то есть посаженную за пару дней батарею и полную тишину
+   * в данных. Теперь это не фатально: помечаем ФС как неисправную и пробуем
+   * перемонтировать раз в цикл, засыпая между попытками. */
+  fs_ok = (res == FR_OK) ? 1U : 0U;
 
   f_unlink("data.csv");
 
@@ -339,8 +341,14 @@ int main(void)
 
 	  uint32_t t_sensors_ms = HAL_GetTick() - t_wake;   /* TEST-ONLY */
 
+	  /* Если ФС не смонтирована (сбой при старте или отвалилась позже) — пробуем
+	   * поднять её заново, но не чаще одного раза за цикл. Между попытками
+	   * устройство спит, поэтому даже неустранимая поломка не сажает батарею. */
+	  if (!fs_ok)
+	      fs_ok = (f_mount(&USERFatFS, USERPath, 1) == FR_OK) ? 1U : 0U;
+
 	  FIL file;
-	  res = f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE);
+	  res = fs_ok ? f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE) : FR_NOT_READY;
 	  if (res == FR_OK)
 	  {
 	      char line[224];
