@@ -38,6 +38,12 @@ extern "C" {
 
 void MX_GPIO_Init(void);
 
+/* Перевод выводов датчиков/флеш в «тихое» состояние перед STOP и обратно после
+ * пробуждения. Вызывать после деинициализации I2C1/SPI1 и до их повторной
+ * инициализации соответственно. */
+void MX_GPIO_SleepPrepare(void);
+void MX_GPIO_SleepRestore(void);
+
 /* USER CODE BEGIN Prototypes */
 
 /* USER CODE END Prototypes */

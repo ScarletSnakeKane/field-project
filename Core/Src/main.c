@@ -179,7 +179,7 @@ int main(void)
       res = f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE);
       if (res == FR_OK)
       {
-          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum,usb_state,aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms,t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err,wake_src,hold_ms\r\n", &file);
+          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum,aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms,t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err,wake_src,hold_ms\r\n", &file);
           f_close(&file);
       }
   }
@@ -227,7 +227,6 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint8_t usb_mode = 0;
   uint32_t last_write_ms = 0;   /* TEST-ONLY: длительность записи в флеш прошлого цикла */
   uint32_t last_hold_ms  = 0;   /* сколько мс держали кнопку перед прошлым уходом в сон */
   while (1)
@@ -252,6 +251,15 @@ int main(void)
 	   * хост мог читать диск, и усыплять флеш было нельзя. */
 	  SPI_Flash_DeepPowerDown();
 
+	  /* Гасим периферию шин. Порядок важен: SPI деинициализируем строго ПОСЛЕ
+	   * команды Deep Power-Down выше — иначе её нечем было бы отправить. */
+	  HAL_SPI_DeInit(&hspi1);
+	  HAL_I2C_DeInit(&hi2c1);
+
+	  /* HAL_..._DeInit оставляет выводы «плавающими» входами, а не в аналоге,
+	   * поэтому доводим их до тихого состояния вручную. */
+	  MX_GPIO_SleepPrepare();
+
 	  /* --- уход в сон: STOP mode, будим только по RTC Wakeup Timer ---
 	   * Таймер перевзводим заново перед каждым входом в STOP, чтобы длительность сна
 	   * была стабильной (RTC_WAKEUP_INTERVAL_SEC) каждый цикл, а не "плавала" от фазы
@@ -268,6 +276,11 @@ int main(void)
 	   * трогать что-либо ещё (I2C/SPI/ADC/DWT-задержки зависят от реальной частоты) --- */
 	  SystemClock_Config();
 	  HAL_ResumeTick();
+
+	  /* Возвращаем выводы 1-Wire из аналога и поднимаем SPI — обязательно до
+	   * любого обращения к флеш, иначе команду пробуждения будет некому послать. */
+	  MX_GPIO_SleepRestore();
+	  MX_SPI1_Init();
 
 	  /* Будим флеш до любого обращения к ней (в DPD она игнорирует все команды, кроме 0xAB). */
 	  SPI_Flash_ReleasePowerDown();
@@ -311,10 +324,7 @@ int main(void)
 	  uint8_t aht_status = 0;   /* TEST-ONLY: бит 0x08 = откалиброван, 0x80 = занят */
 	  AHT20_ReadStatusByte(&hi2c1, &aht_status);
 
-	  uint8_t usb_state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_9);  // 0 или 1
-
-	  /* Кнопка KEY: нажата = 0 (замкнута на GND). Пока только читаем и логируем,
-	   * чтобы убедиться в распиновке до того, как вешать на неё EXTI. */
+	  /* Кнопка KEY: нажата = 0 (замкнута на GND). */
 	  uint8_t btn = HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin);
 
 	  AHT20_Data aht;
@@ -358,13 +368,12 @@ int main(void)
 	       *   t_write_ms    — сколько заняла запись в флеш на ПРОШЛОМ цикле
 	       * Убрать вместе с соответствующей логикой после отладки. */
 	      snprintf(line, sizeof(line),
-	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u,%u,%lu\r\n",
+	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u,%u,%lu\r\n",
 	               ts,
 	               aht.temperature,
 	               aht.humidity,
 	               soil_temp,
 	               soil_hum,
-	               usb_state,   // ← добавили состояние PA9
 	               (int)aht_init_st,
 	               (int)aht_read_st,
 	               (unsigned long)aht_i2c_err,
