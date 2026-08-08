@@ -40,9 +40,39 @@ static void SPI_Flash_GlobalUnprotect(void)
     SPI_Flash_WaitBusy();
 }
 
+void SPI_Flash_DeepPowerDown(void)
+{
+    /* Нельзя обрывать незавершённое стирание/запись переходом в DPD —
+     * сектор может остаться повреждённым. Дожидаемся завершения. */
+    SPI_Flash_WaitBusy();
+
+    uint8_t cmd = FLASH_CMD_DPD;
+    FLASH_CS_LOW();
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, HAL_MAX_DELAY);
+    FLASH_CS_HIGH();
+}
+
+void SPI_Flash_ReleasePowerDown(void)
+{
+    uint8_t cmd = FLASH_CMD_RDPD;
+    FLASH_CS_LOW();
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, HAL_MAX_DELAY);
+    FLASH_CS_HIGH();
+
+    /* Выход из DPD занимает единицы-десятки мкс; 1 мс с большим запасом —
+     * это происходит раз в цикл сна, экономить тут нечего. */
+    HAL_Delay(1);
+}
+
 void SPI_Flash_Init(void)
 {
     FLASH_CS_HIGH();
+
+    /* Флеш сидит на постоянном питании, поэтому Deep Power-Down переживает сброс МК:
+     * если ресет/перепрошивка случились во время сна, чип всё ещё в DPD и игнорирует
+     * любые команды, кроме 0xAB. Будим его до первого обращения — иначе
+     * SPI_Flash_WaitBusy() ниже зависнет навсегда (там HAL_MAX_DELAY). */
+    SPI_Flash_ReleasePowerDown();
 
     /* Снять защиту блоков, иначе запись/стирание будут игнорироваться */
     SPI_Flash_GlobalUnprotect();
