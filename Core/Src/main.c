@@ -77,6 +77,7 @@ FIL file;
 static uint8_t lse_ok = 0;   /* запустился ли LSE-кварц (иначе метки времени врут) */
 static volatile uint8_t woke_by_button = 0;  /* выставляется в EXTI-колбэке кнопки */
 static uint8_t fs_ok = 0;    /* смонтирована ли файловая система */
+static uint32_t write_fails = 0;  /* накопленное число неудачных записей строки */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -141,11 +142,11 @@ int main(void)
   // Включаем питание датчиков (LOW)
   HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
 
-  // === 0) Один раз выставляем время, если календарь ещё не инициализирован ===
-  if (__HAL_RTC_IS_CALENDAR_INITIALIZED(&hrtc) == 0U)
-  {
-      Time_InitOnce();
-  }
+  // === 0) Часы ===
+  // Календарь живёт в backup-домене и переживает сброс, поэтому проверки
+  // "не инициализирован" мало: после обычного ресета время идёт дальше, а вот
+  // новая прошивка должна переставить его на своё время сборки.
+  Time_SyncToBuildIfNeeded();
 
   // 1) Инициализация SPI флеш
   SPI_Flash_Init();
@@ -179,7 +180,7 @@ int main(void)
       res = f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE);
       if (res == FR_OK)
       {
-          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum,aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms,t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err,wake_src,hold_ms\r\n", &file);
+          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum,aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms,t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err,wake_src,hold_ms,write_fails\r\n", &file);
           f_close(&file);
       }
   }
@@ -368,7 +369,7 @@ int main(void)
 	       *   t_write_ms    — сколько заняла запись в флеш на ПРОШЛОМ цикле
 	       * Убрать вместе с соответствующей логикой после отладки. */
 	      snprintf(line, sizeof(line),
-	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u,%u,%lu\r\n",
+	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u,%u,%lu,%lu\r\n",
 	               ts,
 	               aht.temperature,
 	               aht.humidity,
@@ -385,12 +386,28 @@ int main(void)
 	               (unsigned)lse_ok,
 	               (unsigned)ds_err,
 	               (unsigned)wake_src,
-	               (unsigned long)last_hold_ms);
+	               (unsigned long)last_hold_ms,
+	               (unsigned long)write_fails);
 
 	      uint32_t t_w0 = HAL_GetTick();
-	      f_puts(line, &file);
-	      f_close(&file);
+	      int      puts_res  = f_puts(line, &file);
+	      FRESULT  close_res = f_close(&file);
 	      last_write_ms = HAL_GetTick() - t_w0;
+
+	      /* Раньше результат записи игнорировался: заполнившийся том или сбой SPI
+	       * молча съедали строку, и в данных это выглядело просто как её отсутствие.
+	       * Считаем отказы и требуем перемонтирования на следующем цикле — том мог
+	       * отвалиться, и переподключение это чинит. */
+	      if (puts_res < 0 || close_res != FR_OK)
+	      {
+	          write_fails++;
+	          fs_ok = 0;
+	      }
+	  }
+	  else
+	  {
+	      write_fails++;
+	      fs_ok = 0;   /* не открылось — пробуем перемонтировать в следующем цикле */
 	  }
 
 	  /* --- выключаем датчики перед сном (HIGH) --- */
