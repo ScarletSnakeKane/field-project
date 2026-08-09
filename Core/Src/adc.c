@@ -125,5 +125,34 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* adcHandle)
 
 /* USER CODE BEGIN 1 */
 
+#define ADC_POLL_TIMEOUT_MS  10U
+
+uint8_t ADC_ReadChannel(uint32_t channel, uint32_t sampling_time, uint32_t *raw_out)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  sConfig.Channel      = channel;
+  sConfig.Rank         = 1;
+  sConfig.SamplingTime = sampling_time;
+
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+    return 0;
+
+  if (HAL_ADC_Start(&hadc1) != HAL_OK)
+    return 0;
+
+  /* Конечный таймаут: одиночное преобразование занимает микросекунды,
+   * бесконечное ожидание в поле означало бы зависание навсегда. */
+  if (HAL_ADC_PollForConversion(&hadc1, ADC_POLL_TIMEOUT_MS) != HAL_OK)
+  {
+    HAL_ADC_Stop(&hadc1);
+    return 0;
+  }
+
+  *raw_out = HAL_ADC_GetValue(&hadc1);
+  HAL_ADC_Stop(&hadc1);
+  return 1;
+}
+
 /* USER CODE END 1 */
 

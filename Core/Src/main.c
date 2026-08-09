@@ -33,6 +33,7 @@
 #include "spiflash.h"
 #include "time_service.h"
 #include "soil_sensor.h"
+#include "battery.h"
 #include "ds18b20.h"
 #include "usbd_core.h"
 #include "usbd_def.h"
@@ -68,7 +69,8 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 #define CSV_HEADER "timestamp,air_temp,air_hum,soil_temp,soil_hum," \
                    "aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms," \
                    "t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err," \
-                   "wake_src,hold_ms,write_fails"
+                   "wake_src,hold_ms,write_fails," \
+                   "bat_pct,vbat,vdd,soil_valid"
 
 /* USER CODE END PD */
 
@@ -380,6 +382,9 @@ int main(void)
 
 	  float soil_hum  = Soil_ReadMoisture();
 
+	  Battery_Data bat;
+	  Battery_Read(&bat);
+
 	  char ts[32];
 	  Time_GetTimestamp(ts, sizeof(ts));
 
@@ -395,14 +400,15 @@ int main(void)
 	  res = fs_ok ? f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE) : FR_NOT_READY;
 	  if (res == FR_OK)
 	  {
-	      char line[224];
+	      char line[288];
 	      /* TEST-ONLY: хвостовые поля — диагностика сбоев AHT20 и профиль времени цикла:
 	       *   aht_ready_ms  — через сколько мс после подачи питания датчик ответил (9999 = не ответил)
 	       *   t_sensors_ms  — время от пробуждения до записи (I2C + DS18B20 + ADC)
 	       *   t_write_ms    — сколько заняла запись в флеш на ПРОШЛОМ цикле
 	       * Убрать вместе с соответствующей логикой после отладки. */
 	      snprintf(line, sizeof(line),
-	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u,%u,%lu,%lu\r\n",
+	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u,%u,%lu,%lu,"
+	               "%u,%.2f,%.2f,%u\r\n",
 	               ts,
 	               aht.temperature,
 	               aht.humidity,
@@ -420,7 +426,13 @@ int main(void)
 	               (unsigned)ds_err,
 	               (unsigned)wake_src,
 	               (unsigned long)last_hold_ms,
-	               (unsigned long)write_fails);
+	               (unsigned long)write_fails,
+	               (unsigned)bat.percent,
+	               bat.volts,
+	               bat.vdd,
+	               /* soil_valid: ниже дропаута LDO опора АЦП уплывает вместе с банкой,
+	                * поэтому влажность почвы с этого момента недостоверна. */
+	               (unsigned)(bat.valid && !bat.low));
 
 	      uint32_t t_w0 = HAL_GetTick();
 	      int      puts_res  = f_puts(line, &file);

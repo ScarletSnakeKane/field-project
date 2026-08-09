@@ -5,23 +5,17 @@
 #define AIR_VALUE    2.67465f  // напряжение при сухой почве
 #define WATER_VALUE  0.87597f  // напряжение при влажной почве
 
-#define SOIL_ADC_TIMEOUT_MS  10U
+#define SOIL_ADC_CHANNEL     ADC_CHANNEL_1        /* PA1 */
+#define SOIL_SAMPLE_TIME     ADC_SAMPLETIME_84CYCLES
 
 float Soil_ReadVoltage(void)
 {
-    /* Конечный таймаут вместо HAL_MAX_DELAY: одиночное преобразование занимает
-     * микросекунды, а бесконечное ожидание в поле означало бы зависание навсегда. */
-    if (HAL_ADC_Start(&hadc1) != HAL_OK)
-        return NAN;
+    uint32_t raw;
 
-    if (HAL_ADC_PollForConversion(&hadc1, SOIL_ADC_TIMEOUT_MS) != HAL_OK)
-    {
-        HAL_ADC_Stop(&hadc1);
+    /* Канал задаём явно: тот же АЦП читает ещё батарею и VREFINT,
+     * поэтому полагаться на конфигурацию, оставшуюся от прошлого замера, нельзя. */
+    if (!ADC_ReadChannel(SOIL_ADC_CHANNEL, SOIL_SAMPLE_TIME, &raw))
         return NAN;
-    }
-
-    uint32_t raw = HAL_ADC_GetValue(&hadc1);
-    HAL_ADC_Stop(&hadc1);
 
     return (raw * SOIL_VREF) / 4095.0f;  // перевод в вольты
 }
