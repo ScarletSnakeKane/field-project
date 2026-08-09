@@ -37,6 +37,7 @@
 #include "usbd_core.h"
 #include "usbd_def.h"
 #include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,6 +61,14 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
  * этого времени засыпаем принудительно, иначе устройство молча высадит батарею. */
 #define BTN_HOLD_POLL_MS   100U
 #define BTN_HOLD_MAX_MS    300000U   /* 5 минут */
+
+/* Набор колонок CSV. Держим одной строкой, чтобы при старте сверить с тем, что
+ * уже лежит в файле: состав колонок меняется от версии к версии, а архив теперь
+ * переживает перезагрузку — иначе строки разного формата смешались бы в одном файле. */
+#define CSV_HEADER "timestamp,air_temp,air_hum,soil_temp,soil_hum," \
+                   "aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms," \
+                   "t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err," \
+                   "wake_src,hold_ms,write_fails"
 
 /* USER CODE END PD */
 
@@ -139,6 +148,10 @@ int main(void)
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
+  // Состояние кнопки на момент старта читаем сразу: это жест «стереть архив»,
+  // и пользователь отпустит кнопку через мгновение после сброса.
+  uint8_t wipe_requested = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET);
+
   // Включаем питание датчиков (LOW)
   HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
 
@@ -151,10 +164,9 @@ int main(void)
   // 1) Инициализация SPI флеш
   SPI_Flash_Init();
 
-  f_mkfs(USERPath, FM_FAT, 0, work, sizeof(work));
-  f_mount(&USERFatFS, USERPath, 1);
-
-  // 2) Монтируем диск
+  // 2) Монтируем диск. Форматируем ТОЛЬКО если файловой системы на флеш нет:
+  //    безусловный f_mkfs стирал накопленные данные при каждом старте, то есть
+  //    любой сброс или севшая и заменённая батарея в поле обнуляли весь архив.
   res = f_mount(&USERFatFS, USERPath, 1);
   if (res == FR_NO_FILESYSTEM)
   {
@@ -169,7 +181,28 @@ int main(void)
    * перемонтировать раз в цикл, засыпая между попытками. */
   fs_ok = (res == FR_OK) ? 1U : 0U;
 
-  f_unlink("data.csv");
+  // 2b) Архив начинается заново в двух случаях:
+  //     — кнопка KEY удержана в момент старта (ручной сброс при битых данных).
+  //       Жест требует физического сброса с зажатой кнопкой, поэтому в поле
+  //       случайно не повторится: короткое нажатие в работе означает «разбудить»,
+  //       а удержание в работе держит USB-сессию — оба с этим не пересекаются;
+  //     — заголовок в файле не совпал с текущим (залита версия с другим составом
+  //       колонок) — иначе строки разного формата смешались бы в одном файле.
+  uint8_t header_mismatch = 0;
+  if (fs_ok)
+  {
+      FIL hf;
+      if (f_open(&hf, "data.csv", FA_READ) == FR_OK)
+      {
+          char hdr[sizeof(CSV_HEADER) + 8];
+          header_mismatch = (f_gets(hdr, sizeof(hdr), &hf) == NULL) ||
+                            (strncmp(hdr, CSV_HEADER, strlen(CSV_HEADER)) != 0);
+          f_close(&hf);
+      }
+  }
+
+  if (fs_ok && (wipe_requested || header_mismatch))
+      f_unlink("data.csv");
 
   // 3) Создаём CSV файл с заголовком, если файла нет
   res = f_open(&file, "data.csv", FA_OPEN_EXISTING | FA_WRITE);
@@ -180,7 +213,7 @@ int main(void)
       res = f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE);
       if (res == FR_OK)
       {
-          f_puts("timestamp,air_temp,air_hum,soil_temp,soil_hum,aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms,t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err,wake_src,hold_ms,write_fails\r\n", &file);
+          f_puts(CSV_HEADER "\r\n", &file);
           f_close(&file);
       }
   }
