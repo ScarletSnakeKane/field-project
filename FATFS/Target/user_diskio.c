@@ -27,8 +27,10 @@
 #include "ff_gen_drv.h"
 #include "spiflash.h"   // наш драйвер SPI Flash
 
-#define SECTOR_SIZE     512
-#define SECTOR_COUNT    (FLASH_SIZE_BYTES / SECTOR_SIZE)
+/* Размеры тома живут в spiflash.h: заявленный объём (FLASH_VIRT_SECTORS) больше
+ * физического (FLASH_PHYS_SECTORS) — см. пояснение там. */
+#define SECTOR_SIZE     FLASH_SECTOR_BYTES
+#define SECTOR_COUNT    FLASH_VIRT_SECTORS
 
 
 /* Private typedef -----------------------------------------------------------*/
@@ -119,10 +121,23 @@ DRESULT USER_read (
     if ((sector + count) > SECTOR_COUNT)
         return RES_PARERR;
 
-    uint32_t addr = sector * SECTOR_SIZE;
-    uint32_t len  = count * SECTOR_SIZE;
+    /* Часть заявленного тома физически не существует. Такие сектора отдаём
+     * нулями и НИКОГДА не читаем по завёрнутому адресу: SST26 при выходе за
+     * границу кристалла вернёт данные с его начала, то есть чужое содержимое. */
+    if (sector >= FLASH_PHYS_SECTORS)
+    {
+        memset(buff, 0, count * SECTOR_SIZE);
+        return RES_OK;
+    }
 
-    SPI_Flash_Read(addr, buff, len);
+    UINT phys = count;
+    if ((sector + count) > FLASH_PHYS_SECTORS)
+    {
+        phys = FLASH_PHYS_SECTORS - sector;
+        memset(buff + (phys * SECTOR_SIZE), 0, (count - phys) * SECTOR_SIZE);
+    }
+
+    SPI_Flash_Read(sector * SECTOR_SIZE, buff, phys * SECTOR_SIZE);
     return RES_OK;
   /* USER CODE END READ */
 }
@@ -148,6 +163,12 @@ DRESULT USER_write (
 
     if ((sector + count) > SECTOR_COUNT)
         return RES_PARERR;
+
+    /* Запись за физическую границу — это молчаливая потеря данных: байты уйдут
+     * в никуда, а вызывающий решит, что всё записано. Ограничение CSV_MAX_BYTES
+     * в main.c не даёт сюда дойти; если всё же дошли — честная ошибка. */
+    if ((sector + count) > FLASH_PHYS_SECTORS)
+        return RES_ERROR;
 
     uint32_t addr = sector * SECTOR_SIZE;
     uint32_t len  = count * SECTOR_SIZE;

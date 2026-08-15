@@ -30,9 +30,11 @@ extern FATFS USERFatFS;
 extern char USERPath[];
 
 #include "spiflash.h"   // наш драйвер SPI Flash
+#include <string.h>
 
-#define SECTOR_SIZE     512
-#define SECTOR_COUNT    (FLASH_SIZE_BYTES / SECTOR_SIZE)
+/* Размеры тома живут в spiflash.h: заявленный объём больше физического. */
+#define SECTOR_SIZE     FLASH_SECTOR_BYTES
+#define SECTOR_COUNT    FLASH_VIRT_SECTORS
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -237,13 +239,11 @@ int8_t STORAGE_IsWriteProtected_FS(uint8_t lun)
   /* USER CODE BEGIN 5 */
   UNUSED(lun);
 
-  /* Диагностика: Android отказался монтировать том («Unsupported STM USB drive»).
-   * Часть версий не берёт носители, помеченные как защищённые от записи, поэтому
-   * снимаем флаг. Сами записи по-прежнему отклоняются в STORAGE_Write_FS —
-   * данные хост всё равно не испортит, меняется только заявленный признак.
-   * Если это не поможет, причина в FAT12 (том 2 МБ даёт 3984 кластера
-   * при пороге FAT16 в 4085) и правится не здесь. */
-  return (USBD_OK);
+  /* Том намеренно только для чтения: архив нельзя испортить с хоста.
+   * Признак «защищён от записи» возвращён на место — причина отказа Android
+   * оказалась в другом (FAT12, см. FLASH_VIRT_SECTORS в spiflash.h), а
+   * незащищённый том Windows пытается «чинить» при каждом подключении. */
+  return (USBD_FAIL);
   /* USER CODE END 5 */
 }
 
@@ -263,10 +263,23 @@ int8_t STORAGE_Read_FS(uint8_t lun, uint8_t *buf, uint32_t blk_addr, uint16_t bl
   if ((blk_addr + blk_len) > SECTOR_COUNT)
 	return USBD_FAIL;
 
-  uint32_t addr = blk_addr * SECTOR_SIZE;
-  uint32_t len  = blk_len * SECTOR_SIZE;
+  /* Заявленный тому объём вдвое больше физического (см. spiflash.h).
+   * Несуществующие сектора отдаём хосту нулями — читать по завёрнутому адресу
+   * нельзя, флеш вернула бы содержимое начала кристалла. */
+  if (blk_addr >= FLASH_PHYS_SECTORS)
+  {
+      memset(buf, 0, blk_len * SECTOR_SIZE);
+      return USBD_OK;
+  }
 
-  SPI_Flash_Read(addr, buf, len);
+  uint16_t phys = blk_len;
+  if ((blk_addr + blk_len) > FLASH_PHYS_SECTORS)
+  {
+      phys = (uint16_t)(FLASH_PHYS_SECTORS - blk_addr);
+      memset(buf + (phys * SECTOR_SIZE), 0, (blk_len - phys) * SECTOR_SIZE);
+  }
+
+  SPI_Flash_Read(blk_addr * SECTOR_SIZE, buf, phys * SECTOR_SIZE);
 
   return USBD_OK;
   /* USER CODE END 6 */
