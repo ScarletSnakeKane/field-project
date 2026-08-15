@@ -73,6 +73,13 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 /* Смещение байта типа раздела в MBR: таблица разделов с 446, поле System +4. */
 #define MBR_PART_TYPE_OFS   450U
 
+/* Содержимое остаётся CSV, но расширение .txt: на Android с .csv обычно не
+ * связано ни одно приложение, и файл видно, а открыть нечем. Текстовую
+ * смотрелку телефон имеет всегда, а на компьютере .txt открывается и
+ * блокнотом, и Excel через мастер импорта. */
+#define DATA_FILE       "data.txt"
+#define DATA_FILE_OLD   "data.csv"   /* удаляем при первом запуске после переименования */
+
 /* Набор колонок CSV. Держим одной строкой, чтобы при старте сверить с тем, что
  * уже лежит в файле: состав колонок меняется от версии к версии, а архив теперь
  * переживает перезагрузку — иначе строки разного формата смешались бы в одном файле. */
@@ -232,7 +239,7 @@ int main(void)
   if (fs_ok)
   {
       FIL hf;
-      if (f_open(&hf, "data.csv", FA_READ) == FR_OK)
+      if (f_open(&hf, DATA_FILE, FA_READ) == FR_OK)
       {
           char hdr[sizeof(CSV_HEADER) + 8];
           header_mismatch = (f_gets(hdr, sizeof(hdr), &hf) == NULL) ||
@@ -242,15 +249,21 @@ int main(void)
   }
 
   if (fs_ok && (wipe_requested || header_mismatch))
-      f_unlink("data.csv");
+      f_unlink(DATA_FILE);
+
+  /* Файл переименован из .csv в .txt — старый остался бы на диске мёртвым грузом
+   * и сбивал бы с толку при просмотре с телефона. Удаляем один раз; если его нет,
+   * вызов просто вернёт ошибку, которая нам безразлична. */
+  if (fs_ok)
+      f_unlink(DATA_FILE_OLD);
 
   // 3) Создаём CSV файл с заголовком, если файла нет
-  res = f_open(&file, "data.csv", FA_OPEN_EXISTING | FA_WRITE);
+  res = f_open(&file, DATA_FILE, FA_OPEN_EXISTING | FA_WRITE);
 
   if (res == FR_NO_FILE)
   {
       // Файл отсутствует → создаём новый и пишем заголовок
-      res = f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE);
+      res = f_open(&file, DATA_FILE, FA_OPEN_APPEND | FA_WRITE);
       if (res == FR_OK)
       {
           f_puts(CSV_HEADER "\r\n", &file);
@@ -435,7 +448,7 @@ int main(void)
 	      fs_ok = (f_mount(&USERFatFS, USERPath, 1) == FR_OK) ? 1U : 0U;
 
 	  FIL file;
-	  res = fs_ok ? f_open(&file, "data.csv", FA_OPEN_APPEND | FA_WRITE) : FR_NOT_READY;
+	  res = fs_ok ? f_open(&file, DATA_FILE, FA_OPEN_APPEND | FA_WRITE) : FR_NOT_READY;
 
 	  /* Архив заполнен — закрываем файл и не пишем: следующая строка ушла бы
 	   * за физическую границу флеш. Счётчик отказов продолжает расти, поэтому
