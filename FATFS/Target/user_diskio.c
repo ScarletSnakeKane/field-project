@@ -80,7 +80,14 @@ DSTATUS USER_initialize (
   /* USER CODE BEGIN INIT */
     UNUSED(pdrv);
     SPI_Flash_Init();
-    Stat = 0;
+
+    /* Раньше здесь безусловно стояло Stat = 0, то есть «диск исправен» — что бы
+     * ни творилось на шине SPI. Из-за этого отказ флеш не отличался от пустого
+     * тома: FatFs считал носитель готовым, монтирование срывалось на разборе
+     * структур, и вышестоящий код видел FR_NO_FILESYSTEM. Дальше срабатывала
+     * логика «нет ФС — форматируем», и попытка отформатировать несуществующую
+     * микросхему повторялась бы каждый цикл. Теперь спрашиваем саму микросхему. */
+    Stat = SPI_Flash_Probe() ? 0 : STA_NOINIT;
     return Stat;
   /* USER CODE END INIT */
 }
@@ -117,6 +124,9 @@ DRESULT USER_read (
 {
   /* USER CODE BEGIN READ */
     UNUSED(pdrv);
+
+    if (Stat & STA_NOINIT)
+        return RES_NOTRDY;
 
     if ((sector + count) > SECTOR_COUNT)
         return RES_PARERR;
@@ -160,6 +170,9 @@ DRESULT USER_write (
 {
   /* USER CODE BEGIN WRITE */
     UNUSED(pdrv);
+
+    if (Stat & STA_NOINIT)
+        return RES_NOTRDY;
 
     if ((sector + count) > SECTOR_COUNT)
         return RES_PARERR;

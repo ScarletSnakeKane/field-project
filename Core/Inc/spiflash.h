@@ -43,6 +43,9 @@
 #define FLASH_CMD_RDPD        0xAB       // Release from Deep Power-Down
 
 void SPI_Flash_Init(void);
+/* Отвечает ли микросхема вообще. Возвращает 0, если JEDEC ID вычитать не вышло:
+ * на неподключённой или мёртвой шине ответ вырождается в сплошные 0x00 или 0xFF. */
+uint8_t SPI_Flash_Probe(void);
 void SPI_Flash_Read(uint32_t addr, uint8_t *buf, uint32_t len);
 void SPI_Flash_Write(uint32_t addr, const uint8_t *buf, uint32_t len);
 void SPI_Flash_EraseSector(uint32_t addr);
