@@ -83,11 +83,18 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 /* Набор колонок CSV. Держим одной строкой, чтобы при старте сверить с тем, что
  * уже лежит в файле: состав колонок меняется от версии к версии, а архив теперь
  * переживает перезагрузку — иначе строки разного формата смешались бы в одном файле. */
+/* Сначала то, ради чего прибор существует, затем состояние питания, затем
+ * диагностика. Отладочные колонки времени цикла и внутренних кодов AHT20 сняты:
+ * они своё отработали — за весь снятый архив ни одной ошибки, — а платил за них
+ * архив своей длиной. Оставшиеся нужны и в поле: по ним видно, ПОЧЕМУ значение
+ * отсутствует, вместо того чтобы гадать над пустой ячейкой.
+ *   soil_valid    — 0, если банка просела ниже дропаута LDO и опора АЦП уплыла;
+ *   lse_ok        — 0, если часовой кварц не завёлся: тогда времени верить нельзя;
+ *   aht_*, ds_err — почему не прочитались воздух и почва;
+ *   write_fails   — сколько строк за всю жизнь не удалось записать. */
 #define CSV_HEADER "timestamp,air_temp,air_hum,soil_temp,soil_hum," \
-                   "aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms," \
-                   "t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err," \
-                   "wake_src,hold_ms,write_fails," \
-                   "bat_pct,vbat,vdd,soil_valid"
+                   "bat_pct,vbat,soil_valid,lse_ok," \
+                   "aht_init_st,aht_read_st,ds_err,write_fails"
 
 /* USER CODE END PD */
 
@@ -117,11 +124,6 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-static void Log(const char *msg)
-{
-  // если позже добавишь UART — заменишь на HAL_UART_Transmit
-  // пока можно оставить пустым или использовать semihosting
-}
 /* USER CODE END 0 */
 
 /**
@@ -266,7 +268,7 @@ int main(void)
       res = f_open(&file, DATA_FILE, FA_OPEN_APPEND | FA_WRITE);
       if (res == FR_OK)
       {
-          f_puts(CSV_HEADER "\r\n", &file);
+          f_puts(CSV_HEADER "\n", &file);
           f_close(&file);
       }
   }
@@ -276,58 +278,28 @@ int main(void)
       f_close(&file);
   }
 
-  // === Первое чтение и запись при старте ===
-  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
-  HAL_Delay(200); // дать датчикам стабилизироваться
-
-  AHT20_Data aht;
-  AHT20_ReadData(&hi2c1, &aht);
-
-  float soil_temp;
-  if (!DS18B20_ReadTemp(GPIOA, GPIO_PIN_8, &soil_temp))
-        soil_temp = NAN; // датчик не ответил или CRC не сошёлся
-
-  float soil_hum  = Soil_ReadMoisture();
-
-  char ts[32];
-  Time_GetTimestamp(ts, sizeof(ts));
-
-//  res = f_open(&file, "data.csv", FA_OPEN_EXISTING | FA_WRITE);
-//  if (res == FR_OK)
-//  {
-//      f_lseek(&file, f_size(&file));
-//
-//      char line[128];
-//      snprintf(line, sizeof(line),
-//               "%s,%.2f,%.2f,%.2f,%.2f\r\n",
-//               ts,
-//               aht.temperature,
-//               aht.humidity,
-//               soil_temp,
-//               soil_hum);
-//
-//      f_puts(line, &file);
-//      f_close(&file);
-//  }
+  /* Датчики поднимает и гасит сам цикл, здесь они не нужны. Явно обесточиваем
+   * их перед первым сном: MX_GPIO_Init() оставляет питание включённым, и без
+   * этой строки первый интервал сна (в поле — целый час) проходил бы с
+   * запитанными AHT20, DS18B20 и датчиком почвы. */
+  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_SET);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint32_t last_write_ms = 0;   /* TEST-ONLY: длительность записи в флеш прошлого цикла */
-  uint32_t last_hold_ms  = 0;   /* сколько мс держали кнопку перед прошлым уходом в сон */
   while (1)
   {
 	  /* --- Пока кнопка удерживается, в сон не уходим ---
 	   * Это режим "живого" USB: пользователь держит KEY, пока хост читает файл,
 	   * и устройство не пропадает с шины на время STOP. Датчики при этом уже
 	   * обесточены в конце прошлой итерации, так что лишнего тока не тратим. */
-	  uint32_t t_hold0 = HAL_GetTick();
-	  last_hold_ms = 0;
+	  uint32_t t_hold0    = HAL_GetTick();
+	  uint32_t hold_ms    = 0;
 	  while (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET)
 	  {
-	      last_hold_ms = HAL_GetTick() - t_hold0;
-	      if (last_hold_ms >= BTN_HOLD_MAX_MS)
+	      hold_ms = HAL_GetTick() - t_hold0;
+	      if (hold_ms >= BTN_HOLD_MAX_MS)
 	          break;   /* кнопка залипла — засыпаем, чтобы не высадить батарею */
 
 	      HAL_Delay(BTN_HOLD_POLL_MS);
@@ -372,10 +344,6 @@ int main(void)
 	  /* Будим флеш до любого обращения к ней (в DPD она игнорирует все команды, кроме 0xAB). */
 	  SPI_Flash_ReleasePowerDown();
 
-	  uint8_t wake_src = woke_by_button;   /* 1 = кнопка, 0 = плановое пробуждение по RTC */
-
-	  uint32_t t_wake = HAL_GetTick();   /* TEST-ONLY: засекаем длительность активной фазы */
-
 	  /* --- включаем датчики (LOW) --- */
 	  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
 	  HAL_Delay(50);   /* минимальная пауза на нарастание питания перед опросом шины */
@@ -389,18 +357,13 @@ int main(void)
 	  __HAL_RCC_I2C1_RELEASE_RESET();
 	  MX_I2C1_Init();
 
-	  /* Ждём, пока AHT20 реально начнёт подтверждать свой адрес на шине, вместо слепой
-	   * фиксированной паузы. aht_ready_ms — сколько мс от подачи питания это заняло
-	   * (9999 = так и не ответил за отведённое время). */
-	  uint32_t t_power_on = HAL_GetTick();
-	  uint16_t aht_ready_ms = 9999;
+	  /* Ждём, пока AHT20 реально начнёт подтверждать свой адрес на шине, вместо
+	   * слепой фиксированной паузы: время выхода на режим зависит от температуры
+	   * и от того, насколько успел разрядиться его питающий конденсатор. */
 	  for (uint16_t i = 0; i < 80; i++)   /* до ~2 секунд ожидания */
 	  {
 	      if (HAL_I2C_IsDeviceReady(&hi2c1, AHT20_ADDR, 1, 10) == HAL_OK)
-	      {
-	          aht_ready_ms = (uint16_t)(HAL_GetTick() - t_power_on);
 	          break;
-	      }
 	      HAL_Delay(25);
 	  }
 
@@ -408,28 +371,18 @@ int main(void)
 	   * заново инициализировать после каждого включения PA0, иначе показания мусорные. */
 	  HAL_StatusTypeDef aht_init_st = AHT20_Init(&hi2c1);
 
-	  uint8_t aht_status = 0;   /* TEST-ONLY: бит 0x08 = откалиброван, 0x80 = занят */
-	  AHT20_ReadStatusByte(&hi2c1, &aht_status);
-
-	  /* Кнопка KEY: нажата = 0 (замкнута на GND). */
-	  uint8_t btn = HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin);
-
 	  AHT20_Data aht;
-	  uint32_t aht_i2c_err = 0;
-	  /* TEST-ONLY: диагностика чередующихся сбоев AHT20 — код ошибки I2C пишем в CSV,
-	   * чтобы понять, что именно происходит на "провальных" циклах. Убрать после отладки. */
 	  HAL_StatusTypeDef aht_read_st = AHT20_ReadData(&hi2c1, &aht);
 	  if (aht_read_st != HAL_OK)
 	  {
 	      aht.temperature = 0.0f;
 	      aht.humidity    = 0.0f;
-	      aht_i2c_err = HAL_I2C_GetError(&hi2c1);
 	  }
 
 	  float soil_temp;
 	  	  if (!DS18B20_ReadTemp(GPIOA, GPIO_PIN_8, &soil_temp))
 	  	      soil_temp = NAN; // датчик не ответил или CRC не сошёлся
-	  uint8_t ds_err = (uint8_t)DS18B20_LastError();   /* TEST-ONLY: причина отказа 1-Wire */
+	  uint8_t ds_err = (uint8_t)DS18B20_LastError();   /* почему 1-Wire не ответил */
 
 	  float soil_hum  = Soil_ReadMoisture();
 
@@ -438,8 +391,6 @@ int main(void)
 
 	  char ts[32];
 	  Time_GetTimestamp(ts, sizeof(ts));
-
-	  uint32_t t_sensors_ms = HAL_GetTick() - t_wake;   /* TEST-ONLY */
 
 	  /* Если ФС не смонтирована (сбой при старте или отвалилась позже) — пробуем
 	   * поднять её заново, но не чаще одного раза за цикл. Между попытками
@@ -461,44 +412,31 @@ int main(void)
 
 	  if (res == FR_OK)
 	  {
-	      char line[288];
-	      /* TEST-ONLY: хвостовые поля — диагностика сбоев AHT20 и профиль времени цикла:
-	       *   aht_ready_ms  — через сколько мс после подачи питания датчик ответил (9999 = не ответил)
-	       *   t_sensors_ms  — время от пробуждения до записи (I2C + DS18B20 + ADC)
-	       *   t_write_ms    — сколько заняла запись в флеш на ПРОШЛОМ цикле
-	       * Убрать вместе с соответствующей логикой после отладки. */
+	      char line[128];
+	      /* Перевод строки задаём одним "\n": FatFs собран с _USE_STRFUNC = 2,
+	       * и f_puts сам разворачивает \n в \r\n. Со старым "\r\n" в формате на
+	       * диск уходило "\r\r\n" — лишний байт в каждой строке и мусорный
+	       * символ в конце последнего поля при разборе строгим парсером. */
 	      snprintf(line, sizeof(line),
-	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u,%u,%lu,%lu,"
-	               "%u,%.2f,%.2f,%u\r\n",
+	               "%s,%.2f,%.2f,%.2f,%.2f,%u,%.2f,%u,%u,%d,%d,%u,%lu\n",
 	               ts,
 	               aht.temperature,
 	               aht.humidity,
 	               soil_temp,
 	               soil_hum,
-	               (int)aht_init_st,
-	               (int)aht_read_st,
-	               (unsigned long)aht_i2c_err,
-	               (unsigned)aht_ready_ms,
-	               (unsigned long)t_sensors_ms,
-	               (unsigned long)last_write_ms,
-	               (unsigned)aht_status,
-	               (unsigned)btn,
-	               (unsigned)lse_ok,
-	               (unsigned)ds_err,
-	               (unsigned)wake_src,
-	               (unsigned long)last_hold_ms,
-	               (unsigned long)write_fails,
 	               (unsigned)bat.percent,
 	               bat.volts,
-	               bat.vdd,
 	               /* soil_valid: ниже дропаута LDO опора АЦП уплывает вместе с банкой,
 	                * поэтому влажность почвы с этого момента недостоверна. */
-	               (unsigned)(bat.valid && !bat.low));
+	               (unsigned)(bat.valid && !bat.low),
+	               (unsigned)lse_ok,
+	               (int)aht_init_st,
+	               (int)aht_read_st,
+	               (unsigned)ds_err,
+	               (unsigned long)write_fails);
 
-	      uint32_t t_w0 = HAL_GetTick();
 	      int      puts_res  = f_puts(line, &file);
 	      FRESULT  close_res = f_close(&file);
-	      last_write_ms = HAL_GetTick() - t_w0;
 
 	      /* Раньше результат записи игнорировался: заполнившийся том или сбой SPI
 	       * молча съедали строку, и в данных это выглядело просто как её отсутствие.
