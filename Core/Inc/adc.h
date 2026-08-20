@@ -40,6 +40,12 @@ extern ADC_HandleTypeDef hadc1;
 
 void MX_ADC1_Init(void);
 
+/* Одиночное измерение произвольного канала. Канал переконфигурируется перед
+ * каждым замером — сканирование и DMA не используются, каналов всего три
+ * (почва, батарея, VREFINT), и они читаются по очереди раз в цикл.
+ * Возвращает 1 при успехе, 0 при ошибке или таймауте. */
+uint8_t ADC_ReadChannel(uint32_t channel, uint32_t sampling_time, uint32_t *raw_out);
+
 /* USER CODE BEGIN Prototypes */
 
 /* USER CODE END Prototypes */
