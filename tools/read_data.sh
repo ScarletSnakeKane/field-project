@@ -126,3 +126,6 @@ echo ">> 6/6 прошиваю рабочую версию обратно"
 flash_now
 RESTORED_FW=1
 echo ">> готово"
+
+echo
+python "$ROOT/tools/summarize_data.py" "$OUT"

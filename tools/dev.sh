@@ -44,9 +44,32 @@ prog_retry() {
     return 1
 }
 
+# Полная строка вызова компилятора — это полсотни ключей и два десятка -I,
+# и таких строк на пересборку шестьдесят. Читать в них нечего, а места они
+# занимают столько, что за ними теряется единственное, что важно: предупреждения,
+# ошибки и итоговый размер. Поэтому по умолчанию наружу идут только они.
+# Полный вывод: VERBOSE=1 ./tools/dev.sh build
+build_quiet() {
+    if [ "${VERBOSE:-0}" = "1" ]; then
+        make -C "$ROOT/Debug" -j8 all
+        return
+    fi
+    local log; log="$(mktemp)"
+    if make -C "$ROOT/Debug" -j8 all >"$log" 2>&1; then
+        grep -E "warning:|error:" "$log" || true
+        "$GCC_BIN/arm-none-eabi-size.exe" "$ELF"
+        rm -f "$log"
+    else
+        echo "--- сборка упала, полный вывод: ---" >&2
+        cat "$log" >&2
+        rm -f "$log"
+        return 1
+    fi
+}
+
 case "${1:-build}" in
-  build)   make -C "$ROOT/Debug" -j8 all ;;
-  rebuild) make -C "$ROOT/Debug" clean && make -C "$ROOT/Debug" -j8 all ;;
+  build)   build_quiet ;;
+  rebuild) make -C "$ROOT/Debug" clean >/dev/null && build_quiet ;;
   size)    "$GCC_BIN/arm-none-eabi-size.exe" "$ELF" ;;
   connect) prog_retry 20 -c port=SWD mode=UR | grep -Ei "Device ID|Revision|CPU" ;;
   # -rst в конце обязателен: без него программатор оставляет ядро остановленным,
