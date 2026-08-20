@@ -1,0 +1,159 @@
+/* Тесты чистой логики FieldSensor, собираются и запускаются на обычном
+ * компьютере — прошивать плату не нужно.
+ *
+ *     ./tools/test.sh
+ *
+ * Сюда попадает только то, что не трогает регистры: пересчёт напряжений,
+ * разбор ответа датчика, CRC. Работа с шинами проверяется на живой плате,
+ * её тестами не подменить. Смысл разделения в том, что именно арифметика и
+ * разбор дают ошибки, которые на глаз не видно, — а стоят они дорого:
+ * из-за одной такой в архив писались правдоподобные 0.00 °C с мёртвой шины.
+ */
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+
+#include "battery_curve.h"
+#include "ds18b20_decode.h"
+#include "soil_curve.h"
+
+static int checks = 0, failures = 0;
+
+static void ok(int cond, const char *what)
+{
+    checks++;
+    if (!cond) { failures++; printf("  FAIL  %s\n", what); }
+}
+
+static void eqf(float got, float want, float tol, const char *what)
+{
+    checks++;
+    if (!(fabsf(got - want) <= tol)) {
+        failures++;
+        printf("  FAIL  %s: получено %.4f, ожидалось %.4f\n", what, got, want);
+    }
+}
+
+static void equ(unsigned got, unsigned want, const char *what)
+{
+    checks++;
+    if (got != want) {
+        failures++;
+        printf("  FAIL  %s: получено %u, ожидалось %u\n", what, got, want);
+    }
+}
+
+/* ---------------------------------------------------------------- DS18B20 */
+
+/* Эталонные scratchpad'ы. Контрольный байт посчитан независимой реализацией
+ * Dallas CRC-8 на Python, а не этим же кодом, иначе тест проверял бы сам себя. */
+static const unsigned char SP_25C[9]  = {0x91,0x01,0x4B,0x46,0xFF,0x0C,0x10,0x00,0xFC};
+static const unsigned char SP_NEG[9]  = {0x5E,0xFF,0x4B,0x46,0xFF,0x0C,0x10,0x00,0xE6};
+static const unsigned char SP_85C[9]  = {0x50,0x05,0x4B,0x46,0xFF,0x0C,0x10,0x00,0x90};
+static const unsigned char SP_0C[9]   = {0x00,0x00,0x4B,0x46,0xFF,0x0C,0x10,0x00,0x44};
+
+static void test_ds18b20(void)
+{
+    float t = -999.0f;
+    unsigned char sp[9];
+
+    puts("DS18B20");
+
+    equ(DS18B20_CRC8(SP_25C, 8), 0xFC, "CRC8 совпал с независимым расчётом");
+
+    equ(DS18B20_DecodeScratchpad(SP_25C, &t), DS18B20_OK, "исправный ответ принят");
+    eqf(t, 25.0625f, 0.0001f, "+25.0625 C");
+
+    /* Отрицательные температуры — это дополнительный код в двух байтах.
+     * Без явного приведения к int16_t они превращались бы в +4000 с копейками,
+     * а зимняя теплица — ровно тот случай, где это вылезет. */
+    equ(DS18B20_DecodeScratchpad(SP_NEG, &t), DS18B20_OK, "морозный ответ принят");
+    eqf(t, -10.125f, 0.0001f, "-10.125 C");
+
+    /* Та самая ошибка, которая доехала до архива: CRC8 от девяти нулей равен
+     * нулю, поэтому мёртвая шина проходила проверку и давала «валидные» 0.00 C —
+     * для почвы совершенно правдоподобное значение. */
+    memset(sp, 0, sizeof(sp));
+    equ(DS18B20_DecodeScratchpad(sp, &t), DS18B20_ERR_ALL_ZERO,
+        "сплошные нули отвергнуты, а не приняты за 0.00 C");
+
+    /* А вот честный ноль (с настоящим CRC и ненулевым остатком scratchpad)
+     * обязан пройти: иначе прибор ослепнет ровно на точке замерзания. */
+    equ(DS18B20_DecodeScratchpad(SP_0C, &t), DS18B20_OK, "настоящий 0.00 C принят");
+    eqf(t, 0.0f, 0.0001f, "0.00 C");
+
+    memcpy(sp, SP_25C, sizeof(sp));
+    sp[3] ^= 0x01;
+    equ(DS18B20_DecodeScratchpad(sp, &t), DS18B20_ERR_CRC, "битый байт пойман по CRC");
+
+    memcpy(sp, SP_25C, sizeof(sp));
+    sp[8] ^= 0xFF;
+    equ(DS18B20_DecodeScratchpad(sp, &t), DS18B20_ERR_CRC, "битый CRC пойман");
+
+    /* 85.00 C — значение, которое DS18B20 отдаёт после подачи питания, если
+     * преобразование не выполнялось. Сейчас оно проходит как валидное. Для
+     * почвы в теплице это физически невозможно, так что при желании его стоит
+     * отсеивать — тест фиксирует текущее поведение, чтобы смена была осознанной. */
+    equ(DS18B20_DecodeScratchpad(SP_85C, &t), DS18B20_OK, "85.00 C пока считается валидным");
+    eqf(t, 85.0f, 0.0001f, "85.00 C (значение по сбросу)");
+}
+
+/* --------------------------------------------------------------- батарея */
+
+static void test_battery(void)
+{
+    puts("Батарея");
+
+    equ(Battery_VoltsToPercent(4.20f), 100, "полный заряд");
+    equ(Battery_VoltsToPercent(5.00f), 100, "выше таблицы — не больше 100");
+    equ(Battery_VoltsToPercent(3.00f), 0,   "нижняя граница таблицы");
+    equ(Battery_VoltsToPercent(0.00f), 0,   "ниже таблицы — не меньше 0");
+    equ(Battery_VoltsToPercent(-1.0f), 0,   "отрицательное напряжение не ломает шкалу");
+
+    /* Узлы таблицы обязаны воспроизводиться точно: интерполяция не должна
+     * «съезжать» на краях отрезков. */
+    equ(Battery_VoltsToPercent(4.10f), 95, "узел 4.10 В");
+    equ(Battery_VoltsToPercent(3.70f), 52, "узел 3.70 В");
+    equ(Battery_VoltsToPercent(3.30f), 6,  "узел 3.30 В");
+
+    /* Середина отрезка 3.80(65 %) .. 3.70(52 %) — ровно половина между ними. */
+    equ(Battery_VoltsToPercent(3.75f), 59, "середина отрезка 3.80-3.70");
+
+    /* Монотонность: процент не имеет права расти при падении напряжения.
+     * Немонотонная кривая означала бы «заряд вырос сам собой» в архиве. */
+    int prev = 101, bad = 0;
+    for (int mv = 4500; mv >= 2500; mv--) {
+        int p = Battery_VoltsToPercent((float)mv / 1000.0f);
+        if (p > prev) bad++;
+        prev = p;
+    }
+    ok(bad == 0, "кривая монотонна на всём диапазоне 2.5-4.5 В");
+}
+
+/* ----------------------------------------------------------------- почва */
+
+static void test_soil(void)
+{
+    puts("Влажность почвы");
+
+    eqf(Soil_VoltageToMoisture(SOIL_AIR_VOLTS),   0.0f,   0.001f, "сухой воздух = 0 %");
+    eqf(Soil_VoltageToMoisture(SOIL_WATER_VOLTS), 100.0f, 0.001f, "вода = 100 %");
+    eqf(Soil_VoltageToMoisture((SOIL_AIR_VOLTS + SOIL_WATER_VOLTS) / 2.0f),
+        50.0f, 0.001f, "середина калибровки = 50 %");
+
+    /* Датчик ёмкостный и уходит за калибровку от температуры и от разброса
+     * экземпляров. Отдать наружу -7 % или 113 % значило бы записать в архив
+     * заведомо ложное число вместо честной границы шкалы. */
+    eqf(Soil_VoltageToMoisture(3.30f), 0.0f,   0.001f, "выше калибровки прижато к 0");
+    eqf(Soil_VoltageToMoisture(0.00f), 100.0f, 0.001f, "ниже калибровки прижато к 100");
+}
+
+int main(void)
+{
+    test_ds18b20();
+    test_battery();
+    test_soil();
+
+    printf("\n%d проверок, %d провалов\n", checks, failures);
+    return failures ? 1 : 0;
+}
