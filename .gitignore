@@ -15,3 +15,6 @@ Release/
 # OS cruft
 Thumbs.db
 .DS_Store
+
+# CubeIDE regenerates this per-machine (indexer env-hash); not source
+.settings/language.settings.xml
