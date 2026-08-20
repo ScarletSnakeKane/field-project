@@ -1,15 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Временная правка main.c для снятия архива через отладчик.
+"""Временная правка main.c для снятия архива и живых напряжений через отладчик.
 
 Плата отдаёт данные наружу только как USB-накопитель, то есть нужен физически
 воткнутый в компьютер кабель. Когда его нет (например, разработка идёт по
 одному лишь ST-Link), архив забирается так: прошивается сборка с этой правкой,
 она читает файл в ОЗУ и останавливается, а содержимое ОЗУ вычитывается по SWD.
 
+Заодно снимаются сырые показания, которых в CSV нет: напряжение датчика
+влажности почвы до пересчёта в проценты, напряжение банки и реальное VDD.
+Сырое напряжение почвы важно именно потому, что в CSV его не видно: пересчёт
+прижимает результат к нулю, и «датчик в сухом воздухе» выглядит там ровно так
+же, как «датчик оторван» — оба дают 0.00 %.
+
+Всё поле кладётся в одну структуру: раскладку отдельных переменных по .bss
+линкерволен менять, а у структуры смещения фиксированы, и читать её по SWD
+можно одним запросом.
+
 Правка НЕ предназначена для коммита — её накладывает и откатывает read_data.sh.
 Она только читает: архив на флеш при этом не меняется.
 """
-import io, sys
+import io
+import sys
 
 PATH = "Core/Src/main.c"
 
@@ -20,10 +31,17 @@ DECL = """
 
 /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — НЕ КОММИТИТЬ ==== */
 #define DUMP_MAX  32768U
-static uint8_t  dump_buf[DUMP_MAX];
-static volatile uint32_t dump_magic = 0;
-static volatile uint32_t dump_fsize = 0;
-static volatile uint32_t dump_len   = 0;"""
+typedef struct {
+    uint32_t magic;      /* 0xD00DFEED — дамп действительно выполнился */
+    uint32_t fsize;      /* размер data.txt на флеш */
+    uint32_t len;        /* сколько байт реально снято в буфер */
+    uint32_t soil_mv;    /* напряжение датчика почвы ДО пересчёта, мВ */
+    uint32_t bat_mv;     /* напряжение банки, мВ */
+    uint32_t vdd_mv;     /* реальное VDD через VREFINT, мВ */
+    uint32_t bat_pct;    /* заряд по кривой, % */
+} dump_info_t;
+static volatile dump_info_t dump_info;
+static uint8_t dump_buf[DUMP_MAX];"""
 
 DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — НЕ КОММИТИТЬ ====
    * Стоит строго ДО блока очистки архива ниже: тот удаляет файл при
@@ -33,14 +51,29 @@ DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — Н
       if (fs_ok && f_open(&df, DATA_FILE, FA_READ) == FR_OK)
       {
           UINT br = 0;
-          dump_fsize = (uint32_t)f_size(&df);
-          if (dump_fsize > DUMP_MAX)
-              f_lseek(&df, dump_fsize - DUMP_MAX);   /* не влезло — берём хвост */
+          dump_info.fsize = (uint32_t)f_size(&df);
+          if (dump_info.fsize > DUMP_MAX)
+              f_lseek(&df, dump_info.fsize - DUMP_MAX);   /* не влезло — берём хвост */
           f_read(&df, dump_buf, DUMP_MAX, &br);
-          dump_len = (uint32_t)br;
+          dump_info.len = (uint32_t)br;
           f_close(&df);
       }
-      dump_magic = 0xD00DFEEDU;
+
+      /* Питание датчиков в этой точке ещё включено (его снимает MX_GPIO_Init),
+       * но ёмкостному датчику нужно время на выход в режим. */
+      HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
+      HAL_Delay(SENSOR_POWERUP_DELAY_MS);
+
+      float sv = Soil_ReadVoltage();
+      dump_info.soil_mv = (sv != sv) ? 0xFFFFFFFFU : (uint32_t)(sv * 1000.0f);
+
+      Battery_Data bd;
+      Battery_Read(&bd);
+      dump_info.bat_mv  = (uint32_t)(bd.volts * 1000.0f);
+      dump_info.vdd_mv  = (uint32_t)(bd.vdd   * 1000.0f);
+      dump_info.bat_pct = bd.percent;
+
+      dump_info.magic = 0xD00DFEEDU;
       /* Дальше по main() не идём и в STOP не уходим: пока ядро крутится здесь,
        * SWD остаётся живым и дамп читается без гонки с циклом сна. */
       while (1) { __NOP(); }
@@ -48,9 +81,10 @@ DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — Н
 
 """
 
+
 def main():
     s = io.open(PATH, encoding="utf-8").read()
-    if "dump_magic" in s:
+    if "dump_info" in s:
         sys.exit("main.c уже пропатчен — сначала откатите правку")
     for a in (DECL_ANCHOR, DUMP_ANCHOR):
         if s.count(a) != 1:
@@ -59,5 +93,6 @@ def main():
     s = s.replace(DUMP_ANCHOR, DUMP + DUMP_ANCHOR, 1)
     io.open(PATH, "w", encoding="utf-8", newline="\r\n").write(s)
     print("дампер вставлен")
+
 
 main()

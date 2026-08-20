@@ -92,17 +92,46 @@ echo ">> 4/6 читаю ОЗУ"
 # любой правки, а молча прочитанный не тот кусок ОЗУ выглядел бы как испорченные
 # данные, а не как ошибка.
 BUF=$(grep -m1 '\.bss\.dump_buf' Debug/FieldSensor.map | awk '{print $2}')
-MAG=$(grep -A1 -m1 '\.bss\.dump_magic' Debug/FieldSensor.map | tail -1 | awk '{print $1}')
+INF=$(grep -m1 '\.bss\.dump_info' Debug/FieldSensor.map | awk '{print $2}')
+if [ -z "$INF" ]; then
+    INF=$(grep -A1 -m1 '\.bss\.dump_info' Debug/FieldSensor.map | tail -1 | awk '{print $1}')
+fi
 
-# Строка ответа выглядит так: "0x20009398 : D00DFEED 000001B9 000001B9"
-words=$(retry 20 " : " -c port=SWD mode=HOTPLUG -r32 "$MAG" 12 \
-        | grep -E "^0x[0-9A-Fa-f]+ : " | tail -1)
-magic=$(echo "$words" | awk '{print $3}')
-fsize=$((16#$(echo "$words" | awk '{print $4}')))
-len=$((16#$(echo "$words"   | awk '{print $5}')))
+# Ответ приходит строками вида "0x20009398 : D00DFEED 000001B9 000001B9 00000A73".
+# Семь слов структуры могут лечь и на две строки, поэтому склеиваем все слова
+# подряд, а не разбираем одну конкретную строку.
+read_info() {
+    "$PROG" -c port=SWD mode=HOTPLUG -r32 "$INF" 28 2>&1 | tr '\r' '\n' \
+        | grep -E "^0x[0-9A-Fa-f]+ : " | sed 's/^[^:]*: //' | tr ' ' '\n' \
+        | grep -E '^[0-9A-F]{8}$'
+}
 
-[ "$magic" = "D00DFEED" ] || { echo "дамп не выполнился (magic=$magic)" >&2; exit 1; }
+# Ждём именно маркер, а не просто успешный ответ отладчика. Читать структуру
+# один раз нельзя: дампер к моменту первого запроса ещё работает — монтирует
+# том, вычитывает архив (чем он длиннее, тем дольше) и выдерживает паузу на
+# выход датчиков в режим. Прочитанная в этот момент структура заполнена лишь
+# частично, и раньше это выглядело как «дамп не выполнился», хотя он просто
+# не успел.
+magic=""
+for attempt in $(seq 1 20); do
+    set -- $(read_info)
+    if [ "${1:-}" = "D00DFEED" ]; then
+        magic=$1; fsize=$((16#$2)); len=$((16#$3))
+        soil_mv=$4; bat_mv=$((16#$5)); vdd_mv=$((16#$6)); bat_pct=$((16#$7))
+        break
+    fi
+    sleep 2
+done
+
+[ "$magic" = "D00DFEED" ] || { echo "дамп не выполнился за 20 попыток" >&2; exit 1; }
 echo "   файл на флеш: $fsize Б, снято: $len Б"
+
+echo "   живой замер: батарея ${bat_mv} мВ (${bat_pct}%), VDD ${vdd_mv} мВ"
+if [ "$soil_mv" = "FFFFFFFF" ]; then
+    echo "   датчик почвы: АЦП не ответил"
+else
+    echo "   датчик почвы: $((16#$soil_mv)) мВ до пересчёта"
+fi
 
 if [ "$len" -gt 0 ]; then
     # Программатор читает только кратно четырём байтам, поэтому лишний хвост
