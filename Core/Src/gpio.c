@@ -144,6 +144,13 @@ void MX_GPIO_SleepPrepare(void)
   GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+  /* PA11/PA12 (USB D-/D+). После деинициализации стека HAL возвращает их в режим
+   * входа БЕЗ подтяжки, то есть бросает висеть в воздухе. Замер показал, что
+   * стоят такие «висящие» выводы дорого: линии флеша, оставленные так же,
+   * обошлись в 1.2 мА. Уводим в аналог, где входной триггер отключён. */
+  GPIO_InitStruct.Pin = GPIO_PIN_11|GPIO_PIN_12;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /* PA6 (MISO) — выход флеш, при CS=HIGH он в высокоимпедансном состоянии,
    * поэтому наш вход оставлять «плавающим» нельзя. */
   GPIO_InitStruct.Pin = GPIO_PIN_6;
