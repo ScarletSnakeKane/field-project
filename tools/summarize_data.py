@@ -20,7 +20,13 @@ FLAG_COLS = ("soil_valid", "lse_ok")
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "build/data.txt"
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    # Когда архив не влез в буфер, дампер отдаёт окна по всей длине файла,
+    # а не сплошной кусок. Разрывы между окнами тогда — след способа снятия,
+    # а не пропущенные записи, и подавать их как пропуски значит пугать зря.
+    windowed = "--windowed" in sys.argv
+
+    path = args[0] if args else "build/data.txt"
     raw = open(path, "rb").read()
 
     text = raw.decode("ascii", "replace").replace("\r\n", "\n").replace("\r", "\n")
@@ -82,8 +88,15 @@ def main():
         gaps = [(ts[i + 1] - ts[i]).total_seconds() for i in range(len(ts) - 1)]
         if gaps:
             common = collections.Counter(gaps).most_common(3)
-            print("  интервал, с: " +
-                  ", ".join("%g (x%d)" % (g, n) for g, n in common))
+            if windowed:
+                # Оставляем только рабочий интервал: остальное — стыки окон.
+                modal = common[0][0]
+                jumps = sum(1 for g in gaps if g > modal * 2)
+                print("  интервал, с: %g (x%d); %d разрывов — стыки окон, "
+                      "не пропуски" % (common[0][0], common[0][1], jumps))
+            else:
+                print("  интервал, с: " +
+                      ", ".join("%g (x%d)" % (g, n) for g, n in common))
             # Время назад — это перепрошивка: часы переставляются на время
             # сборки. Не поломка, но метки через обновление не монотонны.
             back = sum(1 for g in gaps if g < 0)

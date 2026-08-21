@@ -30,11 +30,16 @@ DUMP_ANCHOR = "  // 2b) Архив начинается заново в двух
 DECL = """
 
 /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — НЕ КОММИТИТЬ ==== */
-#define DUMP_MAX  32768U
+#define DUMP_MAX    32768U
+#define DUMP_WIN    1024U    /* размер одного окна при разреженном снятии */
+
 typedef struct {
     uint32_t magic;      /* 0xD00DFEED — дамп действительно выполнился */
     uint32_t fsize;      /* размер data.txt на флеш */
     uint32_t len;        /* сколько байт реально снято в буфер */
+    uint32_t win_bytes;  /* размер окна; 0 — файл снят целиком, подряд */
+    uint32_t win_count;  /* сколько окон лежит в буфере подряд */
+    uint32_t win_step;   /* шаг между началами окон в файле */
     uint32_t soil_mv;    /* напряжение датчика почвы ДО пересчёта, мВ */
     uint32_t bat_mv;     /* напряжение банки, мВ */
     uint32_t vdd_mv;     /* реальное VDD через VREFINT, мВ */
@@ -51,11 +56,45 @@ DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — Н
       if (fs_ok && f_open(&df, DATA_FILE, FA_READ) == FR_OK)
       {
           UINT br = 0;
-          dump_info.fsize = (uint32_t)f_size(&df);
-          if (dump_info.fsize > DUMP_MAX)
-              f_lseek(&df, dump_info.fsize - DUMP_MAX);   /* не влезло — берём хвост */
-          f_read(&df, dump_buf, DUMP_MAX, &br);
-          dump_info.len = (uint32_t)br;
+          uint32_t fsize = (uint32_t)f_size(&df);
+          dump_info.fsize = fsize;
+
+          if (fsize <= DUMP_MAX)
+          {
+              /* Влезает целиком — снимаем подряд, без потерь. */
+              f_read(&df, dump_buf, DUMP_MAX, &br);
+              dump_info.len = (uint32_t)br;
+          }
+          else
+          {
+              /* Не влезает. Хвост брать нельзя: за сутки архив перерастает буфер
+               * в несколько раз, и по одному хвосту не увидеть ни тренда батареи,
+               * ни того, что происходило ночью. Поэтому берём окна, равномерно
+               * разложенные по всей длине файла: каждое — десяток целых строк,
+               * а вместе они покрывают весь период. Первое окно начинается с
+               * нуля, так что заголовок всегда на месте. */
+              const uint32_t count = DUMP_MAX / DUMP_WIN;
+              const uint32_t step  = (fsize - DUMP_WIN) / (count - 1);
+              uint32_t got = 0;
+
+              for (uint32_t i = 0; i < count; i++)
+              {
+                  UINT part = 0;
+                  if (f_lseek(&df, i * step) != FR_OK)
+                      break;
+                  if (f_read(&df, dump_buf + got, DUMP_WIN, &part) != FR_OK)
+                      break;
+                  got += part;
+                  if (part < DUMP_WIN)
+                      break;
+              }
+
+              dump_info.len       = got;
+              dump_info.win_bytes = DUMP_WIN;
+              dump_info.win_count = count;
+              dump_info.win_step  = step;
+              br = got;
+          }
           f_close(&df);
       }
 

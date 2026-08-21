@@ -101,7 +101,7 @@ fi
 # Семь слов структуры могут лечь и на две строки, поэтому склеиваем все слова
 # подряд, а не разбираем одну конкретную строку.
 read_info() {
-    "$PROG" -c port=SWD mode=HOTPLUG -r32 "$INF" 28 2>&1 | tr '\r' '\n' \
+    "$PROG" -c port=SWD mode=HOTPLUG -r32 "$INF" 40 2>&1 | tr '\r' '\n' \
         | grep -E "^0x[0-9A-Fa-f]+ : " | sed 's/^[^:]*: //' | tr ' ' '\n' \
         | grep -E '^[0-9A-F]{8}$'
 }
@@ -117,7 +117,8 @@ for attempt in $(seq 1 20); do
     set -- $(read_info)
     if [ "${1:-}" = "D00DFEED" ]; then
         magic=$1; fsize=$((16#$2)); len=$((16#$3))
-        soil_mv=$4; bat_mv=$((16#$5)); vdd_mv=$((16#$6)); bat_pct=$((16#$7))
+        win_bytes=$((16#$4)); win_count=$((16#$5)); win_step=$((16#$6))
+        soil_mv=$7; bat_mv=$((16#$8)); vdd_mv=$((16#$9)); bat_pct=$((16#${10}))
         break
     fi
     sleep 2
@@ -125,6 +126,9 @@ done
 
 [ "$magic" = "D00DFEED" ] || { echo "дамп не выполнился за 20 попыток" >&2; exit 1; }
 echo "   файл на флеш: $fsize Б, снято: $len Б"
+if [ "$win_bytes" -gt 0 ]; then
+    echo "   архив больше буфера: взято $win_count окон по $win_bytes Б с шагом $win_step Б"
+fi
 
 echo "   живой замер: батарея ${bat_mv} мВ (${bat_pct}%), VDD ${vdd_mv} мВ"
 if [ "$soil_mv" = "FFFFFFFF" ]; then
@@ -140,8 +144,9 @@ if [ "$len" -gt 0 ]; then
     retry 20 "read successfully" \
         -c port=SWD mode=HOTPLUG -r "$BUF" "$rounded" "$(cygpath -w "$TMPBIN")" >/dev/null
     python -c "import sys; open(sys.argv[1],'wb').write(open(sys.argv[2],'rb').read()[:int(sys.argv[3])])" \
-        "$OUT" "$TMPBIN" "$len"
-    rm -f "$TMPBIN"
+        "$TMPBIN.cut" "$TMPBIN" "$len"
+    python "$ROOT/tools/unpack_dump.py" "$TMPBIN.cut" "$OUT" "$win_bytes" "$win_count"
+    rm -f "$TMPBIN" "$TMPBIN.cut"
     echo "   записано: $OUT"
 else
     echo "   файл на плате пуст" >&2
@@ -157,4 +162,8 @@ RESTORED_FW=1
 echo ">> готово"
 
 echo
-python "$ROOT/tools/summarize_data.py" "$OUT"
+if [ "${win_bytes:-0}" -gt 0 ]; then
+    python "$ROOT/tools/summarize_data.py" "$OUT" --windowed
+else
+    python "$ROOT/tools/summarize_data.py" "$OUT"
+fi
