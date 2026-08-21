@@ -36,9 +36,19 @@ extern RTC_HandleTypeDef hrtc;
 
 /* USER CODE BEGIN Private defines */
 
-/* Periodic sensor-sample wake interval, in seconds (RTC_WAKEUPCLOCK_CK_SPRE_16BITS = 1s ticks).
- * TEST value for bench-measuring STOP-mode current — switch to 3600 (1 hour) for field deployment. */
-#define RTC_WAKEUP_INTERVAL_SEC   15U
+/* Интервал между замерами, в секундах (RTC_WAKEUPCLOCK_CK_SPRE_16BITS = тики по 1 с).
+ *
+ * Боевое значение: раз в час. Счётчик 16-битный, так что верхний предел этого
+ * режима — 65535 с, и запас ещё есть.
+ *
+ * Внимание при отладке: при часовом интервале плата бодрствует полторы секунды
+ * из трёх с половиной тысяч, а в STOP отладочный порт обесточен — попасть в
+ * неё программатором вслепую практически невозможно. Чтобы прошить или снять
+ * данные, нажмите и удерживайте KEY: нажатие будит плату из STOP, а удержание
+ * не даёт ей заснуть снова. Короткие значения (15-30 с) удобны для стенда, но
+ * в поле дают среднее потребление на порядки выше — вся экономия проекта
+ * держится на том, что прибор спит почти всё время. */
+#define RTC_WAKEUP_INTERVAL_SEC   3600U
 
 /* USER CODE END Private defines */
 

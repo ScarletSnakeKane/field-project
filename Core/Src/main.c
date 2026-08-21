@@ -49,11 +49,6 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* TEST-ONLY: deliberate hold-awake window after each sample, so STOP-mode current
- * is easy to see as a clean step on an ammeter/scope, and to leave a window for
- * ST-Link access without needing a reset-based connect. Remove/shrink for production. */
-#define TEST_AWAKE_HOLD_MS   10000U
-
 /* Время на стабилизацию питания датчиков (AHT20/DS18B20/почва) после включения PA0. */
 #define SENSOR_POWERUP_DELAY_MS   500U
 
@@ -123,6 +118,66 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* Один цикл сна: погасить периферию, уйти в STOP и подняться обратно.
+ * Вынесено из main() отдельной функцией, чтобы первый замер после включения
+ * можно было сделать не засыпая, не дублируя при этом весь блок. */
+static void SleepUntilNextSample(void)
+{
+  /* --- Пока кнопка удерживается, в сон не уходим ---
+   * Это режим "живого" USB: пользователь держит KEY, пока хост читает файл,
+   * и устройство не пропадает с шины на время STOP. Датчики при этом уже
+   * обесточены в конце прошлой итерации, так что лишнего тока не тратим. */
+  uint32_t t_hold0    = HAL_GetTick();
+  uint32_t hold_ms    = 0;
+  while (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET)
+  {
+      hold_ms = HAL_GetTick() - t_hold0;
+      if (hold_ms >= BTN_HOLD_MAX_MS)
+          break;   /* кнопка залипла — засыпаем, чтобы не высадить батарею */
+
+      HAL_Delay(BTN_HOLD_POLL_MS);
+  }
+
+  /* Флеш — на постоянном питании, гасить её нечем, кроме Deep Power-Down.
+   * Делаем это только сейчас: пока кнопка удерживалась (USB-сессия выше),
+   * хост мог читать диск, и усыплять флеш было нельзя. */
+  SPI_Flash_DeepPowerDown();
+
+  /* Гасим периферию шин. Порядок важен: SPI деинициализируем строго ПОСЛЕ
+   * команды Deep Power-Down выше — иначе её нечем было бы отправить. */
+  HAL_SPI_DeInit(&hspi1);
+  HAL_I2C_DeInit(&hi2c1);
+
+  /* HAL_..._DeInit оставляет выводы «плавающими» входами, а не в аналоге,
+   * поэтому доводим их до тихого состояния вручную. */
+  MX_GPIO_SleepPrepare();
+
+  /* --- уход в сон: STOP mode, будим только по RTC Wakeup Timer ---
+   * Таймер перевзводим заново перед каждым входом в STOP, чтобы длительность сна
+   * была стабильной (RTC_WAKEUP_INTERVAL_SEC) каждый цикл, а не "плавала" от фазы
+   * свободно бегущего таймера относительно переменной длины активной фазы. */
+  HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+  HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, RTC_WAKEUP_INTERVAL_SEC, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+
+  woke_by_button = 0;   /* сбрасываем перед сном: интересен источник ЭТОГО пробуждения */
+
+  HAL_SuspendTick();
+  HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+  /* --- пробуждение: ядро на HSI без PLL, обязательно поднять клоки прежде чем
+   * трогать что-либо ещё (I2C/SPI/ADC/DWT-задержки зависят от реальной частоты) --- */
+  SystemClock_Config();
+  HAL_ResumeTick();
+
+  /* Возвращаем выводы 1-Wire из аналога и поднимаем SPI — обязательно до
+   * любого обращения к флеш, иначе команду пробуждения будет некому послать. */
+  MX_GPIO_SleepRestore();
+  MX_SPI1_Init();
+
+  /* Будим флеш до любого обращения к ней (в DPD она игнорирует все команды, кроме 0xAB). */
+  SPI_Flash_ReleasePowerDown();
+}
 
 /* USER CODE END 0 */
 
@@ -288,61 +343,17 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  /* Первый проход замеряет сразу, без сна. Иначе после включения архив
+   * оставался бы пустым весь первый интервал — в поле это час, в течение
+   * которого исправный прибор неотличим от мёртвого. Одна строка при
+   * установке стоит копейки и сразу подтверждает, что прибор жив. */
+  uint8_t first_pass = 1;
+
   while (1)
   {
-	  /* --- Пока кнопка удерживается, в сон не уходим ---
-	   * Это режим "живого" USB: пользователь держит KEY, пока хост читает файл,
-	   * и устройство не пропадает с шины на время STOP. Датчики при этом уже
-	   * обесточены в конце прошлой итерации, так что лишнего тока не тратим. */
-	  uint32_t t_hold0    = HAL_GetTick();
-	  uint32_t hold_ms    = 0;
-	  while (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET)
-	  {
-	      hold_ms = HAL_GetTick() - t_hold0;
-	      if (hold_ms >= BTN_HOLD_MAX_MS)
-	          break;   /* кнопка залипла — засыпаем, чтобы не высадить батарею */
-
-	      HAL_Delay(BTN_HOLD_POLL_MS);
-	  }
-
-	  /* Флеш — на постоянном питании, гасить её нечем, кроме Deep Power-Down.
-	   * Делаем это только сейчас: пока кнопка удерживалась (USB-сессия выше),
-	   * хост мог читать диск, и усыплять флеш было нельзя. */
-	  SPI_Flash_DeepPowerDown();
-
-	  /* Гасим периферию шин. Порядок важен: SPI деинициализируем строго ПОСЛЕ
-	   * команды Deep Power-Down выше — иначе её нечем было бы отправить. */
-	  HAL_SPI_DeInit(&hspi1);
-	  HAL_I2C_DeInit(&hi2c1);
-
-	  /* HAL_..._DeInit оставляет выводы «плавающими» входами, а не в аналоге,
-	   * поэтому доводим их до тихого состояния вручную. */
-	  MX_GPIO_SleepPrepare();
-
-	  /* --- уход в сон: STOP mode, будим только по RTC Wakeup Timer ---
-	   * Таймер перевзводим заново перед каждым входом в STOP, чтобы длительность сна
-	   * была стабильной (RTC_WAKEUP_INTERVAL_SEC) каждый цикл, а не "плавала" от фазы
-	   * свободно бегущего таймера относительно переменной длины активной фазы. */
-	  HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
-	  HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, RTC_WAKEUP_INTERVAL_SEC, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
-
-	  woke_by_button = 0;   /* сбрасываем перед сном: интересен источник ЭТОГО пробуждения */
-
-	  HAL_SuspendTick();
-	  HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
-
-	  /* --- пробуждение: ядро на HSI без PLL, обязательно поднять клоки прежде чем
-	   * трогать что-либо ещё (I2C/SPI/ADC/DWT-задержки зависят от реальной частоты) --- */
-	  SystemClock_Config();
-	  HAL_ResumeTick();
-
-	  /* Возвращаем выводы 1-Wire из аналога и поднимаем SPI — обязательно до
-	   * любого обращения к флеш, иначе команду пробуждения будет некому послать. */
-	  MX_GPIO_SleepRestore();
-	  MX_SPI1_Init();
-
-	  /* Будим флеш до любого обращения к ней (в DPD она игнорирует все команды, кроме 0xAB). */
-	  SPI_Flash_ReleasePowerDown();
+	  if (!first_pass)
+	      SleepUntilNextSample();
+	  first_pass = 0;
 
 	  /* --- включаем датчики (LOW) --- */
 	  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
@@ -459,10 +470,6 @@ int main(void)
 
 	  /* --- выключаем датчики перед сном (HIGH) --- */
 	  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_SET);
-
-	  /* TEST-ONLY: держим МК бодрствующим ещё TEST_AWAKE_HOLD_MS перед следующим STOP —
-	   * см. TEST_AWAKE_HOLD_MS выше. */
-	  HAL_Delay(TEST_AWAKE_HOLD_MS);
 	}
     /* USER CODE END WHILE */
 
