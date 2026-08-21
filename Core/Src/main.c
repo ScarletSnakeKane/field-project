@@ -165,6 +165,18 @@ static void SleepUntilNextSample(void)
    * поэтому доводим их до тихого состояния вручную. */
   MX_GPIO_SleepPrepare();
 
+  /* Гасим USB-стек. Досюда мы доходим только когда VBUS низкий, то есть хост
+   * не подключён и рвать нечего. Аналоговая часть трансивера OTG FS питается
+   * от VDD и продолжает потреблять в STOP, даже когда тактирование снято. */
+  USBD_Stop(&hUsbDeviceFS);
+  USBD_DeInit(&hUsbDeviceFS);
+
+  /* Отключаем трассировочный блок ядра. С поднятым TRCENA отладочная логика
+   * остаётся под питанием и во сне — это сотни микроампер на ровном месте.
+   * DWT нужен только для микросекундных задержек 1-Wire в активной фазе. */
+  DWT->CTRL &= ~DWT_CTRL_CYCCNTENA_Msk;
+  CoreDebug->DEMCR &= ~CoreDebug_DEMCR_TRCENA_Msk;
+
   /* --- уход в сон: STOP mode, будим только по RTC Wakeup Timer ---
    * Таймер перевзводим заново перед каждым входом в STOP, чтобы длительность сна
    * была стабильной (RTC_WAKEUP_INTERVAL_SEC) каждый цикл, а не "плавала" от фазы
@@ -189,6 +201,15 @@ static void SleepUntilNextSample(void)
 
   /* Будим флеш до любого обращения к ней (в DPD она игнорирует все команды, кроме 0xAB). */
   SPI_Flash_ReleasePowerDown();
+
+  /* Возвращаем трассировочный блок: без него не работают задержки 1-Wire. */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  /* И USB — чтобы устройство было готово к подключению кабеля в любой момент
+   * бодрствования, а не только после следующего цикла. */
+  MX_USB_DEVICE_Init();
 }
 
 /* USER CODE END 0 */
