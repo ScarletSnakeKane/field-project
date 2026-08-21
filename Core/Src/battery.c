@@ -39,6 +39,11 @@ uint8_t Battery_Read(Battery_Data *out)
     if (!ADC_ReadChannel(ADC_CHANNEL_VREFINT, VREF_SAMPLE_TIME, &raw_ref))
         return 0;
 
+    /* Гасим внутренний опорный источник. HAL включает его при выборе канала 17
+     * и снимает только когда следующим настраивают обычный канал — а следующего
+     * в цикле уже нет, и блок остаётся под питанием до самого утра. */
+    ADC1_COMMON->CCR &= ~ADC_CCR_TSVREFE;
+
     if (raw_ref == 0)
         return 0;   /* защита от деления на ноль, если опорный канал не поднялся */
 
