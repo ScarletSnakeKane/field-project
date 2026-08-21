@@ -281,7 +281,18 @@ int main(void)
 
   // Состояние кнопки на момент старта читаем сразу: это жест «стереть архив»,
   // и пользователь отпустит кнопку через мгновение после сброса.
-  uint8_t wipe_requested = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET);
+  /* Жест «стереть архив» — зажатая KEY в момент старта. Но одной кнопки мало:
+   * чтобы прошить спящую плату, её приходится держать, а программатор в конце
+   * делает программный сброс — и старт происходит с зажатой кнопкой. В таком
+   * виде жест стирал бы данные при каждом обновлении прошивки.
+   * Поэтому дополнительно смотрим, откуда пришёл сброс: программный (SFTRST)
+   * означает программатор и стирание не запускает, а сброс кнопкой RESET или
+   * подача питания — запускает. */
+  uint8_t soft_reset = (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST) != RESET);
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+
+  uint8_t wipe_requested = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET)
+                        && !soft_reset;
 
   // Включаем питание датчиков (LOW)
   HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
