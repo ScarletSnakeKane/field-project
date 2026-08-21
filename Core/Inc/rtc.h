@@ -48,7 +48,7 @@ extern RTC_HandleTypeDef hrtc;
  * не даёт ей заснуть снова. Короткие значения (15-30 с) удобны для стенда, но
  * в поле дают среднее потребление на порядки выше — вся экономия проекта
  * держится на том, что прибор спит почти всё время. */
-#define RTC_WAKEUP_INTERVAL_SEC   3600U
+#define RTC_WAKEUP_INTERVAL_SEC   60U
 
 /* USER CODE END Private defines */
 
