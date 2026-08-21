@@ -98,6 +98,8 @@ DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — Н
           f_close(&df);
       }
 
+      DUMP_WIPE_HOOK
+
       /* Питание датчиков в этой точке ещё включено (его снимает MX_GPIO_Init),
        * но ёмкостному датчику нужно время на выход в режим. */
       HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
@@ -121,7 +123,20 @@ DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — Н
 """
 
 
+# Очистка идёт строго ПОСЛЕ того, как архив уже вычитан в ОЗУ, и только по явной
+# просьбе. Так «снять и начать заново» остаётся одним действием: собранное не
+# теряется, а на флеш остаётся пустой файл с одним заголовком.
+WIPE = """/* Архив уже лежит в ОЗУ — можно удалять. Здесь файл только исчезает:
+       * дампер ниже останавливается и до кода, создающего заголовок, не
+       * доходит. Заново файл появится при следующей загрузке, когда на плату
+       * вернётся рабочая прошивка — она увидит отсутствие файла, создаст его
+       * с заголовком и тут же запишет первый замер. */
+      f_unlink(DATA_FILE);"""
+
+
 def main():
+    wipe = "--wipe" in sys.argv
+
     s = io.open(PATH, encoding="utf-8").read()
     if "dump_info" in s:
         sys.exit("main.c уже пропатчен — сначала откатите правку")
@@ -130,8 +145,9 @@ def main():
             sys.exit("не найден якорь: %s" % a)
     s = s.replace(DECL_ANCHOR, DECL_ANCHOR + DECL, 1)
     s = s.replace(DUMP_ANCHOR, DUMP + DUMP_ANCHOR, 1)
+    s = s.replace("DUMP_WIPE_HOOK", WIPE if wipe else "")
     io.open(PATH, "w", encoding="utf-8", newline="\r\n").write(s)
-    print("дампер вставлен")
+    print("дампер вставлен" + (" (с очисткой архива)" if wipe else ""))
 
 
 main()

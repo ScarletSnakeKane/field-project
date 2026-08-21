@@ -7,12 +7,22 @@
 # вернуть main.c -> собрать -> прошить обратно рабочую версию.
 # Архив на флеш при этом только читается.
 #
-#   ./tools/read_data.sh [выходной_файл]      (по умолчанию build/data.txt)
+#   ./tools/read_data.sh [выходной_файл] [--wipe]
+#
+# --wipe очищает архив на плате ПОСЛЕ того, как он вычитан и сохранён на диск.
+# Файл заново создаст вернувшаяся рабочая прошивка — с заголовком и первым
+# замером. Собранные данные при этом не теряются, они уже в выходном файле.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-OUT="${1:-$ROOT/build/data.txt}"
+
+WIPE=""
+ARGS=()
+for a in "$@"; do
+    if [ "$a" = "--wipe" ]; then WIPE="--wipe"; else ARGS+=("$a"); fi
+done
+OUT="${ARGS[0]:-$ROOT/build/data.txt}"
 mkdir -p "$(dirname "$OUT")"
 
 PLUGINS="/e/ProgramData/ST/STM32CubeIDE_2.2.0/STM32CubeIDE/plugins"
@@ -80,7 +90,7 @@ echo ">> 1/6 сохраняю main.c"
 cp "$ROOT/Core/Src/main.c" "$BACKUP"
 
 echo ">> 2/6 вставляю дампер и собираю"
-python tools/dump_patch.py
+python tools/dump_patch.py $WIPE
 "$ROOT/tools/dev.sh" build >/dev/null
 
 echo ">> 3/6 прошиваю дампер"
