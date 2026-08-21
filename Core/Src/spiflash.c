@@ -88,6 +88,27 @@ void SPI_Flash_Init(void)
     SPI_Flash_GlobalUnprotect();
 }
 
+uint8_t SPI_Flash_Probe(void)
+{
+    uint8_t cmd = FLASH_CMD_RDID;
+    uint8_t id[3] = {0};
+
+    FLASH_CS_LOW();
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, FLASH_SPI_TIMEOUT_MS);
+    HAL_SPI_Receive(&hspi1, id, sizeof(id), FLASH_SPI_TIMEOUT_MS);
+    FLASH_CS_HIGH();
+
+    /* Конкретный ID не проверяем: припаять могут другую совместимую микросхему,
+     * и жёсткая сверка превратилась бы в ложный отказ. Нас интересует только
+     * одно — есть ли на шине хоть кто-то. Молчащая линия читается как сплошные
+     * нули (подтянута вниз) либо сплошные единицы (подтянута вверх). */
+    if ((id[0] == 0x00 && id[1] == 0x00 && id[2] == 0x00) ||
+        (id[0] == 0xFF && id[1] == 0xFF && id[2] == 0xFF))
+        return 0;
+
+    return 1;
+}
+
 void SPI_Flash_Read(uint32_t addr, uint8_t *buf, uint32_t len)
 {
     uint8_t cmd[4];

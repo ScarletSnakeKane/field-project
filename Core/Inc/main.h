@@ -69,6 +69,12 @@ void Error_Handler(void);
 #define WAKE_BTN_GPIO_Port     GPIOA
 #define WAKE_BTN_Pin           GPIO_PIN_0
 
+/* Определение подключения USB: делитель с VBUS заведён на PA9, есть питание = HIGH.
+ * Внутреннюю подтяжку включать НЕЛЬЗЯ — нижнее плечо делителя уже играет её роль,
+ * а внутренняя встала бы параллельно ему и завалила уровень ниже порога единицы. */
+#define VBUS_GPIO_Port         GPIOA
+#define VBUS_Pin               GPIO_PIN_9
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

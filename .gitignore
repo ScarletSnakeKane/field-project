@@ -15,3 +15,6 @@ Release/
 # OS cruft
 Thumbs.db
 .DS_Store
+
+# Выгрузки с платы (tools/read_data.sh)
+build/

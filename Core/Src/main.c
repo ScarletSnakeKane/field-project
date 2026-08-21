@@ -35,6 +35,7 @@
 #include "soil_sensor.h"
 #include "battery.h"
 #include "ds18b20.h"
+#include "power_policy.h"
 #include "usbd_core.h"
 #include "usbd_def.h"
 #include <stdio.h>
@@ -48,11 +49,6 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
-/* TEST-ONLY: deliberate hold-awake window after each sample, so STOP-mode current
- * is easy to see as a clean step on an ammeter/scope, and to leave a window for
- * ST-Link access without needing a reset-based connect. Remove/shrink for production. */
-#define TEST_AWAKE_HOLD_MS   10000U
 
 /* Время на стабилизацию питания датчиков (AHT20/DS18B20/почва) после включения PA0. */
 #define SENSOR_POWERUP_DELAY_MS   500U
@@ -83,11 +79,18 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 /* Набор колонок CSV. Держим одной строкой, чтобы при старте сверить с тем, что
  * уже лежит в файле: состав колонок меняется от версии к версии, а архив теперь
  * переживает перезагрузку — иначе строки разного формата смешались бы в одном файле. */
+/* Сначала то, ради чего прибор существует, затем состояние питания, затем
+ * диагностика. Отладочные колонки времени цикла и внутренних кодов AHT20 сняты:
+ * они своё отработали — за весь снятый архив ни одной ошибки, — а платил за них
+ * архив своей длиной. Оставшиеся нужны и в поле: по ним видно, ПОЧЕМУ значение
+ * отсутствует, вместо того чтобы гадать над пустой ячейкой.
+ *   soil_valid    — 0, если банка просела ниже дропаута LDO и опора АЦП уплыла;
+ *   lse_ok        — 0, если часовой кварц не завёлся: тогда времени верить нельзя;
+ *   aht_*, ds_err — почему не прочитались воздух и почва;
+ *   write_fails   — сколько строк за всю жизнь не удалось записать. */
 #define CSV_HEADER "timestamp,air_temp,air_hum,soil_temp,soil_hum," \
-                   "aht_init_st,aht_read_st,aht_i2c_err,aht_ready_ms," \
-                   "t_sensors_ms,t_write_ms,aht_status,btn,lse_ok,ds_err," \
-                   "wake_src,hold_ms,write_fails," \
-                   "bat_pct,vbat,vdd,soil_valid"
+                   "bat_pct,vbat,soil_valid,lse_ok," \
+                   "aht_init_st,aht_read_st,ds_err,write_fails"
 
 /* USER CODE END PD */
 
@@ -117,11 +120,117 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-static void Log(const char *msg)
+/* Один цикл сна: погасить периферию, уйти в STOP и подняться обратно.
+ * Вынесено из main() отдельной функцией, чтобы первый замер после включения
+ * можно было сделать не засыпая, не дублируя при этом весь блок. */
+static void SleepUntilNextSample(void)
 {
-  // если позже добавишь UART — заменишь на HAL_UART_Transmit
-  // пока можно оставить пустым или использовать semihosting
+  /* --- Не уходим в сон, пока удерживают кнопку или подключён USB ---
+   * Уход в STOP рвёт USB-сессию и портит файл на стороне хоста, поэтому оба
+   * признака означают одно: устройство обязано остаться на шине. Кнопка —
+   * ручной способ, VBUS — то же самое автоматически, без нажатий.
+   * Датчики к этому моменту уже обесточены, лишнего тока не тратим. */
+  uint32_t t_hold0 = HAL_GetTick();
+  uint32_t hold_ms = 0;
+  while (1)
+  {
+      uint8_t btn_held    = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET);
+      uint8_t usb_present = (HAL_GPIO_ReadPin(VBUS_GPIO_Port, VBUS_Pin) == GPIO_PIN_SET);
+
+      hold_ms = HAL_GetTick() - t_hold0;
+
+      /* Само правило — в power_policy.c, вместе с объяснением, почему потолок
+       * по времени действует только на кнопку и не действует на USB. Здесь
+       * остаётся лишь опрос выводов. */
+      if (Policy_MayEnterSleep(btn_held, usb_present, hold_ms, BTN_HOLD_MAX_MS))
+          break;
+
+      HAL_Delay(BTN_HOLD_POLL_MS);
+  }
+
+  /* Флеш — на постоянном питании, гасить её нечем, кроме Deep Power-Down.
+   * Делаем это только сейчас: пока шла USB-сессия (условие выше),
+   * хост мог читать диск, и усыплять флеш было нельзя. */
+  SPI_Flash_DeepPowerDown();
+
+  /* Гасим периферию шин. Порядок важен: SPI деинициализируем строго ПОСЛЕ
+   * команды Deep Power-Down выше — иначе её нечем было бы отправить. */
+  HAL_SPI_DeInit(&hspi1);
+  HAL_I2C_DeInit(&hi2c1);
+
+  /* Гасим USB-стек. Досюда мы доходим только когда VBUS низкий, то есть хост
+   * не подключён и рвать нечего. Аналоговая часть трансивера OTG FS питается
+   * от VDD и продолжает потреблять в STOP, даже когда тактирование снято. */
+  USBD_Stop(&hUsbDeviceFS);
+
+  /* Погасить встроенный трансивер вручную: HAL_PCD_DeInit этого не делает,
+   * бит PWRDWN остаётся взведённым, и аналоговая часть USB продолжает питаться
+   * весь сон. Сделать это надо ДО деинициализации — она отключает тактирование
+   * периферии, после чего регистр станет недоступен для записи. */
+  USB_OTG_FS->GCCFG &= ~USB_OTG_GCCFG_PWRDWN;
+
+  USBD_DeInit(&hUsbDeviceFS);
+
+  /* Парковка выводов — строго ПОСЛЕ всех деинициализаций. Каждая из них внутри
+   * себя дёргает HAL_GPIO_DeInit и возвращает свои выводы в плавающий вход,
+   * так что любая парковка, сделанная раньше, была бы просто затёрта. */
+  MX_GPIO_SleepPrepare();
+
+  /* Отключаем трассировочный блок ядра. С поднятым TRCENA отладочная логика
+   * остаётся под питанием и во сне — это сотни микроампер на ровном месте.
+   * DWT нужен только для микросекундных задержек 1-Wire в активной фазе. */
+  DWT->CTRL &= ~DWT_CTRL_CYCCNTENA_Msk;
+  CoreDebug->DEMCR &= ~CoreDebug_DEMCR_TRCENA_Msk;
+
+  /* --- уход в сон: STOP mode, будим только по RTC Wakeup Timer ---
+   * Таймер перевзводим заново перед каждым входом в STOP, чтобы длительность сна
+   * была стабильной (RTC_WAKEUP_INTERVAL_SEC) каждый цикл, а не "плавала" от фазы
+   * свободно бегущего таймера относительно переменной длины активной фазы. */
+  HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+  HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, RTC_WAKEUP_INTERVAL_SEC, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+
+  woke_by_button = 0;   /* сбрасываем перед сном: интересен источник ЭТОГО пробуждения */
+
+  /* Отладочный блок не должен переживать STOP. Программатор при подключении
+   * выставляет DBG_STOP, чтобы можно было ставить точки останова в спящем МК,
+   * и этот бит держит отладочную логику и тактирование живыми весь сон —
+   * сотни микроампер. Сам по себе он сбрасывается только по сбросу питания,
+   * поэтому после отладки прибор может месяцами жить с включённой отладкой
+   * и никто не заметит. Гасим явно на каждом цикле. */
+  HAL_DBGMCU_DisableDBGStopMode();
+
+  /* Обесточить внутреннюю флеш-память на время STOP. Иначе её стабилизатор
+   * остаётся под нагрузкой всю ночь ради содержимого, которое всё равно не
+   * читается: ядро стоит. Платим за это лишними микросекундами на пробуждение —
+   * флеш надо снова поднять, — что на фоне часового интервала незаметно. */
+  HAL_PWREx_EnableFlashPowerDown();
+
+  HAL_SuspendTick();
+  HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+  /* --- пробуждение: ядро на HSI без PLL, обязательно поднять клоки прежде чем
+   * трогать что-либо ещё (I2C/SPI/ADC/DWT-задержки зависят от реальной частоты) --- */
+  SystemClock_Config();
+  HAL_ResumeTick();
+
+  /* Возвращаем выводы 1-Wire из аналога и поднимаем SPI — обязательно до
+   * любого обращения к флеш, иначе команду пробуждения будет некому послать. */
+  MX_GPIO_SleepRestore();
+  MX_SPI1_Init();
+
+  /* Будим флеш до любого обращения к ней (в DPD она игнорирует все команды, кроме 0xAB). */
+  SPI_Flash_ReleasePowerDown();
+
+  /* Возвращаем трассировочный блок: без него не работают задержки 1-Wire. */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  /* И USB — чтобы устройство было готово к подключению кабеля в любой момент
+   * бодрствования, а не только после следующего цикла. */
+  MX_USB_DEVICE_Init();
 }
+
 /* USER CODE END 0 */
 
 /**
@@ -167,9 +276,15 @@ int main(void)
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
-  // Состояние кнопки на момент старта читаем сразу: это жест «стереть архив»,
-  // и пользователь отпустит кнопку через мгновение после сброса.
-  uint8_t wipe_requested = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET);
+  /* Жест «стереть архив» — зажатая KEY в момент старта, но не всякая: правило
+   * и его обоснование лежат в power_policy.c. Флаги сброса читаем и сразу
+   * снимаем — иначе SFTRST переживёт следующий сброс кнопкой RESET и жест
+   * молча перестанет работать. */
+  uint8_t soft_reset = (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST) != RESET);
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+
+  uint8_t key_held = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET);
+  uint8_t wipe_requested = Policy_ShouldWipeArchive(key_held, soft_reset);
 
   // Включаем питание датчиков (LOW)
   HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
@@ -266,7 +381,7 @@ int main(void)
       res = f_open(&file, DATA_FILE, FA_OPEN_APPEND | FA_WRITE);
       if (res == FR_OK)
       {
-          f_puts(CSV_HEADER "\r\n", &file);
+          f_puts(CSV_HEADER "\n", &file);
           f_close(&file);
       }
   }
@@ -276,105 +391,27 @@ int main(void)
       f_close(&file);
   }
 
-  // === Первое чтение и запись при старте ===
-  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
-  HAL_Delay(200); // дать датчикам стабилизироваться
-
-  AHT20_Data aht;
-  AHT20_ReadData(&hi2c1, &aht);
-
-  float soil_temp;
-  if (!DS18B20_ReadTemp(GPIOA, GPIO_PIN_8, &soil_temp))
-        soil_temp = NAN; // датчик не ответил или CRC не сошёлся
-
-  float soil_hum  = Soil_ReadMoisture();
-
-  char ts[32];
-  Time_GetTimestamp(ts, sizeof(ts));
-
-//  res = f_open(&file, "data.csv", FA_OPEN_EXISTING | FA_WRITE);
-//  if (res == FR_OK)
-//  {
-//      f_lseek(&file, f_size(&file));
-//
-//      char line[128];
-//      snprintf(line, sizeof(line),
-//               "%s,%.2f,%.2f,%.2f,%.2f\r\n",
-//               ts,
-//               aht.temperature,
-//               aht.humidity,
-//               soil_temp,
-//               soil_hum);
-//
-//      f_puts(line, &file);
-//      f_close(&file);
-//  }
+  /* Датчики поднимает и гасит сам цикл, здесь они не нужны. Явно обесточиваем
+   * их перед первым сном: MX_GPIO_Init() оставляет питание включённым, и без
+   * этой строки первый интервал сна (в поле — целый час) проходил бы с
+   * запитанными AHT20, DS18B20 и датчиком почвы. */
+  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_SET);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint32_t last_write_ms = 0;   /* TEST-ONLY: длительность записи в флеш прошлого цикла */
-  uint32_t last_hold_ms  = 0;   /* сколько мс держали кнопку перед прошлым уходом в сон */
+  /* Первый проход замеряет сразу, без сна. Иначе после включения архив
+   * оставался бы пустым весь первый интервал — в поле это час, в течение
+   * которого исправный прибор неотличим от мёртвого. Одна строка при
+   * установке стоит копейки и сразу подтверждает, что прибор жив. */
+  uint8_t first_pass = 1;
+
   while (1)
   {
-	  /* --- Пока кнопка удерживается, в сон не уходим ---
-	   * Это режим "живого" USB: пользователь держит KEY, пока хост читает файл,
-	   * и устройство не пропадает с шины на время STOP. Датчики при этом уже
-	   * обесточены в конце прошлой итерации, так что лишнего тока не тратим. */
-	  uint32_t t_hold0 = HAL_GetTick();
-	  last_hold_ms = 0;
-	  while (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET)
-	  {
-	      last_hold_ms = HAL_GetTick() - t_hold0;
-	      if (last_hold_ms >= BTN_HOLD_MAX_MS)
-	          break;   /* кнопка залипла — засыпаем, чтобы не высадить батарею */
-
-	      HAL_Delay(BTN_HOLD_POLL_MS);
-	  }
-
-	  /* Флеш — на постоянном питании, гасить её нечем, кроме Deep Power-Down.
-	   * Делаем это только сейчас: пока кнопка удерживалась (USB-сессия выше),
-	   * хост мог читать диск, и усыплять флеш было нельзя. */
-	  SPI_Flash_DeepPowerDown();
-
-	  /* Гасим периферию шин. Порядок важен: SPI деинициализируем строго ПОСЛЕ
-	   * команды Deep Power-Down выше — иначе её нечем было бы отправить. */
-	  HAL_SPI_DeInit(&hspi1);
-	  HAL_I2C_DeInit(&hi2c1);
-
-	  /* HAL_..._DeInit оставляет выводы «плавающими» входами, а не в аналоге,
-	   * поэтому доводим их до тихого состояния вручную. */
-	  MX_GPIO_SleepPrepare();
-
-	  /* --- уход в сон: STOP mode, будим только по RTC Wakeup Timer ---
-	   * Таймер перевзводим заново перед каждым входом в STOP, чтобы длительность сна
-	   * была стабильной (RTC_WAKEUP_INTERVAL_SEC) каждый цикл, а не "плавала" от фазы
-	   * свободно бегущего таймера относительно переменной длины активной фазы. */
-	  HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
-	  HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, RTC_WAKEUP_INTERVAL_SEC, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
-
-	  woke_by_button = 0;   /* сбрасываем перед сном: интересен источник ЭТОГО пробуждения */
-
-	  HAL_SuspendTick();
-	  HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
-
-	  /* --- пробуждение: ядро на HSI без PLL, обязательно поднять клоки прежде чем
-	   * трогать что-либо ещё (I2C/SPI/ADC/DWT-задержки зависят от реальной частоты) --- */
-	  SystemClock_Config();
-	  HAL_ResumeTick();
-
-	  /* Возвращаем выводы 1-Wire из аналога и поднимаем SPI — обязательно до
-	   * любого обращения к флеш, иначе команду пробуждения будет некому послать. */
-	  MX_GPIO_SleepRestore();
-	  MX_SPI1_Init();
-
-	  /* Будим флеш до любого обращения к ней (в DPD она игнорирует все команды, кроме 0xAB). */
-	  SPI_Flash_ReleasePowerDown();
-
-	  uint8_t wake_src = woke_by_button;   /* 1 = кнопка, 0 = плановое пробуждение по RTC */
-
-	  uint32_t t_wake = HAL_GetTick();   /* TEST-ONLY: засекаем длительность активной фазы */
+	  if (!first_pass)
+	      SleepUntilNextSample();
+	  first_pass = 0;
 
 	  /* --- включаем датчики (LOW) --- */
 	  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
@@ -389,18 +426,13 @@ int main(void)
 	  __HAL_RCC_I2C1_RELEASE_RESET();
 	  MX_I2C1_Init();
 
-	  /* Ждём, пока AHT20 реально начнёт подтверждать свой адрес на шине, вместо слепой
-	   * фиксированной паузы. aht_ready_ms — сколько мс от подачи питания это заняло
-	   * (9999 = так и не ответил за отведённое время). */
-	  uint32_t t_power_on = HAL_GetTick();
-	  uint16_t aht_ready_ms = 9999;
+	  /* Ждём, пока AHT20 реально начнёт подтверждать свой адрес на шине, вместо
+	   * слепой фиксированной паузы: время выхода на режим зависит от температуры
+	   * и от того, насколько успел разрядиться его питающий конденсатор. */
 	  for (uint16_t i = 0; i < 80; i++)   /* до ~2 секунд ожидания */
 	  {
 	      if (HAL_I2C_IsDeviceReady(&hi2c1, AHT20_ADDR, 1, 10) == HAL_OK)
-	      {
-	          aht_ready_ms = (uint16_t)(HAL_GetTick() - t_power_on);
 	          break;
-	      }
 	      HAL_Delay(25);
 	  }
 
@@ -408,28 +440,18 @@ int main(void)
 	   * заново инициализировать после каждого включения PA0, иначе показания мусорные. */
 	  HAL_StatusTypeDef aht_init_st = AHT20_Init(&hi2c1);
 
-	  uint8_t aht_status = 0;   /* TEST-ONLY: бит 0x08 = откалиброван, 0x80 = занят */
-	  AHT20_ReadStatusByte(&hi2c1, &aht_status);
-
-	  /* Кнопка KEY: нажата = 0 (замкнута на GND). */
-	  uint8_t btn = HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin);
-
 	  AHT20_Data aht;
-	  uint32_t aht_i2c_err = 0;
-	  /* TEST-ONLY: диагностика чередующихся сбоев AHT20 — код ошибки I2C пишем в CSV,
-	   * чтобы понять, что именно происходит на "провальных" циклах. Убрать после отладки. */
 	  HAL_StatusTypeDef aht_read_st = AHT20_ReadData(&hi2c1, &aht);
 	  if (aht_read_st != HAL_OK)
 	  {
 	      aht.temperature = 0.0f;
 	      aht.humidity    = 0.0f;
-	      aht_i2c_err = HAL_I2C_GetError(&hi2c1);
 	  }
 
 	  float soil_temp;
 	  	  if (!DS18B20_ReadTemp(GPIOA, GPIO_PIN_8, &soil_temp))
 	  	      soil_temp = NAN; // датчик не ответил или CRC не сошёлся
-	  uint8_t ds_err = (uint8_t)DS18B20_LastError();   /* TEST-ONLY: причина отказа 1-Wire */
+	  uint8_t ds_err = (uint8_t)DS18B20_LastError();   /* почему 1-Wire не ответил */
 
 	  float soil_hum  = Soil_ReadMoisture();
 
@@ -438,8 +460,6 @@ int main(void)
 
 	  char ts[32];
 	  Time_GetTimestamp(ts, sizeof(ts));
-
-	  uint32_t t_sensors_ms = HAL_GetTick() - t_wake;   /* TEST-ONLY */
 
 	  /* Если ФС не смонтирована (сбой при старте или отвалилась позже) — пробуем
 	   * поднять её заново, но не чаще одного раза за цикл. Между попытками
@@ -461,44 +481,31 @@ int main(void)
 
 	  if (res == FR_OK)
 	  {
-	      char line[288];
-	      /* TEST-ONLY: хвостовые поля — диагностика сбоев AHT20 и профиль времени цикла:
-	       *   aht_ready_ms  — через сколько мс после подачи питания датчик ответил (9999 = не ответил)
-	       *   t_sensors_ms  — время от пробуждения до записи (I2C + DS18B20 + ADC)
-	       *   t_write_ms    — сколько заняла запись в флеш на ПРОШЛОМ цикле
-	       * Убрать вместе с соответствующей логикой после отладки. */
+	      char line[128];
+	      /* Перевод строки задаём одним "\n": FatFs собран с _USE_STRFUNC = 2,
+	       * и f_puts сам разворачивает \n в \r\n. Со старым "\r\n" в формате на
+	       * диск уходило "\r\r\n" — лишний байт в каждой строке и мусорный
+	       * символ в конце последнего поля при разборе строгим парсером. */
 	      snprintf(line, sizeof(line),
-	               "%s,%.2f,%.2f,%.2f,%.2f,%d,%d,%lu,%u,%lu,%lu,0x%02X,%u,%u,%u,%u,%lu,%lu,"
-	               "%u,%.2f,%.2f,%u\r\n",
+	               "%s,%.2f,%.2f,%.2f,%.2f,%u,%.2f,%u,%u,%d,%d,%u,%lu\n",
 	               ts,
 	               aht.temperature,
 	               aht.humidity,
 	               soil_temp,
 	               soil_hum,
-	               (int)aht_init_st,
-	               (int)aht_read_st,
-	               (unsigned long)aht_i2c_err,
-	               (unsigned)aht_ready_ms,
-	               (unsigned long)t_sensors_ms,
-	               (unsigned long)last_write_ms,
-	               (unsigned)aht_status,
-	               (unsigned)btn,
-	               (unsigned)lse_ok,
-	               (unsigned)ds_err,
-	               (unsigned)wake_src,
-	               (unsigned long)last_hold_ms,
-	               (unsigned long)write_fails,
 	               (unsigned)bat.percent,
 	               bat.volts,
-	               bat.vdd,
 	               /* soil_valid: ниже дропаута LDO опора АЦП уплывает вместе с банкой,
 	                * поэтому влажность почвы с этого момента недостоверна. */
-	               (unsigned)(bat.valid && !bat.low));
+	               (unsigned)(bat.valid && !bat.low),
+	               (unsigned)lse_ok,
+	               (int)aht_init_st,
+	               (int)aht_read_st,
+	               (unsigned)ds_err,
+	               (unsigned long)write_fails);
 
-	      uint32_t t_w0 = HAL_GetTick();
 	      int      puts_res  = f_puts(line, &file);
 	      FRESULT  close_res = f_close(&file);
-	      last_write_ms = HAL_GetTick() - t_w0;
 
 	      /* Раньше результат записи игнорировался: заполнившийся том или сбой SPI
 	       * молча съедали строку, и в данных это выглядело просто как её отсутствие.
@@ -521,10 +528,6 @@ int main(void)
 
 	  /* --- выключаем датчики перед сном (HIGH) --- */
 	  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_SET);
-
-	  /* TEST-ONLY: держим МК бодрствующим ещё TEST_AWAKE_HOLD_MS перед следующим STOP —
-	   * см. TEST_AWAKE_HOLD_MS выше. */
-	  HAL_Delay(TEST_AWAKE_HOLD_MS);
 	}
     /* USER CODE END WHILE */
 
@@ -592,6 +595,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     {
         woke_by_button = 1;
     }
+    /* Для VBUS (PA9) флаг не нужен: само прерывание поднимает МК из STOP,
+     * а дальше решение принимается по фактическому уровню на выводе —
+     * пока кабель воткнут, цикл сна просто не начинается. */
 }
 
 /* USER CODE END 4 */

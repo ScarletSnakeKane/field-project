@@ -1,0 +1,3 @@
+# Шелл-скрипты обязаны храниться с LF: с CRLF bash спотыкается на shebang
+# ("bad interpreter: /usr/bin/env bash^M") — на Windows это ловится не сразу.
+*.sh text eol=lf
