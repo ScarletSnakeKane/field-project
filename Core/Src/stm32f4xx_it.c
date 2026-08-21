@@ -225,4 +225,12 @@ void EXTI0_IRQHandler(void)
 {
     HAL_GPIO_EXTI_IRQHandler(WAKE_BTN_Pin);
 }
+
+/**
+  * @brief This function handles EXTI lines 5..9 (детект VBUS на PA9).
+  */
+void EXTI9_5_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(VBUS_Pin);
+}
 /* USER CODE END 1 */

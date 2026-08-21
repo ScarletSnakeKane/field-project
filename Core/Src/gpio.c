@@ -80,6 +80,19 @@ void MX_GPIO_Init(void)
     HAL_NVIC_SetPriority(EXTI0_IRQn, 2, 0);
     HAL_NVIC_EnableIRQ(EXTI0_IRQn);
 
+    /*Configure GPIO pin : PA9 (делитель с VBUS) — прерывание по фронту:
+     * подключили кабель, значит нужно проснуться и не спать, пока он воткнут.
+     * Спад не ловим: пока VBUS высокий, МК и так не уходит в STOP, поэтому
+     * отключение кабеля происходит только в бодрствующем состоянии.
+     * Подтяжка отключена — её роль выполняет нижнее плечо делителя. */
+    GPIO_InitStruct.Pin = VBUS_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(VBUS_GPIO_Port, &GPIO_InitStruct);
+
+    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
     /*Configure GPIO pin : PA8 (1-Wire шина DS18B20) — open-drain! */
     GPIO_InitStruct.Pin = GPIO_PIN_8;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
@@ -95,7 +108,7 @@ void MX_GPIO_Init(void)
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
 
-    GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_15;
+    GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_10|GPIO_PIN_15;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5
