@@ -20,6 +20,7 @@ cl /nologo /std:c11 /TC /W4 /I"%ROOT%\Core\Inc" ^
    "%ROOT%\tests\test_main.c" ^
    "%ROOT%\Core\Src\battery_curve.c" ^
    "%ROOT%\Core\Src\ds18b20_decode.c" ^
+   "%ROOT%\Core\Src\power_policy.c" ^
    "%ROOT%\Core\Src\soil_curve.c" ^
    /Fo"%ROOT%\build\tests\\" /Fe"%ROOT%\build\tests\tests.exe" || exit /b 1
 

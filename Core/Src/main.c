@@ -35,6 +35,7 @@
 #include "soil_sensor.h"
 #include "battery.h"
 #include "ds18b20.h"
+#include "power_policy.h"
 #include "usbd_core.h"
 #include "usbd_def.h"
 #include <stdio.h>
@@ -136,16 +137,12 @@ static void SleepUntilNextSample(void)
       uint8_t btn_held    = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET);
       uint8_t usb_present = (HAL_GPIO_ReadPin(VBUS_GPIO_Port, VBUS_Pin) == GPIO_PIN_SET);
 
-      if (!btn_held && !usb_present)
-          break;
-
       hold_ms = HAL_GetTick() - t_hold0;
 
-      /* Ограничение по времени действует только на кнопку: залипшая или залитая
-       * водой, она иначе не дала бы уснуть никогда. С USB история обратная —
-       * пока есть VBUS, плата питается от хоста, и бодрствование батарею
-       * не расходует, поэтому обрывать сессию по таймеру незачем. */
-      if (!usb_present && hold_ms >= BTN_HOLD_MAX_MS)
+      /* Само правило — в power_policy.c, вместе с объяснением, почему потолок
+       * по времени действует только на кнопку и не действует на USB. Здесь
+       * остаётся лишь опрос выводов. */
+      if (Policy_MayEnterSleep(btn_held, usb_present, hold_ms, BTN_HOLD_MAX_MS))
           break;
 
       HAL_Delay(BTN_HOLD_POLL_MS);
@@ -279,20 +276,15 @@ int main(void)
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
-  // Состояние кнопки на момент старта читаем сразу: это жест «стереть архив»,
-  // и пользователь отпустит кнопку через мгновение после сброса.
-  /* Жест «стереть архив» — зажатая KEY в момент старта. Но одной кнопки мало:
-   * чтобы прошить спящую плату, её приходится держать, а программатор в конце
-   * делает программный сброс — и старт происходит с зажатой кнопкой. В таком
-   * виде жест стирал бы данные при каждом обновлении прошивки.
-   * Поэтому дополнительно смотрим, откуда пришёл сброс: программный (SFTRST)
-   * означает программатор и стирание не запускает, а сброс кнопкой RESET или
-   * подача питания — запускает. */
+  /* Жест «стереть архив» — зажатая KEY в момент старта, но не всякая: правило
+   * и его обоснование лежат в power_policy.c. Флаги сброса читаем и сразу
+   * снимаем — иначе SFTRST переживёт следующий сброс кнопкой RESET и жест
+   * молча перестанет работать. */
   uint8_t soft_reset = (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST) != RESET);
   __HAL_RCC_CLEAR_RESET_FLAGS();
 
-  uint8_t wipe_requested = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET)
-                        && !soft_reset;
+  uint8_t key_held = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET);
+  uint8_t wipe_requested = Policy_ShouldWipeArchive(key_held, soft_reset);
 
   // Включаем питание датчиков (LOW)
   HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
