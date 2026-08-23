@@ -5,6 +5,7 @@
 #define AHT20_ADDR        (0x38 << 1)
 #define AHT20_CMD_INIT    0xBE
 #define AHT20_CMD_TRIGGER 0xAC
+#define AHT20_CMD_RESET   0xBA   /* мягкий сброс, по даташиту не дольше 20 мс */
 #define AHT20_STATUS_BUSY 0x80
 #define AHT20_STATUS_CAL  0x08   /* бит "датчик откалиброван" в статусном байте */
 
@@ -27,6 +28,19 @@ HAL_StatusTypeDef AHT20_Init(I2C_HandleTypeDef *hi2c)
             (status & AHT20_STATUS_CAL) != 0)
         {
             return HAL_OK;
+        }
+
+        /* Если команда инициализации не подействовала с первого раза, дело не в
+         * ней: датчик поднялся в состоянии, из которого 0xBE его не выводит.
+         * Штатный выход отсюда — мягкий сброс, он дешевле любой возни с
+         * питанием. Снять питание толком нельзя: развязывающий конденсатор
+         * модуля разряжать нечем, и на это ушли бы десятки секунд активной
+         * фазы — половина всего бюджета тока. */
+        if (attempt == 1)
+        {
+            uint8_t rst = AHT20_CMD_RESET;
+            HAL_I2C_Master_Transmit(hi2c, AHT20_ADDR, &rst, 1, 100);
+            HAL_Delay(20);
         }
 
         HAL_I2C_Master_Transmit(hi2c, AHT20_ADDR, cmd, 3, 100);
