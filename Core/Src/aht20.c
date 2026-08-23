@@ -1,4 +1,5 @@
 #include "aht20.h"
+#include "aht20_decode.h"
 #include "stm32f4xx_hal.h"
 
 #define AHT20_ADDR        (0x38 << 1)
@@ -53,32 +54,30 @@ HAL_StatusTypeDef AHT20_ReadData(I2C_HandleTypeDef *hi2c, AHT20_Data *out)
 
     HAL_Delay(80);
 
-    /* Пока установлен бит BUSY в статусном байте — измерение ещё не готово,
-     * данные в остальных байтах нельзя доверять. Дожидаемся с ограничением попыток. */
+    /* Пока установлен бит BUSY — измерение ещё не готово, остальным байтам
+     * доверять нельзя. Дожидаемся с ограничением попыток. */
     for (uint8_t attempt = 0; ; attempt++)
     {
         if (HAL_I2C_Master_Receive(hi2c, AHT20_ADDR, buf, 6, 100) != HAL_OK)
             return HAL_ERROR;
 
-        if ((buf[0] & AHT20_STATUS_BUSY) == 0)
+        AHT20_DecodeStatus dec = AHT20_DecodeFrame(buf, &out->temperature, &out->humidity);
+
+        if (dec == AHT20_DEC_OK)
             break;
+
+        /* Сплошные нули означают некалиброванный датчик, а не незаконченное
+         * измерение: ждать тут нечего, ожидание лишь потратит заряд. Раньше
+         * такой кадр разбирался как -50.00 °C и уходил в архив полноценной
+         * строкой — ровно та же ошибка, что когда-то была с DS18B20. */
+        if (dec == AHT20_DEC_ERR_ZERO)
+            return HAL_ERROR;
 
         if (attempt >= 4)
             return HAL_ERROR; /* так и не дождались завершения измерения */
 
         HAL_Delay(20);
     }
-
-    uint32_t raw_hum = ((uint32_t)buf[1] << 12) |
-                       ((uint32_t)buf[2] << 4)  |
-                       ((uint32_t)buf[3] >> 4);
-
-    uint32_t raw_temp = (((uint32_t)buf[3] & 0x0F) << 16) |
-                        ((uint32_t)buf[4] << 8) |
-                        ((uint32_t)buf[5]);
-
-    out->humidity = (raw_hum * 100.0f) / 1048576.0f;
-    out->temperature = (raw_temp * 200.0f / 1048576.0f) - 50.0f;
 
     return HAL_OK;
 }
