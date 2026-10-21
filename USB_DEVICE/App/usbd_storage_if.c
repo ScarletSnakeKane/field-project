@@ -30,6 +30,7 @@ extern FATFS USERFatFS;
 extern char USERPath[];
 
 #include "spiflash.h"   // наш драйвер SPI Flash
+#include "storage_policy.h"
 #include <string.h>
 
 /* Размеры тома живут в spiflash.h: заявленный объём больше физического. */
@@ -192,7 +193,13 @@ int8_t STORAGE_Init_FS(uint8_t lun)
 {
   /* USER CODE BEGIN 2 */
   UNUSED(lun);
-  f_mount(&USERFatFS, USERPath, 1);
+  /* Здесь стоял f_mount — в прерывании OTG, поверх тома, с которым в этот же
+   * момент мог работать основной поток: он обнулял fs_type и терял грязное окно
+   * FatFs, а через USER_initialize доходил до HAL_Delay, который в прерывании
+   * с приоритетом 0 не возвращается никогда. MSC работает с сырыми секторами,
+   * FatFs ему не нужен. Только отмечаем сессию, чтобы основной поток перед
+   * следующей записью перемонтировал том. */
+  SPI_Flash_NoteHostSession();
   return USBD_OK;
   /* USER CODE END 2 */
 }
@@ -224,6 +231,11 @@ int8_t STORAGE_IsReady_FS(uint8_t lun)
 {
   /* USER CODE BEGIN 4 */
   UNUSED(lun);
+
+  /* Не готова или занята основным потоком — «не готов», хост повторит
+   * TEST UNIT READY сам. Правило — в storage_policy.h. */
+  if (!Storage_MscMayAccess(SPI_Flash_IsReady(), SPI_Flash_IsBusy()))
+    return (USBD_FAIL);
 
   return (USBD_OK);
   /* USER CODE END 4 */
@@ -263,6 +275,12 @@ int8_t STORAGE_Read_FS(uint8_t lun, uint8_t *buf, uint32_t blk_addr, uint16_t bl
   if ((blk_addr + blk_len) > SECTOR_COUNT)
 	return USBD_FAIL;
 
+  /* IsReady проверяется только в начале команды, а длинный READ10 идёт
+   * пакетами по 512 Б в разных прерываниях — между ними основной поток успевает
+   * начать запись. Проверяем снова перед каждым обращением к флеш. */
+  if (!Storage_MscMayAccess(SPI_Flash_IsReady(), SPI_Flash_IsBusy()))
+    return USBD_FAIL;
+
   /* Заявленный тому объём вдвое больше физического (см. spiflash.h).
    * Несуществующие сектора отдаём хосту нулями — читать по завёрнутому адресу
    * нельзя, флеш вернула бы содержимое начала кристалла. */
@@ -279,7 +297,8 @@ int8_t STORAGE_Read_FS(uint8_t lun, uint8_t *buf, uint32_t blk_addr, uint16_t bl
       memset(buf + (phys * SECTOR_SIZE), 0, (blk_len - phys) * SECTOR_SIZE);
   }
 
-  SPI_Flash_Read(blk_addr * SECTOR_SIZE, buf, phys * SECTOR_SIZE);
+  if (!SPI_Flash_Read(blk_addr * SECTOR_SIZE, buf, phys * SECTOR_SIZE))
+    return USBD_FAIL;
 
   return USBD_OK;
   /* USER CODE END 6 */

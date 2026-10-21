@@ -18,6 +18,7 @@
 #include "ds18b20_decode.h"
 #include "power_policy.h"
 #include "soil_curve.h"
+#include "storage_policy.h"
 
 static int checks = 0, failures = 0;
 
@@ -271,6 +272,48 @@ static void test_aht20(void)
     eqf(t, 85.0f, 0.01f, "температура +85 C");
 }
 
+/* ---------------------------------------------------------------- хранилище */
+
+static void test_storage_policy(void)
+{
+    static unsigned char mbr[STORAGE_SECTOR_BYTES], boot[STORAGE_SECTOR_BYTES];
+    puts("Хранилище");
+
+    /* Чистая флеш (оба сектора — 0xFF) и FatFs не видит ФС: это новый прибор,
+     * форматировать можно и нужно. */
+    memset(mbr, 0xFF, sizeof(mbr));
+    memset(boot, 0xFF, sizeof(boot));
+    equ(Storage_MayFormat(1, 1, mbr, boot), 1, "чистая флеш форматируется");
+
+    /* ФС смонтировалась — форматировать нечего, какое бы содержимое ни было. */
+    equ(Storage_MayFormat(0, 1, mbr, boot), 0, "есть ФС — не форматируем");
+
+    /* Чтение сорвалось: буфер мог остаться 0xFF от прошлого раза, верить ему нельзя. */
+    equ(Storage_MayFormat(1, 0, mbr, boot), 0, "ошибка чтения — не форматируем");
+
+    /* Один байт не 0xFF в последнем байте MBR — там что-то лежало. Это ровно
+     * сценарий аудита: испорченная сигнатура 55AA давала FR_NO_FILESYSTEM. */
+    mbr[STORAGE_SECTOR_BYTES - 1] = 0xAA;
+    equ(Storage_MayFormat(1, 1, mbr, boot), 0, "непустой MBR — архив не стираем");
+    mbr[STORAGE_SECTOR_BYTES - 1] = 0xFF;
+
+    /* MBR стёрт (питание пропало посреди его перезаписи), но загрузочный
+     * сектор раздела жив — архив на месте, стирать нельзя. */
+    boot[0] = 0xEB;
+    equ(Storage_MayFormat(1, 1, mbr, boot), 0, "стёртый MBR при живом загрузочном — не форматируем");
+    boot[0] = 0xFF;
+
+    /* Мусор с мёртвой шины без подтяжки — тоже «не чисто». */
+    boot[STORAGE_SECTOR_BYTES / 2] = 0x00;
+    equ(Storage_MayFormat(1, 1, mbr, boot), 0, "мусор в загрузочном секторе — не форматируем");
+    boot[STORAGE_SECTOR_BYTES / 2] = 0xFF;
+
+    /* MSC в прерывании: только готовая и свободная флеш. */
+    equ(Storage_MscMayAccess(1, 0), 1, "готова и свободна — MSC читает");
+    equ(Storage_MscMayAccess(1, 1), 0, "занята основным потоком — хосту «не готов»");
+    equ(Storage_MscMayAccess(0, 0), 0, "не инициализирована — из прерывания не будим");
+}
+
 int main(void)
 {
     test_ds18b20();
@@ -279,6 +322,7 @@ int main(void)
     test_aht20();
     test_wipe_policy();
     test_sleep_policy();
+    test_storage_policy();
 
     printf("\n%d проверок, %d провалов\n", checks, failures);
     return failures ? 1 : 0;

@@ -2,6 +2,9 @@
 #define SPIFLASH_H
 
 #include "stm32f4xx_hal.h"
+/* Правила «когда можно форматировать, писать и отдавать флеш хосту» — рядом
+ * с драйвером, чтобы каждый его пользователь видел их без отдельного include. */
+#include "storage_policy.h"
 
 /* SST26VF016B: 16 Mbit = 2 MByte */
 #define FLASH_PAGE_SIZE       256        // байт
@@ -46,9 +49,30 @@ void SPI_Flash_Init(void);
 /* Отвечает ли микросхема вообще. Возвращает 0, если JEDEC ID вычитать не вышло:
  * на неподключённой или мёртвой шине ответ вырождается в сплошные 0x00 или 0xFF. */
 uint8_t SPI_Flash_Probe(void);
-void SPI_Flash_Read(uint32_t addr, uint8_t *buf, uint32_t len);
-void SPI_Flash_Write(uint32_t addr, const uint8_t *buf, uint32_t len);
-void SPI_Flash_EraseSector(uint32_t addr);
+/* Чтение, запись и стирание возвращают 1 при успехе и 0 при отказе: ошибка HAL
+ * или таймаут BUSY. Раньше они были void, и мусор с шины уходил в FatFs как
+ * валидные данные — а по такому чтению старт решал отформатировать архив. */
+uint8_t SPI_Flash_Read(uint32_t addr, uint8_t *buf, uint32_t len);
+uint8_t SPI_Flash_Write(uint32_t addr, const uint8_t *buf, uint32_t len);
+uint8_t SPI_Flash_EraseSector(uint32_t addr);
+/* Прочитать обратно и сравнить с buf: программирование на просевшем питании
+ * или в деградирующий чип может «пройти» без единой ошибки шины. */
+uint8_t SPI_Flash_Verify(uint32_t addr, const uint8_t *buf, uint32_t len);
+
+/* Разделение флеш между основным потоком и MSC в прерывании OTG.
+ * SetBusy(1) основной поток ставит на всю серию операций FatFs, SetBusy(0) —
+ * по её окончании. IsBusy() истинно и во время любой отдельной операции
+ * драйвера. IsReady() — микросхема ответила на Probe и не спит в DPD.
+ * MSC обязан спрашивать оба признака и при отказе отвечать хосту «не готов»:
+ * из прерывания флеш не инициализировать и не ждать. */
+void    SPI_Flash_SetBusy(uint8_t busy);
+uint8_t SPI_Flash_IsBusy(void);
+uint8_t SPI_Flash_IsReady(void);
+
+/* MSC отмечает начало USB-сессии, основной поток забирает отметку и
+ * перемонтирует том, прежде чем снова писать. */
+void    SPI_Flash_NoteHostSession(void);
+uint8_t SPI_Flash_TakeHostSession(void);
 
 /* Deep Power-Down: флеш запитана постоянно (отдельного ключа на плате нет),
  * поэтому в простое её ток снижается только этими командами. */
