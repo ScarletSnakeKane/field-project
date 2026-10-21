@@ -54,22 +54,40 @@ void OneWire_WriteBit(GPIO_TypeDef* GPIOx, uint16_t GPIO_Pin, uint8_t bit)
     __set_PRIMASK(primask);
 }
 
-// Чтение одного бита
+/* Чтение одного бита.
+ *
+ * DS18B20 гарантирует уровень на линии только 15 мкс от спада, и выборка
+ * обязана уложиться в это окно. Прежняя схема «6 мкс + 9 мкс» через
+ * HAL_GPIO_* и OneWire_Delay на 16 МГц с нулевой латентностью флеша
+ * набирала накладных ~0.5-1 мкс на каждый вызов и делала выборку около
+ * 17-18 мкс — уже за окном: на холоде и с длинным кабелем ноль читался
+ * единицей (ds_err = 3, а изредка — совпавший по CRC ложный кадр).
+ *
+ * Теперь все моменты отсчитываются от одной метки DWT, взятой до спада,
+ * а выводом управляем прямо через BSRR/IDR, без вызовов. Линию держим
+ * 2 мкс (минимум по даташиту 1 мкс) и читаем на 12 мкс: с учётом шага
+ * цикла ожидания (~0.4 мкс) выборка не позже ~12.5 мкс от спада, запас до
+ * 15 мкс — больше 2 мкс. Ранний отпуск линии сохраняет единице те же
+ * ~10 мкс на подъём через подтяжку, что и прежде, — читать раньше за счёт
+ * длинного кабеля не пришлось. Длина слота прежняя, 70 мкс. Прерывания на
+ * время слота запрещены, как и раньше. */
 uint8_t OneWire_ReadBit(GPIO_TypeDef* GPIOx, uint16_t GPIO_Pin)
 {
     uint8_t bit;
+    const uint32_t tpus = SystemCoreClock / 1000000U;   /* считаем до спада, а не внутри окна */
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
 
-    HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_RESET);
-    OneWire_Delay(6);
+    uint32_t t0 = DWT->CYCCNT;
+    GPIOx->BSRR = (uint32_t)GPIO_Pin << 16U;            /* линия вниз */
+    while ((DWT->CYCCNT - t0) < 2U * tpus);
 
-    HAL_GPIO_WritePin(GPIOx, GPIO_Pin, GPIO_PIN_SET);
-    OneWire_Delay(9);
+    GPIOx->BSRR = GPIO_Pin;                             /* отпустить линию */
+    while ((DWT->CYCCNT - t0) < 12U * tpus);
 
-    bit = HAL_GPIO_ReadPin(GPIOx, GPIO_Pin);
+    bit = ((GPIOx->IDR & GPIO_Pin) != 0U) ? 1U : 0U;
 
-    OneWire_Delay(55);
+    while ((DWT->CYCCNT - t0) < 70U * tpus);            /* добить слот */
 
     __set_PRIMASK(primask);
     return bit;

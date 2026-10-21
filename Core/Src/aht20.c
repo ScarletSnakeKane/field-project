@@ -58,7 +58,7 @@ static AHT20_DecodeStatus AHT20_MeasureOnce(I2C_HandleTypeDef *hi2c,
                                             AHT20_Data *out, int *bus_ok)
 {
     uint8_t cmd[3] = {AHT20_CMD_TRIGGER, 0x33, 0x00};
-    uint8_t buf[6] = {0};
+    uint8_t buf[AHT20_FRAME_LEN] = {0};
     HAL_StatusTypeDef status = HAL_ERROR;
 
     *bus_ok = 0;
@@ -80,7 +80,9 @@ static AHT20_DecodeStatus AHT20_MeasureOnce(I2C_HandleTypeDef *hi2c,
      * доверять нельзя. Дожидаемся с ограничением попыток. */
     for (uint8_t attempt = 0; ; attempt++)
     {
-        if (HAL_I2C_Master_Receive(hi2c, AHT20_ADDR, buf, 6, 100) != HAL_OK)
+        /* Читаем и седьмой байт — CRC: без него полуиспорченный кадр внутри
+         * шкалы уходил в архив правдоподобными числами. */
+        if (HAL_I2C_Master_Receive(hi2c, AHT20_ADDR, buf, AHT20_FRAME_LEN, 100) != HAL_OK)
         {
             *bus_ok = 0;
             return AHT20_DEC_ERR_BUSY;
@@ -106,9 +108,10 @@ HAL_StatusTypeDef AHT20_ReadData(I2C_HandleTypeDef *hi2c, AHT20_Data *out)
      * починки) просто терял замер.
      *
      * Платим только при отказе: около 200 мс, если кадр пришёл сразу и оказался
-     * вне шкалы, и до ~0.8 с в худшем случае, когда датчик все пять раз отвечает
-     * BUSY. Раз в час при токе активной фазы порядка 20 мА даже худший случай
-     * стоит меньше 5 мкА среднего против бюджета в 377 мкА. */
+     * вне шкалы или с несошедшимся CRC, и до ~0.8 с в худшем случае, когда
+     * датчик все пять раз отвечает BUSY. Раз в час при токе активной фазы
+     * порядка 20 мА даже худший случай стоит меньше 5 мкА среднего против
+     * бюджета в 377 мкА. */
     for (uint8_t round = 0; round < 2; round++)
     {
         int bus_ok = 0;
@@ -121,10 +124,11 @@ HAL_StatusTypeDef AHT20_ReadData(I2C_HandleTypeDef *hi2c, AHT20_Data *out)
         if (!bus_ok)
             return HAL_ERROR;
 
-        /* Сплошные нули означают некалиброванный датчик, а не незаконченное
-         * измерение: новый запуск даст тот же пустой кадр, лечится это только
-         * переинициализацией на следующем цикле. */
-        if (dec == AHT20_DEC_ERR_ZERO)
+        /* Сплошные нули или снятый бит калибровки означают некалиброванный
+         * датчик, а не незаконченное измерение: новый запуск даст то же самое,
+         * лечится это только переинициализацией на следующем цикле. А вот
+         * несошедшийся CRC — разовый сбой, его стоит повторить. */
+        if (dec == AHT20_DEC_ERR_ZERO || dec == AHT20_DEC_ERR_NOCAL)
             return HAL_ERROR;
     }
 
