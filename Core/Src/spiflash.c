@@ -298,7 +298,14 @@ void SPI_Flash_NoteHostSession(void)
 
 uint8_t SPI_Flash_TakeHostSession(void)
 {
+    /* Проверка и сброс — под запретом прерываний: иначе STORAGE_Init_FS из
+     * прерывания OTG между чтением и обнулением потерял бы отметку о сессии
+     * (R8). PRIMASK восстанавливается, а не снимается: функцию могут позвать
+     * и при уже запрещённых прерываниях. */
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
     uint8_t was = host_session;
     host_session = 0;
+    __set_PRIMASK(primask);
     return was;
 }
