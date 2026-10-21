@@ -24,6 +24,10 @@ import re
 import statistics as st
 import sys
 
+# Расшифровка кодов ds_err живёт в одном месте — в summarize_data.py.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import summarize_data  # noqa: E402
+
 # Заряд считается той же кривой, что и в прошивке: таблица читается прямо из
 # Core/Src/battery_curve.c, чтобы две копии не разошлись. Раньше здесь стояла
 # константа 8 %/100 мВ на весь диапазон, а по кривой на рабочем участке
@@ -183,6 +187,8 @@ def report(path, lo, hi):
             k = sum(1 for v in col[n] if v.strip() not in ("0", "0x00", ""))
             if k:
                 bad.append("%s != 0 в %d из %d" % (n, k, len(ts)))
+                if n == "ds_err":
+                    bad[-1] += " (%s)" % summarize_data.ds_err_detail(col[n])
     for n in FLAG_COLS:
         if n in col:
             k = sum(1 for v in col[n] if v.strip() in ("0", ""))

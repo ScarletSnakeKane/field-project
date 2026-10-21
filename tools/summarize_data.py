@@ -21,6 +21,33 @@ FLAG_COLS = ("soil_valid", "lse_ok")
 # Значение DS18B20 по сбросу: преобразование не выполнилось, а не 85 °C почвы.
 DS_RESET = 85.0
 
+# Коды ds_err — DS18B20_Status из Core/Inc/ds18b20_decode.h. Менять вместе.
+# Без расшифровки сводка говорила только «ds_err != 0», и, например, клон
+# датчика (код 5 каждый час) было не отличить от оборванного провода (R9).
+DS_ERR_TEXT = {
+    1: "нет presence перед измерением",
+    2: "нет presence перед чтением",
+    3: "CRC не сошёлся",
+    4: "шина читается нулями — нет подтяжки или датчика",
+    5: "служебные байты scratchpad не те — кадр битый или не DS18B20",
+    6: "85.00 °C по сбросу — преобразование не прошло",
+    7: "вне шкалы -55..+125 °C",
+}
+
+
+def ds_err_detail(values):
+    """Разбивка ненулевых ds_err по кодам: «код 5 (…) x24; код 1 (…) x2»."""
+    cnt = collections.Counter(v.strip() for v in values
+                              if v.strip() not in ("0", "0x00", ""))
+    parts = []
+    for v, n in cnt.most_common():
+        try:
+            text = DS_ERR_TEXT.get(int(v, 0), "неизвестный код")
+        except ValueError:
+            text = "не число"
+        parts.append("код %s (%s) x%d" % (v, text, n))
+    return "; ".join(parts)
+
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -61,7 +88,10 @@ def main():
         if name in col:
             n = sum(1 for v in col[name] if v.strip() not in ("0", "0x00", ""))
             if n:
-                bad.append("%s != 0 в %d строках" % (name, n))
+                if name == "ds_err":
+                    bad.append("ds_err != 0 в %d строках (%s)" % (n, ds_err_detail(col[name])))
+                else:
+                    bad.append("%s != 0 в %d строках" % (name, n))
     for name in FLAG_COLS:
         if name in col:
             n = sum(1 for v in col[name] if v.strip() in ("0", ""))
@@ -130,4 +160,5 @@ def main():
     return 0
 
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())
