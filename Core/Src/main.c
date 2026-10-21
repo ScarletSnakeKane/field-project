@@ -337,6 +337,12 @@ int main(void)
    * есть; Android его не увидит, Windows и Linux читают. Перевести такой
    * прибор на FAT16 можно только сознательно, сняв архив и стерев флеш. */
 
+  /* Питание для форматирования и правки MBR — по тому же правилу, что и для
+   * дозаписи: обе операции стирают 4-КБ блоки со служебными структурами. */
+  Battery_Data bat_boot;
+  Battery_Read(&bat_boot);
+  uint8_t boot_power_ok = Storage_MayWrite(bat_boot.valid, bat_boot.low, bat_boot.vdd);
+
   if (res == FR_NO_FILESYSTEM)
   {
       /* «Нет ФС» по мнению FatFs — ещё не повод стирать: так же выглядит
@@ -346,7 +352,8 @@ int main(void)
           (disk_read(0, work, 0, 1) == RES_OK) &&
           (disk_read(0, work + FLASH_SECTOR_BYTES, STORAGE_BOOT_SECTOR, 1) == RES_OK);
 
-      if (Storage_MayFormat(1, reads_ok, work, work + FLASH_SECTOR_BYTES))
+      if (boot_power_ok &&
+          Storage_MayFormat(1, reads_ok, work, work + FLASH_SECTOR_BYTES))
       {
           /* Размер кластера задан явно — 512 байт, минимум. Автовыбор для тома 4 МБ
            * взял бы 1 КБ, кластеров получилось бы около 4050 при пороге FAT16 в 4085,
@@ -373,7 +380,7 @@ int main(void)
    * данные и файловую систему не трогает и повторное выполнение безвредно.
    * Только для FAT16: у оставленного как есть FAT12 тип 0x01, и 0x0E был бы
    * для него ложью. */
-  if (fs_ok && USERFatFS.fs_type == FS_FAT16 &&
+  if (fs_ok && boot_power_ok && USERFatFS.fs_type == FS_FAT16 &&
       disk_read(0, work, 0, 1) == RES_OK)
   {
       if (work[MBR_PART_TYPE_OFS] != 0x0E)
@@ -519,6 +526,14 @@ int main(void)
 	  char ts[32];
 	  Time_GetTimestamp(ts, sizeof(ts));
 
+	  /* На просевшем питании не пишем вовсе: каждая дозапись стирает и
+	   * перепрограммирует 4-КБ блоки каталога и FAT, и сбой посреди них теряет
+	   * весь data.txt. Правило — в storage_policy.h. Пропуски считаем отдельно
+	   * от write_fails: это не отказ тома. В CSV счётчик пока не выводится
+	   * (формат строки — не этого блока), его видно отладчиком. */
+	  static volatile uint32_t lowpower_skips = 0;
+	  uint8_t power_ok = Storage_MayWrite(bat.valid, bat.low, bat.vdd);
+
 	  /* Флеш наша до конца блока: MSC в это время отвечает хосту «не готов». */
 	  SPI_Flash_SetBusy(1);
 
@@ -539,7 +554,9 @@ int main(void)
 	      fs_ok = (f_mount(&USERFatFS, USERPath, 1) == FR_OK) ? 1U : 0U;
 
 	  FIL file;
-	  res = fs_ok ? f_open(&file, DATA_FILE, FA_OPEN_APPEND | FA_WRITE) : FR_NOT_READY;
+	  res = !power_ok ? FR_DENIED
+	      : fs_ok     ? f_open(&file, DATA_FILE, FA_OPEN_APPEND | FA_WRITE)
+	                  : FR_NOT_READY;
 
 	  /* Архив заполнен — закрываем файл и не пишем: следующая строка ушла бы
 	   * за физическую границу флеш. Счётчик отказов продолжает расти, поэтому
@@ -587,6 +604,10 @@ int main(void)
 	          write_fails++;
 	          fs_ok = 0;
 	      }
+	  }
+	  else if (!power_ok)
+	  {
+	      lowpower_skips++;
 	  }
 	  else
 	  {

@@ -312,6 +312,14 @@ static void test_storage_policy(void)
     equ(Storage_MscMayAccess(1, 0), 1, "готова и свободна — MSC читает");
     equ(Storage_MscMayAccess(1, 1), 0, "занята основным потоком — хосту «не готов»");
     equ(Storage_MscMayAccess(0, 0), 0, "не инициализирована — из прерывания не будим");
+
+    /* Питание. Порог VDD 2.9 В и признак bat.low. */
+    equ(Storage_MayWrite(1, 0, 3.20f), 1, "нормальное питание — пишем");
+    equ(Storage_MayWrite(1, 1, 3.20f), 0, "банка ниже порога LDO — не пишем");
+    equ(Storage_MayWrite(1, 0, 2.85f), 0, "VDD ниже 2.9 В — не пишем");
+    equ(Storage_MayWrite(1, 0, 2.90f), 1, "ровно 2.9 В — ещё пишем");
+    /* Замер не удался: ничего не знаем — архив из-за отказа АЦП не останавливаем. */
+    equ(Storage_MayWrite(0, 0, 0.0f), 1, "замер батареи не удался — пишем");
 }
 
 int main(void)

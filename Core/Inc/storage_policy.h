@@ -12,6 +12,12 @@
 #define STORAGE_SECTOR_BYTES   512U
 #define STORAGE_BOOT_SECTOR    63U
 
+/* Ниже этого VDD стирание и программирование SST26VF016B идут вне паспорта
+ * (2.7–3.6 В), а пик тока стирания на исходе банки может уронить питание
+ * посреди RMW блока каталога или FAT. Запас 0.2 В над паспортом — на просадку
+ * под нагрузкой, которую VREFINT в момент замера не видит. */
+#define STORAGE_MIN_VDD_VOLTS  2.9f
+
 /* Весь буфер — 0xFF, то есть стёртая флеш. */
 static inline uint8_t Storage_IsErased(const uint8_t *buf, uint32_t len)
 {
@@ -46,6 +52,21 @@ static inline uint8_t Storage_MayFormat(uint8_t no_fs, uint8_t reads_ok,
 static inline uint8_t Storage_MscMayAccess(uint8_t flash_ready, uint8_t flash_busy)
 {
     return (flash_ready && !flash_busy) ? 1U : 0U;
+}
+
+/* Можно ли сейчас писать на флеш при таком питании. Каждая дозапись — это
+ * стирание и перепрограммирование 4-КБ блоков каталога и FAT, и сбой посреди
+ * них теряет весь data.txt. Пропущенная строка стоит одного часа данных.
+ * Неудавшийся замер батареи (valid == 0, vdd == 0) запись не запрещает:
+ * иначе отказ АЦП навсегда остановил бы архив, а о питании мы тогда просто
+ * ничего не знаем. */
+static inline uint8_t Storage_MayWrite(uint8_t bat_valid, uint8_t bat_low, float vdd)
+{
+    if (!bat_valid)
+        return 1;
+    if (bat_low)
+        return 0;
+    return (vdd >= STORAGE_MIN_VDD_VOLTS) ? 1U : 0U;
 }
 
 #endif
