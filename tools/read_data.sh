@@ -14,9 +14,17 @@
 # окнами, хеш совпал), и лишь затем прошивается второй дампер, который удаляет
 # файл при совпадении размера и хеша с сохранённым. Архив больше 32 КБ снимается
 # окнами, на диск попадает только часть строк — такой --wipe не стирает.
+# Перед стиранием снятый файл копируется в build/archive/data-<дата>-<хеш>.txt:
+# build/data.txt следующие снятия сдвигают в .prev и затирают, а копия в
+# build/archive не перезаписывается и не удаляется никогда (R5).
 #
 # Прошлый выходной файл перед снятием переименовывается в <файл>.prev: иначе при
 # неудачном снятии сводка показала бы старые данные как свежие (D3).
+# Рабочая прошивка после снятия собирается из main.c, каким он был ДО снятия,
+# байт-в-байт. Если main.c за время снятия правили, правки откладываются в
+# build/main.c.yours-<дата> и возвращаются в main.c только после того, как на
+# плату легла рабочая версия: недописанный код в поле не уходит (R4).
+#
 # Код выхода: 0 — снято (и стёрто, если просили); 1 — данных нет или снятие
 # сломалось; 2 — нет программатора/ST-Link; 3 — снято, но стирание не сделано.
 set -euo pipefail
@@ -41,8 +49,13 @@ TMPBIN="$(mktemp -u).bin"
 FLASHED_DUMPER=0
 RESTORED_FW=0
 PATCHED_SUM=""
+YOURS=""      # копия main.c с правками владельца, сделанными за время снятия
+ARCHIVE=""    # несменяемая копия архива, снятого перед стиранием
 
-src_sum() { git hash-object --no-filters "$SRC"; }
+# Всё, что сравнивается после $(...), чистится от CR: на Windows программы
+# пишут CRLF, а Git Bash срезает только LF, и «0x1234\r» != «0x1234» (R1).
+src_sum() { git hash-object --no-filters "$SRC" | tr -d '\r'; }
+stamp() { date +%Y%m%d-%H%M%S; }
 
 echo ">> 1/6 сохраняю main.c"
 # Копия снимается до установки trap: прерывание раньше этой строки оставило бы
@@ -51,31 +64,57 @@ BACKUP="$(mktemp)"
 cp "$SRC" "$BACKUP"
 ORIG_SUM="$(src_sum)"
 
-# Вернуть main.c. Копией перезаписываем только если файл ровно тот, что
-# оставил патч. Если за время ожидания окна (до часа) main.c сохранили из
-# CubeIDE, перезапись молча стёрла бы эти правки: тогда убираем из файла
-# только вставку дампера, а копию «до снятия» кладём рядом (D5).
+# Вернуть main.c байт-в-байт из копии, снятой до патча (D5), со сверкой хеша.
+# Если за время ожидания окна (до часа) main.c сохранили из CubeIDE, раньше из
+# файла убиралась только вставка дампера, и на плату уходила недописанная
+# правка, а если она не собиралась — на плате оставался дампер (R4). Теперь
+# такой файл откладывается в build/main.c.yours-<дата> (без вставки дампера),
+# а рабочая прошивка собирается из копии «до снятия».
 restore_src() {
     [ -n "$PATCHED_SUM" ] && [ -s "$BACKUP" ] || return 0
-    local cur
+    local cur yours
     cur="$(src_sum)"
-    if [ "$cur" = "$PATCHED_SUM" ]; then
+    if [ "$cur" != "$PATCHED_SUM" ] && [ "$cur" != "$ORIG_SUM" ]; then
+        yours="$ROOT/build/main.c.yours-$(stamp)"
+        while [ -e "$yours" ]; do yours="$yours.1"; done
+        cp "$SRC" "$yours"
+        echo "!! ======================================================================" >&2
+        echo "!! main.c ИЗМЕНИЛИ во время снятия. На плату он НЕ пойдёт: рабочая" >&2
+        echo "!! прошивка соберётся из main.c, каким он был до снятия." >&2
+        if python "$ROOT/tools/dump_patch.py" --revert "$yours" >/dev/null; then
+            echo "!! Ваши правки (без вставки дампера): ${yours#$ROOT/}" >&2
+            YOURS="$yours"
+        else
+            echo "!! Ваши правки отложены в ${yours#$ROOT/}, но вставку дампера из" >&2
+            echo "!! копии убрать не удалось — уберите её руками, в main.c сами не вернутся." >&2
+            YOURS=""
+        fi
+        echo "!! ======================================================================" >&2
+    fi
+    if [ "$cur" != "$ORIG_SUM" ]; then
         cp "$BACKUP" "$SRC"
-        if [ "$(src_sum)" = "$ORIG_SUM" ]; then
-            echo ">> main.c восстановлен (сверено по хешу)"
-        else
-            echo "!! main.c восстановлен, но хеш не совпал с исходным — проверьте git diff" >&2
-        fi
-    elif [ "$cur" != "$ORIG_SUM" ]; then
-        cp "$BACKUP" "$ROOT/build/main.c.before-dump"
-        if python "$ROOT/tools/dump_patch.py" --revert >/dev/null; then
-            echo "!! main.c менялся во время снятия: ваши правки оставлены, вставка дампера убрана." >&2
-        else
-            echo "!! main.c менялся во время снятия, и вставку дампера убрать не удалось — уберите руками" >&2
-        fi
-        echo "   main.c до снятия: build/main.c.before-dump" >&2
+    fi
+    if [ "$(src_sum)" = "$ORIG_SUM" ]; then
+        echo ">> main.c восстановлен из копии до снятия (сверено по хешу)"
+    else
+        echo "!! main.c восстановлен, но хеш не совпал с исходным — проверьте git diff" >&2
     fi
     PATCHED_SUM=""
+}
+
+# Вернуть в main.c правки владельца — только когда на плате уже рабочая
+# версия (или дампер и не прошивался). Иначе подсказка «./tools/dev.sh flash»
+# прошила бы в поле ту самую недописанную правку.
+give_back_yours() {
+    [ -n "$YOURS" ] || return 0
+    if [ "$FLASHED_DUMPER" = "1" ] && [ "$RESTORED_FW" != "1" ]; then
+        echo "!! ваши правки main.c НЕ возвращены (на плате не рабочая версия): ${YOURS#$ROOT/}" >&2
+    elif [ "$(src_sum)" != "$ORIG_SUM" ]; then
+        echo "!! main.c снова менялся — ваши отложенные правки остались в ${YOURS#$ROOT/}" >&2
+    else
+        cp "$YOURS" "$SRC"
+        echo "!! ваши правки возвращены в main.c (копия: ${YOURS#$ROOT/}); на плате — версия ДО них" >&2
+    fi
 }
 
 patch_src() {
@@ -108,11 +147,14 @@ on_exit() {
     if [ "$FLASHED_DUMPER" = "1" ] && [ "$RESTORED_FW" != "1" ]; then
         echo ">> аварийный откат: возвращаю рабочую прошивку" >&2
         if "$ROOT/tools/dev.sh" build >/dev/null 2>&1 && flash_now; then
+            RESTORED_FW=1
             echo ">> рабочая прошивка возвращена" >&2
         else
             echo "!! НЕ УДАЛОСЬ. На плате дампер. Прошейте вручную: ./tools/dev.sh flash" >&2
         fi
     fi
+    give_back_yours
+    [ -z "$ARCHIVE" ] || echo ">> копия архива, снятая перед --wipe: ${ARCHIVE#$ROOT/} (не перезаписывается)"
     rm -f "$BACKUP" "$TMPBIN" "$TMPBIN.cut"
     exit "$code"
 }
@@ -182,7 +224,7 @@ wait_dump() {
         if [ "${1:-}" = "D00DFEED" ] && [ $# -ge 13 ]; then
             magic=$1; fsize=$((16#$2)); len=$((16#$3))
             win_bytes=$((16#$4)); win_count=$((16#$5)); win_step=$((16#$6))
-            soil_mv=$7; bat_mv=$((16#$8)); vdd_mv=$((16#$9)); bat_pct=$((16#${10}))
+            soil_mv=$7; bat_mv=$8; vdd_mv=$9; bat_pct=${10}
             status=$((16#${11})); hash="0x${12}"; wipe=$((16#${13}))
             return 0
         fi
@@ -205,6 +247,22 @@ status_text() {
         4) echo "f_lseek вернул FRESULT $fr — снято $len из $fsize Б" ;;
         *) echo "неизвестный статус дампера 0x$(printf %X "$status")" ;;
     esac
+}
+
+# Несменяемая копия перед стиранием: после него на плате архива нет, а
+# build/data.txt два следующих снятия затирают через .prev (R5). Имя
+# уникально, существующий файл не трогается, копия сверяется по хешу.
+save_archive() {
+    local dir="$ROOT/build/archive" base f n=0
+    mkdir -p "$dir" || return 1
+    base="$dir/data-$(stamp)-${hash#0x}"
+    f="$base.txt"
+    while [ -e "$f" ]; do n=$((n + 1)); f="$base-$n.txt"; done
+    cp "$OUT" "$f" || return 1
+    python "$ROOT/tools/unpack_dump.py" --check "$f" "$hash" || return 1
+    chmod a-w "$f" 2>/dev/null || true
+    ARCHIVE="$f"
+    echo "   копия архива: ${f#$ROOT/}"
 }
 
 require_prog
@@ -240,7 +298,11 @@ fi
 why="$(status_text)"
 [ -z "$why" ] || echo "   !! $why" >&2
 
-echo "   живой замер: батарея ${bat_mv} мВ (${bat_pct}%), VDD ${vdd_mv} мВ"
+if [ "$bat_mv" = "FFFFFFFF" ]; then
+    echo "   живой замер: батарея — замер не удался (нет данных о банке и VDD)"
+else
+    echo "   живой замер: батарея $((16#$bat_mv)) мВ ($((16#$bat_pct))%), VDD $((16#$vdd_mv)) мВ"
+fi
 if [ "$soil_mv" = "FFFFFFFF" ]; then
     echo "   датчик почвы: АЦП не ответил"
 else
@@ -274,8 +336,11 @@ if [ -n "$WIPE" ]; then
         WIPE_FAIL="архив $fsize Б больше буфера 32 КБ и снят окнами — на диске только часть строк. Снимите файл целиком через USB самой платы (том появится как флешка) и удалите его там"
     elif [ "$len" -ne "$fsize" ]; then
         WIPE_FAIL="снято $len Б из $fsize"
-    elif [ "$(python "$ROOT/tools/unpack_dump.py" --fnv "$OUT")" != "$hash" ]; then
+    elif ! python "$ROOT/tools/unpack_dump.py" --check "$OUT" "$hash"; then
+        # Сверка кодом возврата, а не сравнением строк: без CRLF-ловушки (R1).
         WIPE_FAIL="файл на диске не совпал с прочитанным с платы"
+    elif ! save_archive; then
+        WIPE_FAIL="не удалось сохранить несменяемую копию в build/archive"
     else
         echo ">> 4б/6 стираю архив: второй дампер удалит файл, только если он тот же ($fsize Б, хеш $hash)"
         saved_size=$fsize

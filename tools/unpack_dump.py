@@ -10,11 +10,15 @@
 
     python tools/unpack_dump.py <вход.bin> <выход.csv> <win_bytes> <win_count> [хеш]
     python tools/unpack_dump.py --fnv <файл>
+    python tools/unpack_dump.py --check <файл> <хеш>
 
 win_bytes = 0 означает непрерывный дамп. Хеш — dump_info.hash из дампера:
 если прочитанные по SWD байты с ним не сходятся (не тот адрес, обрыв чтения),
 выходной файл не пишется вовсе — испорченный архив хуже отсутствующего.
---fnv печатает тот же хеш для файла на диске.
+--fnv печатает тот же хеш для файла на диске. --check сверяет хеш файла сам
+и отвечает только кодом возврата (0 — совпал). Сравнивать в bash вывод --fnv
+нельзя: на Windows print() пишет CRLF, Git Bash в $(...) срезает только LF,
+и строка с CR на конце никогда не равна хешу (R1).
 """
 import sys
 
@@ -31,6 +35,9 @@ def main():
     if sys.argv[1] == "--fnv":
         print("0x%08X" % fnv1a(open(sys.argv[2], "rb").read()))
         return
+    if sys.argv[1] == "--check":
+        got = fnv1a(open(sys.argv[2], "rb").read())
+        sys.exit(0 if got == int(sys.argv[3], 0) else 1)
     src, dst = sys.argv[1], sys.argv[2]
     win_bytes = int(sys.argv[3])
     win_count = int(sys.argv[4])

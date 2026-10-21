@@ -20,7 +20,8 @@
 
     python tools/dump_patch.py                       только читает архив
     python tools/dump_patch.py --wipe <размер> <хеш> второй проход очистки
-    python tools/dump_patch.py --revert              убрать вставку из main.c
+    python tools/dump_patch.py --revert [файл]       убрать вставку из main.c
+                                                     (или из его копии)
 
 Очистка — всегда второй, отдельный проход. Первый только читает; хост
 сохраняет файл на диск и сверяет его с тем, что было на флеш. Второй дампер
@@ -165,11 +166,21 @@ DUMP = "  " + BEGIN + """
       float sv = Soil_ReadVoltage();
       dump_info.soil_mv = (sv != sv) ? 0xFFFFFFFFU : (uint32_t)(sv * 1000.0f);
 
+      /* При отказе замера volts/vdd = NAN, а percent = 255: приведение NAN к
+       * uint32_t не определено (на M4 даёт 0), и хост показывал «0 мВ (255%)»,
+       * то есть пустую банку. Отказ помечаем так же, как у почвы. */
       Battery_Data bd;
       Battery_Read(&bd);
-      dump_info.bat_mv  = (uint32_t)(bd.volts * 1000.0f);
-      dump_info.vdd_mv  = (uint32_t)(bd.vdd   * 1000.0f);
-      dump_info.bat_pct = bd.percent;
+      if (bd.valid)
+      {
+          dump_info.bat_mv  = (uint32_t)(bd.volts * 1000.0f);
+          dump_info.vdd_mv  = (uint32_t)(bd.vdd   * 1000.0f);
+          dump_info.bat_pct = bd.percent;
+      }
+      else
+      {
+          dump_info.bat_mv = dump_info.vdd_mv = dump_info.bat_pct = 0xFFFFFFFFU;
+      }
 
       dump_info.magic = 0xD00DFEEDU;
       /* Дальше по main() не идём и в STOP не уходим: пока ядро крутится здесь,
@@ -203,15 +214,15 @@ WIPE = """/* Здесь файл только исчезает: дампер н�
       }"""
 
 
-def read_src():
+def read_src(path=PATH):
     # newline="" — читать байт-в-байт, не трогая CRLF: иначе запись обратно
     # перевела бы все строки в одно окончание, и git diff показал бы изменённым
     # весь файл, а вставка в нём потерялась бы (D5).
-    return io.open(PATH, encoding="utf-8", newline="").read()
+    return io.open(path, encoding="utf-8", newline="").read()
 
 
-def write_src(s):
-    io.open(PATH, "w", encoding="utf-8", newline="").write(s)
+def write_src(s, path=PATH):
+    io.open(path, "w", encoding="utf-8", newline="").write(s)
 
 
 def eol_of(s):
@@ -229,14 +240,15 @@ def revert(s):
 
 def main():
     args = sys.argv[1:]
-    s = read_src()
 
     if args[:1] == ["--revert"]:
-        s, n = revert(s)
+        # Необязательный путь — копия main.c с правками владельца (read_data.sh).
+        path = args[1] if len(args) > 1 else PATH
+        s, n = revert(read_src(path))
         if BEGIN in s or "dump_info" in s:
-            sys.exit("вставка дампера убрана не полностью — откатите main.c руками")
+            sys.exit("вставка дампера убрана не полностью — откатите %s руками" % path)
         if n:
-            write_src(s)
+            write_src(s, path)
         print("дампер убран" if n else "дампера в main.c нет")
         return
 
@@ -248,6 +260,7 @@ def main():
     elif args:
         sys.exit("неизвестные аргументы: %s" % " ".join(args))
 
+    s = read_src()
     if "dump_info" in s:
         sys.exit("main.c уже пропатчен — сначала откатите правку")
     for a in (DECL_ANCHOR, DUMP_ANCHOR):
