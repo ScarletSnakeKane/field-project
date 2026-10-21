@@ -10,6 +10,7 @@
 """
 import collections
 import datetime as dt
+import math
 import sys
 
 # Колонки, где любое ненулевое значение — это отказ, а не показание.
@@ -17,6 +18,8 @@ ERROR_COLS = ("aht_init_st", "aht_read_st", "ds_err", "write_fails",
               "aht_i2c_err")
 # Колонки-флаги, где отказом является НОЛЬ.
 FLAG_COLS = ("soil_valid", "lse_ok")
+# Значение DS18B20 по сбросу: преобразование не выполнилось, а не 85 °C почвы.
+DS_RESET = 85.0
 
 
 def main():
@@ -66,17 +69,38 @@ def main():
                 bad.append("%s == 0 в %d строках" % (name, n))
     print("  отказы: " + ("; ".join(bad) if bad else "нет"))
 
+    # nan отказавшего датчика разбирается float() без ошибки, но в min/max
+    # ведёт себя по-разному в зависимости от позиции: в первой строке он давал
+    # «air_temp nan .. nan» при 199 валидных строках (D8). Поэтому nan и 85.00
+    # почвы в диапазон не входят, а считаются отдельно.
     for name in header:
+        if name == "timestamp":
+            continue
         vals = []
+        nans = 0
         for v in col[name]:
             try:
-                vals.append(float(v))
+                f = float(v)
             except ValueError:
-                pass
-        if len(vals) == len(rows) and name != "timestamp":
-            lo, hi = min(vals), max(vals)
-            if lo != hi:
-                print("  %-14s %8.2f .. %8.2f" % (name, lo, hi))
+                continue
+            if math.isnan(f) or math.isinf(f):
+                nans += 1
+            else:
+                vals.append(f)
+        if len(vals) + nans != len(rows):
+            continue
+        note = ""
+        if nans:
+            note += "   nan: %d" % nans
+        if name == "soil_temp":
+            junk = sum(1 for v in vals if v == DS_RESET)
+            vals = [v for v in vals if v != DS_RESET]
+            if junk:
+                note += "   85.00 (сброс DS18B20): %d" % junk
+        if not vals:
+            print("  %-14s нет ни одного значения%s" % (name, note))
+        elif min(vals) != max(vals) or note:
+            print("  %-14s %8.2f .. %8.2f%s" % (name, min(vals), max(vals), note))
 
     if "timestamp" in col:
         try:
