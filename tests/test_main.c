@@ -47,12 +47,26 @@ static void equ(unsigned got, unsigned want, const char *what)
 
 /* ---------------------------------------------------------------- DS18B20 */
 
-/* Эталонные scratchpad'ы. Контрольный байт посчитан независимой реализацией
- * Dallas CRC-8 на Python, а не этим же кодом, иначе тест проверял бы сам себя. */
-static const unsigned char SP_25C[9]  = {0x91,0x01,0x4B,0x46,0xFF,0x0C,0x10,0x00,0xFC};
-static const unsigned char SP_NEG[9]  = {0x5E,0xFF,0x4B,0x46,0xFF,0x0C,0x10,0x00,0xE6};
-static const unsigned char SP_85C[9]  = {0x50,0x05,0x4B,0x46,0xFF,0x0C,0x10,0x00,0x90};
-static const unsigned char SP_0C[9]   = {0x00,0x00,0x4B,0x46,0xFF,0x0C,0x10,0x00,0x44};
+/* Эталонные scratchpad'ы в раскладке даташита: температура (2 байта), TH, TL,
+ * конфигурация 0x7F (12 бит), 0xFF, байт 6 (0x10 - младший полубайт
+ * температуры после конвертации, 0x0C по сбросу), 0x10, CRC. Контрольный
+ * байт посчитан независимой реализацией Dallas CRC-8 на Python, а не этим же
+ * кодом, иначе тест проверял бы сам себя; для SP_85C он совпадает с
+ * общеизвестным кадром по сбросу 50 05 4B 46 7F FF 0C 10 1C. */
+static const unsigned char SP_25C[9]  = {0x91,0x01,0x4B,0x46,0x7F,0xFF,0x0F,0x10,0x25};
+static const unsigned char SP_NEG[9]  = {0x5E,0xFF,0x4B,0x46,0x7F,0xFF,0x02,0x10,0xB6};
+static const unsigned char SP_85C[9]  = {0x50,0x05,0x4B,0x46,0x7F,0xFF,0x0C,0x10,0x1C};
+static const unsigned char SP_0C[9]   = {0x00,0x00,0x4B,0x46,0x7F,0xFF,0x10,0x10,0x69};
+static const unsigned char SP_85C1[9] = {0x51,0x05,0x4B,0x46,0x7F,0xFF,0x0F,0x10,0x0A};
+static const unsigned char SP_125[9]  = {0xD0,0x07,0x4B,0x46,0x7F,0xFF,0x10,0x10,0x55};
+static const unsigned char SP_125P[9] = {0xD1,0x07,0x4B,0x46,0x7F,0xFF,0x0F,0x10,0xE2};
+static const unsigned char SP_M55[9]  = {0x90,0xFC,0x4B,0x46,0x7F,0xFF,0x10,0x10,0xEE};
+static const unsigned char SP_M55M[9] = {0x8F,0xFC,0x4B,0x46,0x7F,0xFF,0x01,0x10,0x68};
+/* Те же 25 °C с верным CRC, но с испорченными служебными байтами. */
+static const unsigned char SP_CFG9[9] = {0x91,0x01,0x4B,0x46,0x1F,0xFF,0x0F,0x10,0xB5};
+static const unsigned char SP_CFGX[9] = {0x91,0x01,0x4B,0x46,0xFF,0xFF,0x0F,0x10,0xFC};
+static const unsigned char SP_B5X[9]  = {0x91,0x01,0x4B,0x46,0x7F,0x0C,0x0F,0x10,0x4C};
+static const unsigned char SP_B7X[9]  = {0x91,0x01,0x4B,0x46,0x7F,0xFF,0x0F,0x00,0xB8};
 
 static void test_ds18b20(void)
 {
@@ -61,7 +75,8 @@ static void test_ds18b20(void)
 
     puts("DS18B20");
 
-    equ(DS18B20_CRC8(SP_25C, 8), 0xFC, "CRC8 совпал с независимым расчётом");
+    equ(DS18B20_CRC8(SP_25C, 8), 0x25, "CRC8 совпал с независимым расчётом");
+    equ(DS18B20_CRC8(SP_85C, 8), 0x1C, "CRC8 кадра по сбросу совпал с общеизвестным");
 
     equ(DS18B20_DecodeScratchpad(SP_25C, &t), DS18B20_OK, "исправный ответ принят");
     eqf(t, 25.0625f, 0.0001f, "+25.0625 C");
@@ -92,12 +107,43 @@ static void test_ds18b20(void)
     sp[8] ^= 0xFF;
     equ(DS18B20_DecodeScratchpad(sp, &t), DS18B20_ERR_CRC, "битый CRC пойман");
 
+    /* Почти пустой кадр с подобранным CRC раньше проходил всегда (255 из 255
+     * вариантов «только sp[0] != 0»). Служебные байты мусор не воспроизводит. */
+    {
+        int accepted = 0;
+        for (int x = 1; x < 256; x++) {
+            memset(sp, 0, sizeof(sp));
+            sp[0] = (unsigned char)x;
+            sp[8] = DS18B20_CRC8(sp, 8);
+            if (DS18B20_DecodeScratchpad(sp, &t) == DS18B20_OK) accepted++;
+        }
+        equ((unsigned)accepted, 0, "почти пустые кадры с верным CRC отвергнуты");
+    }
+    equ(DS18B20_DecodeScratchpad(SP_CFGX, &t), DS18B20_ERR_RESERVED,
+        "старший бит конфигурации поднят — отвергнуто");
+    equ(DS18B20_DecodeScratchpad(SP_B5X, &t), DS18B20_ERR_RESERVED, "байт 5 не 0xFF — отвергнуто");
+    equ(DS18B20_DecodeScratchpad(SP_B7X, &t), DS18B20_ERR_RESERVED, "байт 7 не 0x10 — отвергнуто");
+    /* Биты разрешения в конфигурации законно меняются: 9 бит — тоже DS18B20. */
+    equ(DS18B20_DecodeScratchpad(SP_CFG9, &t), DS18B20_OK, "конфигурация 9 бит принята");
+
     /* 85.00 C — значение, которое DS18B20 отдаёт после подачи питания, если
-     * преобразование не выполнялось. Сейчас оно проходит как валидное. Для
-     * почвы в теплице это физически невозможно, так что при желании его стоит
-     * отсеивать — тест фиксирует текущее поведение, чтобы смена была осознанной. */
-    equ(DS18B20_DecodeScratchpad(SP_85C, &t), DS18B20_OK, "85.00 C пока считается валидным");
-    eqf(t, 85.0f, 0.0001f, "85.00 C (значение по сбросу)");
+     * преобразование не выполнялось, и с верным CRC. Датчик обесточивается
+     * каждый час, так что непринятая CONVERT T даёт ровно этот кадр. Раньше
+     * тест называл его валидным; в почве теплицы 85 C не бывает. */
+    t = -999.0f;
+    equ(DS18B20_DecodeScratchpad(SP_85C, &t), DS18B20_ERR_RESET_VALUE,
+        "85.00 C по сбросу отвергнуты");
+    eqf(t, -999.0f, 0.0001f, "при отказе температура не тронута");
+    /* Соседний код — уже настоящее измерение: отсеивается ровно одно значение. */
+    equ(DS18B20_DecodeScratchpad(SP_85C1, &t), DS18B20_OK, "85.0625 C принято");
+    eqf(t, 85.0625f, 0.0001f, "+85.0625 C");
+
+    /* Шкала датчика -55..+125: края проходят, шаг наружу — нет. */
+    equ(DS18B20_DecodeScratchpad(SP_125, &t),  DS18B20_OK,        "+125 C принято");
+    equ(DS18B20_DecodeScratchpad(SP_125P, &t), DS18B20_ERR_RANGE, "+125.0625 C отвергнуто");
+    equ(DS18B20_DecodeScratchpad(SP_M55, &t),  DS18B20_OK,        "-55 C принято");
+    eqf(t, -55.0f, 0.0001f, "-55 C");
+    equ(DS18B20_DecodeScratchpad(SP_M55M, &t), DS18B20_ERR_RANGE, "-55.0625 C отвергнуто");
 }
 
 /* --------------------------------------------------------------- батарея */
