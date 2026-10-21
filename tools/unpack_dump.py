@@ -8,19 +8,47 @@
 их надо отбросить, иначе разбор получит склеенную из двух половинок строку,
 которая по числу полей выглядит правдоподобно и потому особенно вредна.
 
-    python tools/unpack_dump.py <вход.bin> <выход.csv> <win_bytes> <win_count>
+    python tools/unpack_dump.py <вход.bin> <выход.csv> <win_bytes> <win_count> [хеш]
+    python tools/unpack_dump.py --fnv <файл>
+    python tools/unpack_dump.py --check <файл> <хеш>
 
-win_bytes = 0 означает непрерывный дамп.
+win_bytes = 0 означает непрерывный дамп. Хеш — dump_info.hash из дампера:
+если прочитанные по SWD байты с ним не сходятся (не тот адрес, обрыв чтения),
+выходной файл не пишется вовсе — испорченный архив хуже отсутствующего.
+--fnv печатает тот же хеш для файла на диске. --check сверяет хеш файла сам
+и отвечает только кодом возврата (0 — совпал). Сравнивать в bash вывод --fnv
+нельзя: на Windows print() пишет CRLF, Git Bash в $(...) срезает только LF,
+и строка с CR на конце никогда не равна хешу (R1).
 """
 import sys
 
 
+def fnv1a(data):
+    """FNV-1a 32 — тот же, что считает дампер (tools/dump_patch.py)."""
+    h = 2166136261
+    for b in bytearray(data):
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return h
+
+
 def main():
+    if sys.argv[1] == "--fnv":
+        print("0x%08X" % fnv1a(open(sys.argv[2], "rb").read()))
+        return
+    if sys.argv[1] == "--check":
+        got = fnv1a(open(sys.argv[2], "rb").read())
+        sys.exit(0 if got == int(sys.argv[3], 0) else 1)
     src, dst = sys.argv[1], sys.argv[2]
     win_bytes = int(sys.argv[3])
     win_count = int(sys.argv[4])
 
     data = open(src, "rb").read()
+    if len(sys.argv) > 5:
+        want = int(sys.argv[5], 0)
+        got = fnv1a(data)
+        if got != want:
+            sys.exit("   !! хеш снятого (0x%08X) не совпал с хешем на плате (0x%08X):"
+                     " ОЗУ прочитано не то или не целиком, файл не записан" % (got, want))
 
     if win_bytes == 0 or win_count <= 1:
         open(dst, "wb").write(data)
