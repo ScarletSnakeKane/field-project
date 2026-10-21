@@ -6,6 +6,7 @@
  * сознательно: Debug/ не в git, и сборка CubeIDE новый файл не увидит. */
 
 #include <stdint.h>
+#include <math.h>
 
 /* Логический сектор FAT и место загрузочного сектора раздела. f_mkfs без
  * FM_SFD кладёт раздел с LBA 63 (ff.c, b_vol), MBR — в сектор 0. */
@@ -57,16 +58,19 @@ static inline uint8_t Storage_MscMayAccess(uint8_t flash_ready, uint8_t flash_bu
 /* Можно ли сейчас писать на флеш при таком питании. Каждая дозапись — это
  * стирание и перепрограммирование 4-КБ блоков каталога и FAT, и сбой посреди
  * них теряет весь data.txt. Пропущенная строка стоит одного часа данных.
- * Неудавшийся замер батареи (valid == 0, vdd == 0) запись не запрещает:
- * иначе отказ АЦП навсегда остановил бы архив, а о питании мы тогда просто
- * ничего не знаем. */
+ * Низкое VDD запрещает запись всегда, даже при valid == 0: Battery_Read
+ * отдаёт VDD по VREFINT и тогда, когда банка вне шкалы (глубокий разряд,
+ * LDO в дропауте) — это и есть самый опасный для флеш случай (R2).
+ * Если неизвестно и VDD (vdd — NAN: АЦП не ответил, опора 0), запись не
+ * запрещается: иначе отказ АЦП навсегда остановил бы архив, а о питании мы
+ * тогда просто ничего не знаем. */
 static inline uint8_t Storage_MayWrite(uint8_t bat_valid, uint8_t bat_low, float vdd)
 {
-    if (!bat_valid)
-        return 1;
-    if (bat_low)
+    if (!isnan(vdd) && vdd < STORAGE_MIN_VDD_VOLTS)
         return 0;
-    return (vdd >= STORAGE_MIN_VDD_VOLTS) ? 1U : 0U;
+    if (bat_valid && bat_low)
+        return 0;
+    return 1;
 }
 
 #endif

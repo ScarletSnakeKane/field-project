@@ -42,7 +42,9 @@ uint8_t Battery_VoltsToPercent(float v);
  * raw_bat и raw_ref — 12-битные отсчёты канала батареи и VREFINT,
  * vrefint_cal — заводская калибровка VREFINT при VREFINT_CAL_VDDA.
  * Возвращает 1 и оба значения, если замер правдоподобен; иначе 0, а в
- * *vdd_out и *volts_out — NAN, чтобы отказ не выглядел измерением. */
+ * *volts_out — NAN, чтобы отказ не выглядел измерением. *vdd_out при отказе
+ * — NAN, только если неправдоподобна сама опора; если опора в окне, VDD
+ * отдаётся и при банке вне шкалы: по нему хранилище решает, можно ли писать. */
 uint8_t Battery_ComputeVolts(uint32_t raw_bat, uint32_t raw_ref, uint16_t vrefint_cal,
                              float *vdd_out, float *volts_out);
 

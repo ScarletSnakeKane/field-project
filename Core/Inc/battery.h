@@ -11,7 +11,8 @@
 
 typedef struct {
     float   volts;     /* напряжение банки, NAN при отказе */
-    float   vdd;       /* реальное VDD, вычисленное через VREFINT, NAN при отказе */
+    float   vdd;       /* реальное VDD через VREFINT; NAN, только если неправдоподобна опора:
+                        * при банке вне шкалы (valid == 0) VDD известно */
     uint8_t percent;   /* заряд, % по кривой разряда Li-ion; BAT_PERCENT_UNKNOWN при отказе */
     uint8_t low;       /* 1 — ниже BAT_LOW_VOLTS */
     uint8_t valid;     /* 0 — измерить не удалось */

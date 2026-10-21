@@ -51,7 +51,8 @@ uint8_t Battery_Read(Battery_Data *out)
     ADC1_COMMON->CCR &= ~ADC_CCR_TSVREFE;
 
     /* Деление на ноль опоры, абсурдное VDD и обрыв делителя отсекаются там же,
-     * где считаются: при отказе в полях остаются NAN. */
+     * где считаются: при отказе в вольтах NAN, а VDD остаётся числом, если
+     * опора правдоподобна, — по нему Storage_MayWrite запрещает запись (R2). */
     if (!Battery_ComputeVolts(raw_bat, raw_ref, *VREFINT_CAL_ADDR, &out->vdd, &out->volts))
         return 0;
 

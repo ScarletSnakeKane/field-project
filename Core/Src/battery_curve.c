@@ -43,20 +43,29 @@ uint8_t Battery_ComputeVolts(uint32_t raw_bat, uint32_t raw_ref, uint16_t vrefin
     *vdd_out   = NAN;
     *volts_out = NAN;
 
-    /* Ноль опоры — канал не поднялся, делить на него нельзя. Насыщенный канал
-     * батареи значит лишь «не меньше шкалы», настоящее напряжение неизвестно. */
-    if (raw_ref == 0 || raw_bat >= 4095U)
+    /* Ноль опоры — канал не поднялся, делить на него нельзя. */
+    if (raw_ref == 0)
         return 0;
 
-    float vdd   = VREFINT_CAL_VDDA * (float)vrefint_cal / (float)raw_ref;
-    float volts = ((float)raw_bat / 4095.0f) * vdd * BAT_DIVIDER_RATIO;
-
+    float vdd = VREFINT_CAL_VDDA * (float)vrefint_cal / (float)raw_ref;
     if (!(vdd >= BAT_VDD_MIN && vdd <= BAT_VDD_MAX))
         return 0;
+
+    /* Опора правдоподобна — VDD отдаём, даже если банка дальше окажется вне
+     * шкалы. Банка ниже 2.5 В — это LDO в дропауте и VDD около 2.4 В, ровно
+     * когда хранилищу важнее всего знать, что писать на флеш нельзя. Раньше
+     * здесь оставался NAN, и «замер не удался» разрешал запись (R2). */
+    *vdd_out = vdd;
+
+    /* Насыщенный канал батареи значит лишь «не меньше шкалы», настоящее
+     * напряжение неизвестно. */
+    if (raw_bat >= 4095U)
+        return 0;
+
+    float volts = ((float)raw_bat / 4095.0f) * vdd * BAT_DIVIDER_RATIO;
     if (!(volts >= BAT_VOLTS_MIN && volts <= BAT_VOLTS_MAX))
         return 0;
 
-    *vdd_out   = vdd;
     *volts_out = volts;
     return 1;
 }
