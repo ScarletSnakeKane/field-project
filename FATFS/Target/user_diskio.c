@@ -147,7 +147,10 @@ DRESULT USER_read (
         memset(buff + (phys * SECTOR_SIZE), 0, (count - phys) * SECTOR_SIZE);
     }
 
-    SPI_Flash_Read(sector * SECTOR_SIZE, buff, phys * SECTOR_SIZE);
+    /* Ошибка шины — честный RES_ERROR, а не RES_OK с мусором в буфере:
+     * по такому «успешному» чтению загрузочного сектора старт форматировал том. */
+    if (!SPI_Flash_Read(sector * SECTOR_SIZE, buff, phys * SECTOR_SIZE))
+        return RES_ERROR;
     return RES_OK;
   /* USER CODE END READ */
 }
@@ -193,8 +196,11 @@ DRESULT USER_write (
 
     for (uint32_t blk = block_start; blk < block_end; blk += FLASH_SECTOR_SIZE)
     {
-        /* 1) читаем существующий блок целиком */
-        SPI_Flash_Read(blk, block_buf, FLASH_SECTOR_SIZE);
+        /* 1) читаем существующий блок целиком. Не прочитался — блок НЕ трогаем:
+         *    стереть его и записать обратно то, что пришло с шины, значило бы
+         *    самим уничтожить 7 соседних секторов каталога или FAT. */
+        if (!SPI_Flash_Read(blk, block_buf, FLASH_SECTOR_SIZE))
+            return RES_ERROR;
 
         /* 2) вычисляем пересечение [addr, addr+len) с этим блоком */
         uint32_t copy_start = (addr > blk) ? addr : blk;
@@ -208,9 +214,14 @@ DRESULT USER_write (
             memcpy(&block_buf[off_in_block], &buff[off_in_src], copy_len);
         }
 
-        /* 3) стираем и пишем блок целиком */
-        SPI_Flash_EraseSector(blk);
-        SPI_Flash_Write(blk, block_buf, FLASH_SECTOR_SIZE);
+        /* 3) стираем и пишем блок целиком, затем читаем обратно. Таймаут или
+         *    расхождение уходят в FatFs как RES_ERROR: f_close вернёт ошибку,
+         *    main посчитает write_fails и перемонтирует том, вместо того чтобы
+         *    молча потерять строку. */
+        if (!SPI_Flash_EraseSector(blk) ||
+            !SPI_Flash_Write(blk, block_buf, FLASH_SECTOR_SIZE) ||
+            !SPI_Flash_Verify(blk, block_buf, FLASH_SECTOR_SIZE))
+            return RES_ERROR;
     }
 
     return RES_OK;
@@ -238,6 +249,8 @@ DRESULT USER_ioctl (
     switch (cmd)
     {
         case CTRL_SYNC:
+            /* Кэша записи у драйвера нет, а каждая запись выше дожидается конца
+             * программирования и сверяет блок: к этому моменту всё уже на флеш. */
             return RES_OK;
 
         case GET_SECTOR_COUNT:
