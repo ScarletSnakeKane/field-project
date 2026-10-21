@@ -12,11 +12,15 @@ find_plugins() {
     local def="/e/ProgramData/ST/STM32CubeIDE_2.2.0/STM32CubeIDE/plugins"
     if [ -n "${CUBEIDE_PLUGINS:-}" ]; then echo "$CUBEIDE_PLUGINS"; return; fi
     if [ -d "$def" ]; then echo "$def"; return; fi
-    local d found=""
-    # Маска раскрывается по алфавиту, так что последней остаётся самая новая версия.
-    for d in /?/ProgramData/ST/STM32CubeIDE_*/STM32CubeIDE/plugins \
-             /?/ST/STM32CubeIDE_*/STM32CubeIDE/plugins; do
-        [ -d "$d" ] && found="$d"
+    local d drv found=""
+    # Буквы дисков перебираются явно: в Git Bash /c, /d — точки монтирования,
+    # корневой каталог их не перечисляет, и маска /?/ не раскрывалась (R7).
+    # Маска версии раскрывается по алфавиту — последней остаётся самая новая.
+    for drv in c d e f g h; do
+        for d in /$drv/ProgramData/ST/STM32CubeIDE_*/STM32CubeIDE/plugins \
+                 /$drv/ST/STM32CubeIDE_*/STM32CubeIDE/plugins; do
+            [ -d "$d" ] && found="$d"
+        done
     done
     echo "${found:-$def}"
 }
