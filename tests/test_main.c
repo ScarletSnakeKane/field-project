@@ -475,6 +475,74 @@ static void test_storage_policy(void)
     equ(Storage_MayFormat(1, 1, mbr, boot), 0, "мусор в загрузочном секторе — не форматируем");
     boot[STORAGE_SECTOR_BYTES / 2] = 0xFF;
 
+    /* R3: сорванный формат. Загрузочный сектор — как его кладёт f_mkfs для
+     * тома 4 МБ с кластером 512 (резерв 1, одна FAT по 32 сектора, раздел
+     * с LBA 63): корень в секторе 63 + 1 + 32 = 96. MBR ещё стёрт. */
+    {
+        static unsigned char root[STORAGE_SECTOR_BYTES];
+        static const unsigned char jmp_oem[11] = {0xEB,0xFE,0x90,'M','S','D','O','S','5','.','0'};
+
+        memset(mbr, 0xFF, sizeof(mbr));
+        memset(boot, 0, sizeof(boot));
+        memcpy(boot, jmp_oem, sizeof(jmp_oem));
+        boot[11] = 0x00; boot[12] = 0x02;   /* 512 байт на сектор */
+        boot[13] = 1;                       /* кластер 1 сектор */
+        boot[14] = 1;    boot[15] = 0;      /* резерв 1 */
+        boot[16] = 1;                       /* одна FAT */
+        boot[22] = 32;   boot[23] = 0;      /* FAT 32 сектора */
+        boot[28] = 63;                      /* раздел с LBA 63 */
+        boot[510] = 0x55; boot[511] = 0xAA;
+        equ(Storage_OurRootDirSector(boot), 96, "наш загрузочный сектор — корень в 96");
+        boot[16] = 2;
+        equ(Storage_OurRootDirSector(boot), 128, "две FAT — корень за обеими, в 128");
+        boot[16] = 1;
+
+        /* f_mkfs оборвался до очистки корня: корень ещё 0xFF. */
+        memset(root, 0xFF, sizeof(root));
+        equ(Storage_MayFormat(1, 1, mbr, boot), 0, "наш недоделанный формат — «чистым» не считается");
+        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 1, "недоделанный формат, корень 0xFF — доделываем");
+
+        /* Корень очищен, но MBR не записан. */
+        memset(root, 0x00, sizeof(root));
+        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 1, "недоделанный формат, корень обнулён — доделываем");
+
+        /* Прерванная правка типа раздела на томе с архивом: MBR стёрт, в корне data.txt. */
+        memcpy(root, "DATA    TXT", 11);
+        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 0, "в корне data.txt — архив не стираем");
+        /* Удалённый файл — тоже запись, даже если от неё осталась одна метка 0xE5. */
+        memset(root, 0x00, sizeof(root));
+        root[0] = 0xE5;
+        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 0, "в корне удалённый файл — не стираем");
+        memset(root, 0x00, sizeof(root));
+
+        equ(Storage_MayRedoFormat(1, 1, 0, mbr, boot, root), 0, "корень не прочитан — не форматируем");
+        equ(Storage_MayRedoFormat(1, 0, 1, mbr, boot, root), 0, "MBR/загрузочный не прочитаны — не форматируем");
+        equ(Storage_MayRedoFormat(0, 1, 1, mbr, boot, root), 0, "ФС смонтировалась — не форматируем");
+
+        /* MBR не стёрт (битая сигнатура при живом разделе) — не наш случай. */
+        mbr[0] = 0x00;
+        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 0, "MBR не стёрт — не форматируем");
+        mbr[0] = 0xFF;
+
+        /* Чужой загрузочный сектор (другой OEM — форматировал не наш f_mkfs). */
+        boot[3] = 'm';
+        equ(Storage_OurRootDirSector(boot), 0, "чужой OEM — не наш формат");
+        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 0, "чужой загрузочный сектор — не форматируем");
+        boot[3] = 'M';
+        boot[511] = 0x00;
+        equ(Storage_OurRootDirSector(boot), 0, "без 55AA — не наш формат");
+        boot[511] = 0xAA;
+        boot[28] = 0;
+        equ(Storage_OurRootDirSector(boot), 0, "раздел не с LBA 63 — не наш формат");
+        boot[28] = 63;
+        boot[16] = 0;
+        equ(Storage_OurRootDirSector(boot), 0, "ноль FAT — не загрузочный сектор");
+        boot[16] = 1;
+
+        memset(mbr, 0xFF, sizeof(mbr));
+        memset(boot, 0xFF, sizeof(boot));
+    }
+
     /* MSC в прерывании: только готовая и свободная флеш. */
     equ(Storage_MscMayAccess(1, 0), 1, "готова и свободна — MSC читает");
     equ(Storage_MscMayAccess(1, 1), 0, "занята основным потоком — хосту «не готов»");

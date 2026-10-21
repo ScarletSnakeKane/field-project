@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <math.h>
+#include <string.h>
 
 /* Логический сектор FAT и место загрузочного сектора раздела. f_mkfs без
  * FM_SFD кладёт раздел с LBA 63 (ff.c, b_vol), MBR — в сектор 0. */
@@ -43,6 +44,67 @@ static inline uint8_t Storage_MayFormat(uint8_t no_fs, uint8_t reads_ok,
         return 0;
     return Storage_IsErased(mbr, STORAGE_SECTOR_BYTES) &&
            Storage_IsErased(boot, STORAGE_SECTOR_BYTES);
+}
+
+/* LBA первого сектора корневого каталога, если boot — загрузочный сектор,
+ * который кладёт наш f_mkfs (FAT12/16, раздел с LBA 63, OEM "MSDOS5.0");
+ * иначе 0. Корень лежит сразу за резервной областью и таблицами FAT —
+ * в том же порядке f_mkfs их и пишет (ff.c, «Initialize FAT area», затем
+ * «Initialize root directory»). */
+static inline uint32_t Storage_OurRootDirSector(const uint8_t *boot)
+{
+    static const uint8_t jmp_oem[11] = {0xEB, 0xFE, 0x90,
+                                        'M', 'S', 'D', 'O', 'S', '5', '.', '0'};
+    if (memcmp(boot, jmp_oem, sizeof(jmp_oem)) != 0)
+        return 0;
+    if (boot[510] != 0x55 || boot[511] != 0xAA)
+        return 0;
+
+    uint32_t bps   = (uint32_t)boot[11] | ((uint32_t)boot[12] << 8);
+    uint32_t rsvd  = (uint32_t)boot[14] | ((uint32_t)boot[15] << 8);
+    uint32_t nfats = boot[16];
+    uint32_t fatsz = (uint32_t)boot[22] | ((uint32_t)boot[23] << 8);
+    uint32_t hidd  = (uint32_t)boot[28] | ((uint32_t)boot[29] << 8) |
+                     ((uint32_t)boot[30] << 16) | ((uint32_t)boot[31] << 24);
+
+    if (bps != STORAGE_SECTOR_BYTES || hidd != STORAGE_BOOT_SECTOR)
+        return 0;
+    if (rsvd == 0 || nfats == 0 || nfats > 2 || fatsz == 0)
+        return 0;
+    return STORAGE_BOOT_SECTOR + rsvd + nfats * fatsz;
+}
+
+/* В секторе каталога нет ни одной записи: только нули (f_mkfs его очистил)
+ * или 0xFF (до очистки не дошёл). Удалённый файл (0xE5) — уже запись: файл
+ * когда-то был, и решать о нём будет человек. */
+static inline uint8_t Storage_IsEmptyDir(const uint8_t *dir)
+{
+    for (uint32_t i = 0; i < STORAGE_SECTOR_BYTES; i++)
+        if (dir[i] != 0x00 && dir[i] != 0xFF)
+            return 0;
+    return 1;
+}
+
+/* Можно ли доделать сорванный формат (R3). f_mkfs пишет загрузочный сектор
+ * первым, а MBR — последним; если между ними пропало питание или сверка
+ * блока не сошлась, на флеш остаётся наш загрузочный сектор при стёртом MBR.
+ * Storage_MayFormat такую флеш чистой не считает, и прибор навсегда
+ * оставался бы с fs_ok = 0. Доформатировать безопасно, только если на томе
+ * не было ни одного файла: тем же «MBR стёрт, загрузочный жив» выглядит и
+ * прерванная правка типа раздела в MBR на томе с архивом — у того в корне
+ * лежит data.txt.
+ *   root_ok — корневой сектор прочитан без ошибки драйвера. */
+static inline uint8_t Storage_MayRedoFormat(uint8_t no_fs, uint8_t reads_ok, uint8_t root_ok,
+                                            const uint8_t *mbr, const uint8_t *boot,
+                                            const uint8_t *root)
+{
+    if (!no_fs || !reads_ok || !root_ok)
+        return 0;
+    if (!Storage_IsErased(mbr, STORAGE_SECTOR_BYTES))
+        return 0;
+    if (Storage_OurRootDirSector(boot) == 0)
+        return 0;
+    return Storage_IsEmptyDir(root);
 }
 
 /* Можно ли MSC (из прерывания OTG) читать флеш прямо сейчас. Не готова —

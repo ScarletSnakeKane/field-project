@@ -348,19 +348,55 @@ int main(void)
       /* «Нет ФС» по мнению FatFs — ещё не повод стирать: так же выглядит
        * одно искажённое чтение или прерванная перезапись блока 0. Форматируем
        * только чистую флеш — правило и его обоснование в storage_policy.h. */
+      BYTE *mbr  = work;
+      BYTE *boot = work + FLASH_SECTOR_BYTES;
+      BYTE *root = work + 2 * FLASH_SECTOR_BYTES;
       uint8_t reads_ok =
-          (disk_read(0, work, 0, 1) == RES_OK) &&
-          (disk_read(0, work + FLASH_SECTOR_BYTES, STORAGE_BOOT_SECTOR, 1) == RES_OK);
+          (disk_read(0, mbr, 0, 1) == RES_OK) &&
+          (disk_read(0, boot, STORAGE_BOOT_SECTOR, 1) == RES_OK);
 
-      if (boot_power_ok &&
-          Storage_MayFormat(1, reads_ok, work, work + FLASH_SECTOR_BYTES))
+      uint8_t may_format = Storage_MayFormat(1, reads_ok, mbr, boot);
+
+      /* Не чистая — но, может быть, это наш же формат, сорванный между
+       * загрузочным сектором и MBR (R3). Без этой проверки такой прибор
+       * больше никогда не форматировался бы и молча не писал ничего. */
+      if (!may_format && reads_ok)
       {
-          /* Размер кластера задан явно — 512 байт, минимум. Автовыбор для тома 4 МБ
-           * взял бы 1 КБ, кластеров получилось бы около 4050 при пороге FAT16 в 4085,
-           * и том снова вышел бы FAT12 — тот самый, который Android не монтирует. */
-          res = f_mkfs(USERPath, FM_FAT, FLASH_SECTOR_BYTES, work, sizeof(work));
-          if (res == FR_OK)
-              res = f_mount(&USERFatFS, USERPath, 1);
+          uint32_t root_lba = Storage_OurRootDirSector(boot);
+          uint8_t  root_ok  = (root_lba != 0) &&
+                              (disk_read(0, root, root_lba, 1) == RES_OK);
+          may_format = Storage_MayRedoFormat(1, reads_ok, root_ok, mbr, boot, root);
+      }
+
+      if (boot_power_ok && may_format)
+      {
+          /* Решение «форматировать» принято по содержимому флеш один раз;
+           * повторы его не пересматривают — после первой попытки загрузочный
+           * сектор уже записан. Повтор нужен потому, что f_mkfs теперь может
+           * вернуть FR_DISK_ERR по несошедшейся сверке блока, а без него
+           * одна такая сверка оставляла прибор без тома до следующего старта.
+           * Перед повтором питание проверяется заново: если сбой был от
+           * просадки, долбить флеш дальше нельзя. */
+          for (uint8_t attempt = 0; attempt < 3; attempt++)
+          {
+              if (attempt > 0)
+              {
+                  Battery_Read(&bat_boot);
+                  boot_power_ok = Storage_MayWrite(bat_boot.valid, bat_boot.low, bat_boot.vdd);
+                  if (!boot_power_ok)
+                      break;
+                  SPI_Flash_Init();
+              }
+              /* Размер кластера задан явно — 512 байт, минимум. Автовыбор для тома 4 МБ
+               * взял бы 1 КБ, кластеров получилось бы около 4050 при пороге FAT16 в 4085,
+               * и том снова вышел бы FAT12 — тот самый, который Android не монтирует. */
+              res = f_mkfs(USERPath, FM_FAT, FLASH_SECTOR_BYTES, work, sizeof(work));
+              if (res == FR_OK)
+              {
+                  res = f_mount(&USERFatFS, USERPath, 1);
+                  break;
+              }
+          }
       }
   }
 
@@ -368,7 +404,9 @@ int main(void)
    * в активном режиме, то есть посаженную за пару дней батарею и полную тишину
    * в данных. Теперь это не фатально: помечаем ФС как неисправную и пробуем
    * перемонтировать раз в цикл, засыпая между попытками. Нечистая флеш без
-   * распознаваемой ФС так и остаётся с fs_ok = 0: архив на ней не трогаем. */
+   * распознаваемой ФС так и остаётся с fs_ok = 0: архив на ней не трогаем.
+   * Сорванный в этой загрузке формат доделается на следующем старте —
+   * его узнаёт Storage_MayRedoFormat. */
   fs_ok = (res == FR_OK) ? 1U : 0U;
 
   /* Android считает раздел пригодным для монтирования, только если байт типа
