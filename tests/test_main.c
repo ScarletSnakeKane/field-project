@@ -314,13 +314,15 @@ static void test_sleep_policy(void)
  * Контрольные байты посчитаны независимой реализацией на Python (делением
  * многочленов, сверено с эталонным вектором Sensirion 0xBEEF -> 0x92),
  * а не этим же кодом, иначе тест проверял бы сам себя. */
+static unsigned hexdigit(char c)
+{
+    return (c >= 'A') ? (unsigned)(c - 'A' + 10) : (unsigned)(c - '0');
+}
+
 static void aht_frame(unsigned char *f, const char *hex)
 {
-    for (int i = 0; i < AHT20_FRAME_LEN; i++) {
-        unsigned v = 0;
-        sscanf(hex + 2 * i, "%2x", &v);
-        f[i] = (unsigned char)v;
-    }
+    for (int i = 0; i < AHT20_FRAME_LEN; i++)
+        f[i] = (unsigned char)((hexdigit(hex[2 * i]) << 4) | hexdigit(hex[2 * i + 1]));
 }
 
 static void test_aht20(void)
