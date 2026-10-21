@@ -17,9 +17,18 @@
 можно одним запросом.
 
 Правка НЕ предназначена для коммита — её накладывает и откатывает read_data.sh.
-Она только читает: архив на флеш при этом не меняется.
+
+    python tools/dump_patch.py                       только читает архив
+    python tools/dump_patch.py --wipe <размер> <хеш> второй проход очистки
+    python tools/dump_patch.py --revert              убрать вставку из main.c
+
+Очистка — всегда второй, отдельный проход. Первый только читает; хост
+сохраняет файл на диск и сверяет его с тем, что было на флеш. Второй дампер
+перечитывает файл заново и удаляет его, только если размер и хеш совпали с
+сохранённым на хосте, — то есть удаляется ровно то, что уже лежит на диске.
 """
 import io
+import re
 import sys
 
 PATH = "Core/Src/main.c"
@@ -27,11 +36,28 @@ PATH = "Core/Src/main.c"
 DECL_ANCHOR = "static uint32_t write_fails = 0;"
 DUMP_ANCHOR = "  // 2b) Архив начинается заново в двух случаях:"
 
+BEGIN = "/* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — НЕ КОММИТИТЬ ===="
+END = "/* ==== КОНЕЦ ВРЕМЕННОГО ДАМПЕРА ==== */"
+
+# Раскладку структуры читает read_data.sh по номерам слов — менять только вместе.
 DECL = """
 
-/* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — НЕ КОММИТИТЬ ==== */
+""" + BEGIN + """ */
 #define DUMP_MAX    32768U
 #define DUMP_WIN    1024U    /* размер одного окна при разреженном снятии */
+
+/* Коды status: младший байт — где сломалось, следующий — FRESULT. */
+#define DUMP_ST_OK       0U
+#define DUMP_ST_NO_FS    1U  /* том не смонтирован */
+#define DUMP_ST_OPEN     2U  /* f_open не открыл файл (FR_NO_FILE = 4 — файла нет) */
+#define DUMP_ST_READ     3U  /* f_read вернул ошибку */
+#define DUMP_ST_SEEK     4U  /* f_lseek вернул ошибку */
+
+/* Коды wipe. */
+#define DUMP_WIPE_NONE    0U /* очистку не просили */
+#define DUMP_WIPE_DONE    1U /* файл удалён */
+#define DUMP_WIPE_REFUSED 2U /* файл не совпал с сохранённым на хосте — не тронут */
+#define DUMP_WIPE_FAILED  3U /* f_unlink вернул ошибку (код в старшем байте) */
 
 typedef struct {
     uint32_t magic;      /* 0xD00DFEED — дамп действительно выполнился */
@@ -44,16 +70,29 @@ typedef struct {
     uint32_t bat_mv;     /* напряжение банки, мВ */
     uint32_t vdd_mv;     /* реальное VDD через VREFINT, мВ */
     uint32_t bat_pct;    /* заряд по кривой, % */
+    uint32_t status;     /* DUMP_ST_*: почему снято 0 байт — нет тома, файла или чтения */
+    uint32_t hash;       /* FNV-1a по len байтам буфера: хост сверяет, что прочёл то же */
+    uint32_t wipe;       /* DUMP_WIPE_* */
 } dump_info_t;
 static volatile dump_info_t dump_info;
-static uint8_t dump_buf[DUMP_MAX];"""
+static uint8_t dump_buf[DUMP_MAX];
+""" + END
 
-DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — НЕ КОММИТИТЬ ====
+DUMP = "  " + BEGIN + """
    * Стоит строго ДО блока очистки архива ниже: тот удаляет файл при
    * несовпадении заголовка, и после него читать было бы уже нечего. */
   {
       FIL df;
-      if (fs_ok && f_open(&df, DATA_FILE, FA_READ) == FR_OK)
+      FRESULT dr;
+      if (!fs_ok)
+      {
+          dump_info.status = DUMP_ST_NO_FS;
+      }
+      else if ((dr = f_open(&df, DATA_FILE, FA_READ)) != FR_OK)
+      {
+          dump_info.status = DUMP_ST_OPEN | ((uint32_t)dr << 8);
+      }
+      else
       {
           UINT br = 0;
           uint32_t fsize = (uint32_t)f_size(&df);
@@ -62,7 +101,9 @@ DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — Н
           if (fsize <= DUMP_MAX)
           {
               /* Влезает целиком — снимаем подряд, без потерь. */
-              f_read(&df, dump_buf, DUMP_MAX, &br);
+              dr = f_read(&df, dump_buf, DUMP_MAX, &br);
+              if (dr != FR_OK)
+                  dump_info.status = DUMP_ST_READ | ((uint32_t)dr << 8);
               dump_info.len = (uint32_t)br;
           }
           else
@@ -80,10 +121,16 @@ DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — Н
               for (uint32_t i = 0; i < count; i++)
               {
                   UINT part = 0;
-                  if (f_lseek(&df, i * step) != FR_OK)
+                  if ((dr = f_lseek(&df, i * step)) != FR_OK)
+                  {
+                      dump_info.status = DUMP_ST_SEEK | ((uint32_t)dr << 8);
                       break;
-                  if (f_read(&df, dump_buf + got, DUMP_WIN, &part) != FR_OK)
+                  }
+                  if ((dr = f_read(&df, dump_buf + got, DUMP_WIN, &part)) != FR_OK)
+                  {
+                      dump_info.status = DUMP_ST_READ | ((uint32_t)dr << 8);
                       break;
+                  }
                   got += part;
                   if (part < DUMP_WIN)
                       break;
@@ -96,6 +143,16 @@ DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — Н
               br = got;
           }
           f_close(&df);
+      }
+
+      {
+          uint32_t h = 2166136261U;
+          for (uint32_t i = 0; i < dump_info.len; i++)
+          {
+              h ^= dump_buf[i];
+              h *= 16777619U;
+          }
+          dump_info.hash = h;
       }
 
       DUMP_WIPE_HOOK
@@ -119,35 +176,93 @@ DUMP = """  /* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — Н
        * SWD остаётся живым и дамп читается без гонки с циклом сна. */
       while (1) { __NOP(); }
   }
+  """ + END + """
 
 """
 
 
-# Очистка идёт строго ПОСЛЕ того, как архив уже вычитан в ОЗУ, и только по явной
-# просьбе. Так «снять и начать заново» остаётся одним действием: собранное не
-# теряется, а на флеш остаётся пустой файл с одним заголовком.
-WIPE = """/* Архив уже лежит в ОЗУ — можно удалять. Здесь файл только исчезает:
-       * дампер ниже останавливается и до кода, создающего заголовок, не
-       * доходит. Заново файл появится при следующей загрузке, когда на плату
-       * вернётся рабочая прошивка — она увидит отсутствие файла, создаст его
-       * с заголовком и тут же запишет первый замер. */
-      f_unlink(DATA_FILE);"""
+# Удаляется только файл, который хост уже сохранил целиком: снят подряд (не
+# окнами), прочитан без ошибок, и размер с хешем совпали с переданными с хоста.
+# Раньше удаление стояло безусловно сразу после чтения — и стирало весь архив,
+# даже когда в буфер попали лишь окна по 1 КБ, f_read вернул ошибку или хост
+# так и не дочитал ОЗУ (D1).
+WIPE = """/* Здесь файл только исчезает: дампер ниже останавливается и до кода,
+       * создающего заголовок, не доходит. Заново файл появится при следующей
+       * загрузке рабочей прошивки — с заголовком и первым замером. */
+      if (dump_info.status == DUMP_ST_OK && dump_info.win_bytes == 0U
+          && dump_info.len == dump_info.fsize
+          && dump_info.fsize == %(size)uU && dump_info.hash == 0x%(hash)08XU)
+      {
+          FRESULT ur = f_unlink(DATA_FILE);
+          dump_info.wipe = (ur == FR_OK) ? DUMP_WIPE_DONE
+                                         : (DUMP_WIPE_FAILED | ((uint32_t)ur << 8));
+      }
+      else
+      {
+          dump_info.wipe = DUMP_WIPE_REFUSED;
+      }"""
+
+
+def read_src():
+    # newline="" — читать байт-в-байт, не трогая CRLF: иначе запись обратно
+    # перевела бы все строки в одно окончание, и git diff показал бы изменённым
+    # весь файл, а вставка в нём потерялась бы (D5).
+    return io.open(PATH, encoding="utf-8", newline="").read()
+
+
+def write_src(s):
+    io.open(PATH, "w", encoding="utf-8", newline="").write(s)
+
+
+def eol_of(s):
+    return "\r\n" if "\r\n" in s else "\n"
+
+
+def revert(s):
+    """Убрать вставку, не трогая остального: правки, сделанные в main.c за время
+    снятия, при этом сохраняются."""
+    b, e = re.escape(BEGIN), re.escape(END)
+    s, n1 = re.subn(r"(?:\r?\n){2}" + b + r".*?" + e, "", s, count=1, flags=re.S)
+    s, n2 = re.subn(r"  " + b + r".*?" + e + r"(?:\r?\n){2}", "", s, count=1, flags=re.S)
+    return s, n1 + n2
 
 
 def main():
-    wipe = "--wipe" in sys.argv
+    args = sys.argv[1:]
+    s = read_src()
 
-    s = io.open(PATH, encoding="utf-8").read()
+    if args[:1] == ["--revert"]:
+        s, n = revert(s)
+        if BEGIN in s or "dump_info" in s:
+            sys.exit("вставка дампера убрана не полностью — откатите main.c руками")
+        if n:
+            write_src(s)
+        print("дампер убран" if n else "дампера в main.c нет")
+        return
+
+    wipe = None
+    if args[:1] == ["--wipe"]:
+        if len(args) != 3:
+            sys.exit("--wipe требует размер и хеш сохранённого на хосте файла")
+        wipe = {"size": int(args[1]), "hash": int(args[2], 0)}
+    elif args:
+        sys.exit("неизвестные аргументы: %s" % " ".join(args))
+
     if "dump_info" in s:
         sys.exit("main.c уже пропатчен — сначала откатите правку")
     for a in (DECL_ANCHOR, DUMP_ANCHOR):
         if s.count(a) != 1:
             sys.exit("не найден якорь: %s" % a)
-    s = s.replace(DECL_ANCHOR, DECL_ANCHOR + DECL, 1)
-    s = s.replace(DUMP_ANCHOR, DUMP + DUMP_ANCHOR, 1)
-    s = s.replace("DUMP_WIPE_HOOK", WIPE if wipe else "")
-    io.open(PATH, "w", encoding="utf-8", newline="\r\n").write(s)
-    print("дампер вставлен" + (" (с очисткой архива)" if wipe else ""))
+
+    hook = WIPE % wipe if wipe else ""
+    nl = eol_of(s)
+    decl = DECL.replace("\n", nl)
+    dump = DUMP.replace("DUMP_WIPE_HOOK", hook).replace("\n", nl)
+    s = s.replace(DECL_ANCHOR, DECL_ANCHOR + decl, 1)
+    s = s.replace(DUMP_ANCHOR, dump + DUMP_ANCHOR, 1)
+    write_src(s)
+    print("дампер вставлен" + (" (очистка, если файл совпадёт с сохранённым)" if wipe else ""))
 
 
-main()
+if __name__ == "__main__":
+    main()
