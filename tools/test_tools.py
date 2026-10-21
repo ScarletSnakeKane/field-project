@@ -4,7 +4,7 @@
     python tools/test_tools.py
 
 Проверяется то, на чём инструменты уже ошибались (находки D1, D2, D3, D5, D8
-аудита): вставка дампера не меняет окончания строк и снимается без следа;
+аудита и R1, R4–R6, R9 приёмки): вставка дампера не меняет окончания строк и снимается без следа;
 дампер стирает архив только тот, что хост сохранил целиком; срок батареи
 считается по кривой прошивки от текущего заряда; nan не портит диапазоны;
 испорченное чтение ОЗУ не попадает на диск.
@@ -122,6 +122,7 @@ STUBS = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 typedef unsigned int UINT;
 typedef enum { FR_OK = 0, FR_DISK_ERR = 1, FR_NO_FILE = 4 } FRESULT;
 typedef struct { uint32_t pos; } FIL;
@@ -150,9 +151,16 @@ static FRESULT f_unlink(const char *n) { (void)n; g_unlinked = 1; g_exists = 0; 
 #define HAL_GPIO_WritePin(a, b, c) ((void)0)
 #define HAL_Delay(x) ((void)0)
 #define SENSOR_POWERUP_DELAY_MS 0
-typedef struct { float volts, vdd; uint8_t percent; } Battery_Data;
+typedef struct { float volts, vdd; uint8_t percent, low, valid; } Battery_Data;
+static int g_bat_valid = 1;
 static float Soil_ReadVoltage(void) { return 1.0f; }
-static void Battery_Read(Battery_Data *b) { b->volts = 3.8f; b->vdd = 3.3f; b->percent = 65; }
+static void Battery_Read(Battery_Data *b)
+{
+    /* Как battery.c после П2: при отказе NAN и 255 %. */
+    b->valid = (uint8_t)g_bat_valid; b->low = 0;
+    b->volts = g_bat_valid ? 3.8f : NAN; b->vdd = g_bat_valid ? 3.3f : NAN;
+    b->percent = g_bat_valid ? 65 : 255;
+}
 """
 
 MAIN = r"""
@@ -163,10 +171,12 @@ int main(int argc, char **argv)
     fs_ok = (uint8_t)atoi(argv[3]);
     g_read_fail = atoi(argv[4]);
     g_fail_full = atoi(argv[5]);
+    g_bat_valid = atoi(argv[6]);
     for (uint32_t i = 0; i < g_size; i++) g_file[i] = (uint8_t)('a' + i % 26);
     run_dump();
-    printf("%u %u %u %u %u %d\n", (unsigned)dump_info.len, (unsigned)dump_info.win_bytes,
-           (unsigned)dump_info.status, (unsigned)dump_info.hash, (unsigned)dump_info.wipe, g_unlinked);
+    printf("%u %u %u %u %u %d %u %u %u\n", (unsigned)dump_info.len, (unsigned)dump_info.win_bytes,
+           (unsigned)dump_info.status, (unsigned)dump_info.hash, (unsigned)dump_info.wipe, g_unlinked,
+           (unsigned)dump_info.bat_mv, (unsigned)dump_info.vdd_mv, (unsigned)dump_info.bat_pct);
     return 0;
 }
 """
@@ -208,11 +218,12 @@ class DumperWipe(unittest.TestCase):
         subprocess.check_call([GCC, "-std=c11", "-Wall", "-o", exe, c])
         return exe
 
-    def run_exe(self, exe, size, exists=1, fs=1, read_fail=-1, fail_full=0):
+    def run_exe(self, exe, size, exists=1, fs=1, read_fail=-1, fail_full=0, bat=1):
         out = subprocess.check_output([exe, str(size), str(exists), str(fs),
-                                       str(read_fail), str(fail_full)])
-        ln, win, st, h, wipe, unlinked = map(int, out.split())
-        return dict(len=ln, win=win, status=st, hash=h, wipe=wipe, unlinked=unlinked)
+                                       str(read_fail), str(fail_full), str(bat)])
+        ln, win, st, h, wipe, unlinked, bmv, vmv, pct = map(int, out.split())
+        return dict(len=ln, win=win, status=st, hash=h, wipe=wipe, unlinked=unlinked,
+                    bat=(bmv, vmv, pct))
 
     def test_read_only_never_unlinks(self):
         r = self.run_exe(self.build(), 1000)
@@ -257,6 +268,12 @@ class DumperWipe(unittest.TestCase):
         self.assertEqual(r["win"], 1024)
         self.assertEqual(r["hash"], fnv1a(windowed(size)))
         self.assertEqual((r["wipe"], r["unlinked"]), (2, 0))
+
+    def test_battery_fail_marked(self):
+        # R6: отказ замера батареи — 0xFFFFFFFF, а не 0 мВ и 255 %.
+        exe = self.build()
+        self.assertEqual(self.run_exe(exe, 10)["bat"], (3800, 3300, 65))
+        self.assertEqual(self.run_exe(exe, 10, bat=0)["bat"], (0xFFFFFFFF,) * 3)
 
     def test_status_no_fs_and_no_file(self):
         exe = self.build()
@@ -334,6 +351,26 @@ class NanRanges(unittest.TestCase):
             self.assertRegex(line[-1], r"18\.00 \.\.\s+18\.00\s+85\.00 \(сброс DS18B20\): \d+")
 
 
+class DsErrCodes(unittest.TestCase):
+    """R9: коды ds_err 5/6/7 расшифрованы в сводке, а не «ds_err != 0»."""
+
+    def test_codes_named(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        p = os.path.join(d, "ds5.txt")
+        lines = slurp(DATA).split(b"\r\n")
+        for i, code in ((1, b"5"), (2, b"5"), (3, b"6"), (4, b"7")):
+            lines[i] = lines[i][:lines[i].rfind(b",", 0, lines[i].rfind(b","))] + b"," + code + b",0"
+        spit(p, b"\r\n".join(lines))
+        for name in ("summarize_data.py", "analyze_run.py"):
+            out = run_tool(name, p)[1]
+            self.assertIn("ds_err != 0", out)
+            self.assertIn("код 5 (служебные байты scratchpad не те", out)
+            self.assertRegex(out, r"код 5 \([^)]*\) x2")
+            self.assertIn("код 6 (85.00 °C по сбросу", out)
+            self.assertIn("код 7 (вне шкалы", out)
+
+
 class UnpackHash(unittest.TestCase):
     """D1/D3: прочитанное по SWD, не совпавшее с буфером дампера, на диск не идёт."""
 
@@ -350,6 +387,196 @@ class UnpackHash(unittest.TestCase):
         self.assertEqual(slurp(dst), b"abc\r\n")
         out = run_tool("unpack_dump.py", "--fnv", dst)[1].strip()
         self.assertEqual(int(out, 16), fnv1a(b"abc\r\n"))
+
+
+# --- Стенд read_data.sh: фейковый программатор вместо платы ----------------
+#
+# Программатор — Python-эмуляция: «прошивка» — это main.c, каким его собрал
+# заглушечный dev.sh; если в нём есть вставка дампера, при прошивке дампер
+# «выполняется» над файлом board.txt (стирание — по тем же условиям, что
+# в C-вставке, с размером и хешем, вписанными в текст патча).
+# Все python-вызовы идут через обёртку, которая, как Python на Windows,
+# пишет в stdout CRLF (R1).
+
+FAKE_PROG = r"""
+import os, re, sys
+st = os.environ["FAKE_STATE"]
+root = os.environ["FAKE_ROOT"]
+a = sys.argv[1:]
+def out(*lines):
+    sys.stdout.write("".join(l + "\r\n" for l in lines))
+def fnv(d):
+    h = 2166136261
+    for b in bytearray(d):
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return h
+board = os.path.join(st, "board.txt")
+if a[:2] == ["-l", "st"]:
+    out("ST-Link SN : 0001")
+elif "-w" in a:
+    fw = open(os.path.join(root, "Debug", "built.c"), "rb").read()
+    open(os.path.join(st, "fw.c"), "wb").write(fw)
+    n = len([f for f in os.listdir(st) if f.startswith("flash")])
+    open(os.path.join(st, "flash%d.c" % n), "wb").write(fw)
+    if os.environ.get("FAKE_EDIT") and n == 0:
+        # Владелец сохранил main.c, пока скрипт ждал окно.
+        open(os.path.join(root, "Core", "Src", "main.c"), "ab").write(os.environ["FAKE_EDIT"].encode())
+    info = None
+    if b"dump_info" in fw:
+        data = open(board, "rb").read() if os.path.exists(board) else None
+        w = [0xD00DFEED] + [0] * 12
+        if data is None:
+            w[10] = 2 | (4 << 8)
+            data = b""
+        else:
+            w[1] = w[2] = len(data)
+            w[11] = fnv(data)
+            m = re.search(rb"dump_info.fsize == (\d+)U && dump_info.hash == 0x([0-9A-F]+)U", fw)
+            if m:
+                if int(m.group(1)) == len(data) and int(m.group(2), 16) == w[11]:
+                    os.remove(board)
+                    w[12] = 1
+                else:
+                    w[12] = 2
+        w[6] = 0xFFFFFFFF
+        if os.environ.get("FAKE_BAT_FAIL"):
+            w[7] = w[8] = w[9] = 0xFFFFFFFF
+        else:
+            w[7], w[8], w[9] = 3800, 3300, 65
+        open(os.path.join(st, "info"), "w").write(" ".join("%08X" % x for x in w))
+        open(os.path.join(st, "buf"), "wb").write(data)
+    elif os.path.exists(os.path.join(st, "info")):
+        os.remove(os.path.join(st, "info"))
+    out("Download verified successfully")
+elif "-r32" in a:
+    p = os.path.join(st, "info")
+    if not os.path.exists(p):
+        out("Error: target not halted")
+    else:
+        w = open(p).read().split()
+        for i in range(0, len(w), 4):
+            out("0x%08X : %s" % (0x20000000 + 4 * i, " ".join(w[i:i + 4])))
+elif "-r" in a:
+    i = a.index("-r")
+    n, dst = int(a[i + 2]), a[i + 3]
+    d = open(os.path.join(st, "buf"), "rb").read()
+    open(dst, "wb").write((d + b"\0" * n)[:n])
+    out("Data read successfully")
+else:
+    out("Error: unknown command")
+"""
+
+FAKE_DEV = r"""#!/usr/bin/env bash
+set -e
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[ "$1" = build ] || exit 2
+grep -q BUILD_FAIL "$ROOT/Core/Src/main.c" && { echo "error: BUILD_FAIL" >&2; exit 1; }
+cp "$ROOT/Core/Src/main.c" "$ROOT/Debug/built.c"
+touch "$ROOT/Debug/FieldSensor.elf"
+"""
+
+# Обёртка python, печатающая CRLF, как Python на Windows. pipefail сохраняет
+# код возврата самого Python.
+FAKE_PY = r"""#!/usr/bin/env bash
+set -o pipefail
+"%s" "$@" | sed 's/$/\r/'
+"""
+
+BASH = shutil.which("bash")
+
+
+@unittest.skipUnless(BASH and os.name != "nt" and shutil.which("git") and shutil.which("sed"),
+                     "стенд read_data.sh гоняется только под bash вне Windows")
+class ReadDataBench(unittest.TestCase):
+    """R1, R4, R5, R6: read_data.sh целиком, с CRLF от Python."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        r = self.root
+        for d in ("tools", "Core/Src", "Debug", "bin", "state"):
+            os.makedirs(os.path.join(r, d))
+        for f in ("read_data.sh", "cubeide.sh", "dump_patch.py", "unpack_dump.py", "summarize_data.py"):
+            shutil.copy(os.path.join(TOOLS, f), os.path.join(r, "tools", f))
+        self.orig = slurp(os.path.join(ROOT, "Core", "Src", "main.c"))
+        spit(os.path.join(r, "Core", "Src", "main.c"), self.orig)
+        spit(os.path.join(r, "Debug", "FieldSensor.map"),
+             b" .bss.dump_info  0x20000000       0x34 ./Core/Src/main.o\n"
+             b" .bss.dump_buf   0x20000100     0x8000 ./Core/Src/main.o\n")
+        self.state = os.path.join(r, "state")
+        self.data = slurp(DATA)
+        self.board(self.data)
+        execs = {
+            "tools/dev.sh": FAKE_DEV,
+            "bin/python": FAKE_PY % sys.executable,
+            "bin/cygpath": '#!/bin/sh\n[ "$1" = -w ] && shift\necho "$1"\n',
+            "bin/STM32_Programmer_CLI.exe": "#!%s\n%s" % (sys.executable, FAKE_PROG),
+        }
+        for name, text in execs.items():
+            p = os.path.join(r, name)
+            spit(p, text.encode("utf-8"))
+            os.chmod(p, 0o755)
+
+    def board(self, data):
+        spit(os.path.join(self.state, "board.txt"), data)
+
+    def run_sh(self, *args, **env):
+        e = dict(os.environ)
+        e.update(PATH=os.path.join(self.root, "bin") + os.pathsep + e["PATH"],
+                 STM32_PROG=os.path.join(self.root, "bin", "STM32_Programmer_CLI.exe"),
+                 FAKE_STATE=self.state, FAKE_ROOT=self.root, FLASH_WAIT_SEC="5")
+        e.update(env)
+        p = subprocess.run([BASH, os.path.join(self.root, "tools", "read_data.sh")] + list(args),
+                           cwd=self.root, env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+    def archive(self):
+        d = os.path.join(self.root, "build", "archive")
+        return [os.path.join(d, f) for f in sorted(os.listdir(d))] if os.path.isdir(d) else []
+
+    def test_wipe_survives_crlf(self):
+        # R1: хеш с диска сверяется не сравнением строк с CR на конце.
+        rc, out, err = self.run_sh("--wipe")
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "board.txt")), "архив на плате не стёрт")
+        self.assertNotIn("не совпал", err)
+        self.assertEqual(slurp(os.path.join(self.state, "fw.c")), self.orig)
+
+    def test_wiped_archive_kept(self):
+        # R5: копия, после которой плата стёрта, переживает следующие снятия.
+        self.assertEqual(self.run_sh("--wipe")[0], 0)
+        arc = self.archive()
+        self.assertEqual(len(arc), 1)
+        self.assertEqual(slurp(arc[0]), self.data)
+        self.assertRegex(os.path.basename(arc[0]), r"^data-\d{8}-\d{6}-[0-9A-F]{8}\.txt$")
+        for i in range(2):
+            self.board(self.data[:200] + b"next %d\r\n" % i)
+            self.assertEqual(self.run_sh()[0], 0)
+        self.assertEqual(self.archive(), arc)
+        self.assertEqual(slurp(arc[0]), self.data)
+
+    def test_foreign_edit_not_flashed(self):
+        # R4: правка main.c во время снятия (здесь — даже не собирающаяся)
+        # не уходит на плату; рабочая прошивка — main.c до снятия байт-в-байт,
+        # правка возвращается в main.c после прошивки и лежит копией рядом.
+        edit = "\n/* BUILD_FAIL: недописано */\n"
+        rc, out, err = self.run_sh(FAKE_EDIT=edit)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(slurp(os.path.join(self.state, "fw.c")), self.orig)
+        self.assertIn("ИЗМЕНИЛИ", err)
+        self.assertEqual(slurp(os.path.join(self.root, "Core", "Src", "main.c")),
+                         self.orig + edit.encode("utf-8"))
+        yours = [f for f in os.listdir(os.path.join(self.root, "build")) if f.startswith("main.c.yours-")]
+        self.assertEqual(len(yours), 1)
+        self.assertEqual(slurp(os.path.join(self.root, "build", yours[0])), self.orig + edit.encode("utf-8"))
+
+    def test_battery_fail_not_empty_bank(self):
+        # R6: отказ замера батареи — не «0 мВ (255%)».
+        rc, out, err = self.run_sh(FAKE_BAT_FAIL="1")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("батарея — замер не удался", out)
+        rc, out, err = self.run_sh()
+        self.assertIn("батарея 3800 мВ (65%), VDD 3300 мВ", out)
 
 
 if __name__ == "__main__":
