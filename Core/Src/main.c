@@ -132,7 +132,9 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
  *   i2c_rec       — шину I2C пришлось освобождать (B6): 1 тактами, 2 снятием
  *                   питания, 3 не освободилась;
  *   sens_off      — карантин питания датчиков: сколько циклов ещё без питания;
- *   write_fails   — сколько строк за всю жизнь не удалось записать;
+ *   write_fails   — сколько строк за всю жизнь не удалось записать; вырос
+ *                   без пропуска строки — это отметка «архив заполнен» (S2):
+ *                   дальше строк не будет, пока не освободят место;
  *   lowpower_skips — сколько строк пропущено из-за низкого питания (П1, C3);
  *   reset_cause   — почему стартовали: биты флагов сброса и код сбоя
  *                   (Policy_ResetCause);
@@ -1030,12 +1032,43 @@ int main(void)
 	                  : FR_NOT_READY;
 
 	  /* Архив заполнен — закрываем файл и не пишем: следующая строка ушла бы
-	   * за физическую границу флеш. Счётчик отказов продолжает расти, поэтому
-	   * по последним записанным строкам видно, что запись прекратилась. */
-	  if (res == FR_OK && f_size(&file) >= CSV_MAX_BYTES)
+	   * за физическую границу флеш. Заполнен — это не только data.txt до
+	   * CSV_MAX_BYTES: старые data_N.txt занимают ту же физическую флеш, и
+	   * место считается по ней (S2, правило — Storage_ArchiveRoom). Раньше по
+	   * ним никто не считал: дозапись уходила в несуществующий сектор, том
+	   * перемонтировался каждый цикл, и архив вставал без единого следа.
+	   * Теперь первая строка после заполнения пишется из запаса как отметка
+	   * — в ней write_fails уже вырос, хотя строка на месте и без пропуска по
+	   * времени, — а дальше write_fails растёт без строк. Отметка — одна на
+	   * старт: перезапуск пишет ещё одну, пока цел запас. */
+	  static uint8_t archive_marked = 0;
+	  if (res == FR_OK)
 	  {
-	      f_close(&file);
-	      res = FR_DENIED;
+	      DWORD   fre_clst = 0;
+	      FATFS  *vol      = NULL;
+	      FRESULT gf_res   = f_getfree(USERPath, &fre_clst, &vol);
+	      uint8_t room     = STORAGE_ROOM_FULL;
+	      if (gf_res == FR_OK)
+	          room = Storage_ArchiveRoom(f_size(&file), CSV_MAX_BYTES,
+	                                     Storage_PhysFreeClusters(fre_clst, vol->n_fatent,
+	                                                              vol->database, vol->csize,
+	                                                              FLASH_PHYS_SECTORS),
+	                                     archive_marked);
+	      if (gf_res != FR_OK)
+	      {
+	          f_close(&file);
+	          res = gf_res;   /* том не ответил — обычный отказ с перемонтированием */
+	      }
+	      else if (room == STORAGE_ROOM_FULL)
+	      {
+	          f_close(&file);
+	          res = FR_DENIED;
+	      }
+	      else if (room == STORAGE_ROOM_MARK)
+	      {
+	          write_fails++;
+	          archive_marked = 1;
+	      }
 	  }
 
 	  if (res == FR_OK)

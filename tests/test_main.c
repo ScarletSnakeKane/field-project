@@ -716,6 +716,64 @@ static void test_storage_policy(void)
     equ(Storage_MscMayAccess(1, 1), 0, "занята основным потоком — хосту «не готов»");
     equ(Storage_MscMayAccess(0, 0), 0, "не инициализирована — из прерывания не будим");
 
+    /* S2: физически свободное место. Геометрия нашего f_mkfs: том с LBA 63
+     * на 8129 секторов, кластер 1 сектор, область данных с сектора 128,
+     * 8064 кластера; физически есть (4096 - 128) = 3968. */
+    puts("Место на физической флеш (S2)");
+    {
+        const uint32_t NF = 8064U + 2U, DB = 128U, PHYS = 4096U, ABSENT = 8064U - 3968U;
+        equ(Storage_PhysFreeClusters(8064U, NF, DB, 1U, PHYS), 3968U, "пустой том — свободна вся физическая флеш");
+        equ(Storage_PhysFreeClusters(8064U - 2930U, NF, DB, 1U, PHYS), 3968U - 2930U,
+            "data_1.txt на 1.5 МБ — его место вычтено из физических");
+        equ(Storage_PhysFreeClusters(ABSENT + 1U, NF, DB, 1U, PHYS), 1U, "на флеш остался один кластер");
+        equ(Storage_PhysFreeClusters(ABSENT, NF, DB, 1U, PHYS), 0U, "свободны только несуществующие — 0");
+        equ(Storage_PhysFreeClusters(ABSENT - 1U, NF, DB, 1U, PHYS), 0U,
+            "занят и несуществующий кластер — 0, а не переполнение");
+        equ(Storage_PhysFreeClusters(2016U, 2016U + 2U, DB, 4U, PHYS), 992U, "кластер 4 сектора — граница в кластерах");
+        equ(Storage_PhysFreeClusters(100U, 100U + 2U, DB, 1U, PHYS), 100U, "том меньше флеш — считает FatFs");
+        equ(Storage_PhysFreeClusters(8064U, NF, DB, 0U, PHYS), 0U, "битый csize — места нет");
+        equ(Storage_PhysFreeClusters(8064U, NF, PHYS + 1U, 1U, PHYS), 0U, "область данных за флеш — места нет");
+
+        const uint32_t MAX = 1800000U;   /* CSV_MAX_BYTES из main.c */
+        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_RESERVE + 1U, 0), STORAGE_ROOM_OK, "место есть — пишем");
+        equ(Storage_ArchiveRoom(MAX - 1U, MAX, 3000U, 0), STORAGE_ROOM_OK, "предел не достигнут — пишем");
+        equ(Storage_ArchiveRoom(MAX, MAX, 3000U, 0), STORAGE_ROOM_MARK, "предел размера — одна строка-отметка");
+        equ(Storage_ArchiveRoom(MAX, MAX, 3000U, 1), STORAGE_ROOM_FULL, "отметка уже есть — не пишем");
+        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_RESERVE, 0), STORAGE_ROOM_MARK,
+            "флеш дошла до запаса — отметка, хотя data.txt мал");
+        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_RESERVE, 1), STORAGE_ROOM_FULL, "в запасе и отмечено — не пишем");
+        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_HARD, 0), STORAGE_ROOM_MARK, "последние кластеры — ещё отметка");
+        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_HARD - 1U, 0), STORAGE_ROOM_FULL,
+            "меньше жёсткого запаса — не пишем ничего, даже отметку");
+
+        /* Сценарий разбора S2: data_1.txt на 1.5 МБ, новый data.txt растёт по
+         * 150 Б раз в час, с перезапуском каждые 10 циклов (отметка — одна на
+         * старт). Ни один кластер нового файла не должен лечь за физической
+         * границей, а отметка — появиться. */
+        uint32_t old = 2930U, size = 0U, marks = 0U, written = 0U, worst_over = 0U;
+        uint8_t marked = 0;
+        for (uint32_t cycle = 0; cycle < 20000U; cycle++)
+        {
+            if (cycle % 10U == 0U)
+                marked = 0;
+            uint32_t used = old + (size + 511U) / 512U;
+            uint8_t room = Storage_ArchiveRoom(size, MAX,
+                                               Storage_PhysFreeClusters(8064U - used, NF, DB, 1U, PHYS),
+                                               marked);
+            if (room == STORAGE_ROOM_FULL)
+                continue;
+            if (room == STORAGE_ROOM_MARK) { marked = 1; marks++; }
+            size += 150U;
+            written++;
+            used = old + (size + 511U) / 512U;
+            if (used > 3968U && used - 3968U > worst_over)
+                worst_over = used - 3968U;
+        }
+        equ(worst_over, 0U, "ни одного кластера за физической границей");
+        ok(marks > 0U, "заполнение отмечено в архиве");
+        ok(written > 2000U && size < 600000U, "data.txt дорос почти до края флеш, а не до CSV_MAX_BYTES");
+    }
+
     /* Питание. Порог VDD 2.9 В и признак bat.low. */
     equ(Storage_MayWrite(1, 0, 3.20f), 1, "нормальное питание — пишем");
     equ(Storage_MayWrite(1, 1, 3.20f), 0, "банка ниже порога LDO — не пишем");

@@ -322,6 +322,67 @@ static inline uint8_t Storage_MscMayAccess(uint8_t flash_ready, uint8_t flash_bu
     return (flash_ready && !flash_busy) ? 1U : 0U;
 }
 
+/* Сколько свободных кластеров физически есть на флеш (S2). Том заявлен на
+ * 4 МБ (ради FAT16), а флеш — 2 МБ; FatFs считает свободными и кластеры за
+ * физической границей и выделяет их по возрастанию номера. Пока места хватает,
+ * до них не доходит, но старые data_N.txt занимают ту же физическую флеш:
+ * после пары смен заголовка новый data.txt упирается в границу задолго до
+ * CSV_MAX_BYTES, запись в несуществующий сектор не проходит, и архив молча
+ * встаёт. Поэтому место считаем по флеш, а не по тому.
+ *   free_clst    — свободных кластеров по FatFs (f_getfree);
+ *   n_fatent     — число записей FAT (кластеров + 2);
+ *   database     — первый сектор области данных (абсолютный, с LBA раздела);
+ *   csize        — секторов в кластере;
+ *   phys_sectors — сколько секторов есть на самом деле (FLASH_PHYS_SECTORS).
+ * Все кластеры за границей вычитаются из свободных: если какой-то из них уже
+ * занят (запись туда когда-то пыталась пройти), результат меньше настоящего —
+ * ошибка в безопасную сторону. */
+static inline uint32_t Storage_PhysFreeClusters(uint32_t free_clst, uint32_t n_fatent,
+                                                uint32_t database, uint32_t csize,
+                                                uint32_t phys_sectors)
+{
+    if (csize == 0U || n_fatent < 2U)
+        return 0;
+    uint32_t total = n_fatent - 2U;
+    uint32_t phys  = (phys_sectors > database) ? (phys_sectors - database) / csize : 0U;
+    if (phys > total)
+        phys = total;
+    uint32_t absent = total - phys;
+    return (free_clst > absent) ? free_clst - absent : 0U;
+}
+
+/* Запас физически свободных кластеров (S2). Обычные строки пишутся, пока его
+ * больше STORAGE_ROOM_RESERVE; в запасе остаётся место на строку-отметку о
+ * заполнении. Ниже STORAGE_ROOM_HARD не пишется ничего: дозапись строки
+ * (до 224 Б) может занять ещё кластер, а FatFs по пути на флеш выделил бы
+ * несуществующий. Кластер у нашего f_mkfs — 1 сектор (512 Б), так что запас
+ * — ~4 КБ, отметок в нём хватит на ~20 перезапусков. */
+#define STORAGE_ROOM_RESERVE  8U
+#define STORAGE_ROOM_HARD     2U
+
+/* Что делать с очередной строкой (S2):
+ *   STORAGE_ROOM_OK   — писать как обычно;
+ *   STORAGE_ROOM_MARK — архив заполнен, но отметки о том ещё нет: одна строка
+ *                       из запаса, и в ней write_fails уже вырос (см. main.c);
+ *   STORAGE_ROOM_FULL — не писать: ветка «архив заполнен».
+ * Заполнен — это data.txt дорос до max_bytes ИЛИ физически свободно меньше
+ * запаса. marked — отметка уже записана (после старта); phys_free — из
+ * Storage_PhysFreeClusters. Политики освобождения места здесь нет: стирать
+ * старые архивы или нет — решение владельца. */
+#define STORAGE_ROOM_OK    0U
+#define STORAGE_ROOM_MARK  1U
+#define STORAGE_ROOM_FULL  2U
+
+static inline uint8_t Storage_ArchiveRoom(uint32_t file_size, uint32_t max_bytes,
+                                          uint32_t phys_free, uint8_t marked)
+{
+    if (file_size < max_bytes && phys_free > STORAGE_ROOM_RESERVE)
+        return STORAGE_ROOM_OK;
+    if (!marked && phys_free >= STORAGE_ROOM_HARD)
+        return STORAGE_ROOM_MARK;
+    return STORAGE_ROOM_FULL;
+}
+
 /* Можно ли сейчас писать на флеш при таком питании. Каждая дозапись — это
  * стирание и перепрограммирование 4-КБ блоков каталога и FAT, и сбой посреди
  * них теряет весь data.txt. Пропущенная строка стоит одного часа данных.
