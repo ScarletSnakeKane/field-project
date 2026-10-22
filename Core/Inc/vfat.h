@@ -102,6 +102,7 @@ typedef char VFat_AssertRoom[((LOG_FLASH_SECTORS * LOG_SLOTS * VFAT_LINE_BUF) / 
 typedef struct {
     uint32_t i;     /* запись журнала, с которой продолжать */
     uint32_t pos;   /* смещение её строки в файле */
+    uint8_t  bads;  /* испорченных слотов от начала её сектора журнала до неё */
     uint8_t  valid;
 } VFatCursor;
 
@@ -126,6 +127,11 @@ typedef struct {
     uint32_t last_wf, last_lps, last_boot;
     /* Индекс: смещение в файле начала сектора журнала k (записи k*64). */
     uint32_t off[2][VFAT_CHUNKS_MAX + 1U];
+    /* Испорченных слотов в секторе журнала при сборке. Чтение сверяет с ним
+     * каждый встреченный испорченный слот: разовый сбой чтения посреди
+     * сектора журнала иначе сдвинул бы все следующие байты файла, а
+     * поймался бы только на его границе. */
+    uint8_t  nbad[VFAT_CHUNKS_MAX + 1U];
     VFatCursor cur[2];
 } VFat;
 
@@ -143,6 +149,11 @@ uint8_t VFat_Read(VFat *v, uint32_t lba, uint8_t *buf);
  * (с пределом VFAT_LINE_BUF - 1), но с \r\n. out — не меньше VFAT_LINE_BUF.
  * Возвращает длину или -1 (не замер — в data.txt не попадает). */
 int VFat_FormatMeas(const LogRecord *r, char *out);
+
+/* Нужна ли для сектора lba флеш (данные data.txt / data_old.txt). Служебные
+ * секторы и info.txt собираются из RAM — их хост прочтёт и при флеш, не
+ * готовой к чтению. */
+uint8_t VFat_UsesFlash(const VFat *v, uint32_t lba);
 int VFat_FormatMeasSlow(const LogRecord *r, char *out);
 
 /* ====================================================== реализация */
@@ -355,7 +366,8 @@ static uint32_t VFat_RenderInfo(const VFat *v, char *out, uint32_t size)
                      "FieldSensor %s\r\n"
                      "ARCHIVE NOT AVAILABLE: %s.\r\n"
                      "Unplug the cable, wait a minute and plug it in again.\r\n",
-                     fw, (v->state == VFAT_EIO) ? "flash read error" : "log is not open");
+                     fw, (v->state == VFAT_EIO) ? "flash read error"
+                         : "log is not open (flash error, or the old archive waits for battery power to be imported)");
     else
         n = snprintf(out, size,
                      "FieldSensor %s\r\n"
@@ -368,9 +380,10 @@ static uint32_t VFat_RenderInfo(const VFat *v, char *out, uint32_t size)
                      (v->last_ts[0] && !v->last_time_ok) ? " (clock not trusted)" : "",
                      (unsigned long)(v->n_bad + v->n_skip),
                      (unsigned long)v->last_wf, (unsigned long)v->last_lps, (unsigned long)v->last_boot,
-                     v->n_import ? "data_old.txt: text of the old archive" : "",
-                     v->n_import ? (v->imp_dropped ? ", some old files did not fit" : "") : "",
-                     v->n_import ? "\r\n" : "",
+                     v->present[VFAT_FILE_OLD] ? "data_old.txt: text of the old archive" : "",
+                     (v->n_import && v->imp_dropped) ? (v->present[VFAT_FILE_OLD]
+                         ? ", some old files did not fit" : "old archive did not fit") : "",
+                     (v->present[VFAT_FILE_OLD] || (v->n_import && v->imp_dropped)) ? "\r\n" : "",
                      v->slow ? "slow line formatter (self-check failed)" : "",
                      v->slow ? "\r\n" : "");
     if (n < 0)
@@ -391,6 +404,21 @@ static void VFat_Layout(VFat *v)
         c += v->ncl[f];
     }
     VFat_Stamp(v);
+}
+
+/* Запись журнала с повтором: разовое искажённое или сорванное чтение
+ * (помеха на SPI) не должно ни выкинуть строку из индекса, ни сдвинуть
+ * файл при чтении. Настоящая порча слота стабильна — повтор её не скроет. */
+static uint8_t VFat_ReadRec(const LogRing *r, uint32_t i, LogRecord *rec)
+{
+    uint8_t st = LOG_READ_EIO;
+    for (uint32_t k = 0; k < 3U; k++)
+    {
+        st = LogRing_Read(r, i, rec);
+        if (st == LOG_READ_OK || st == LOG_READ_NONE)
+            break;
+    }
+    return st;
 }
 
 static void VFat_Kick(const LogRing *r)
@@ -416,12 +444,13 @@ static uint8_t VFat_Scan(VFat *v, uint8_t check)
             v->off[1][i / LOG_SLOTS] = pos[1];
             VFat_Kick(r);
         }
-        uint8_t st = LogRing_Read(r, i, &rec);
+        uint8_t st = VFat_ReadRec(r, i, &rec);
         if (st == LOG_READ_EIO || st == LOG_READ_NONE)
             return VFAT_EIO;
         if (st == LOG_READ_BAD)
         {
             v->n_bad++;
+            v->nbad[i / LOG_SLOTS]++;
             continue;
         }
         uint8_t t = LogRecord_Type(&rec);
@@ -557,12 +586,13 @@ static uint8_t VFat_FileRead(VFat *v, uint32_t which, uint32_t x, uint8_t *buf, 
         uint32_t mid = (lo + hi) / 2U;
         if (off[mid] <= y) lo = mid; else hi = mid;
     }
-    uint32_t i = lo * LOG_SLOTS, p = off[lo];
+    uint32_t i = lo * LOG_SLOTS, p = off[lo], bads = 0;
     VFatCursor *c = &v->cur[which];
     if (c->valid && c->pos <= y && c->i >= i)
     {
         i = c->i;
         p = c->pos;
+        bads = c->bads;
     }
 
     LogRecord rec;
@@ -579,7 +609,11 @@ static uint8_t VFat_FileRead(VFat *v, uint32_t which, uint32_t x, uint8_t *buf, 
             c->valid = 0;
             return 0;
         }
-        uint8_t st = LogRing_Read(v->ring, i, &rec);
+        if (i % LOG_SLOTS == 0U)
+            bads = 0;
+        uint8_t st = VFat_ReadRec(v->ring, i, &rec);
+        if (st == LOG_READ_BAD && ++bads > v->nbad[i / LOG_SLOTS])
+            st = LOG_READ_EIO;   /* при сборке слот читался — сбой сейчас */
         if (st == LOG_READ_EIO || st == LOG_READ_NONE)
         {
             c->valid = 0;
@@ -600,7 +634,7 @@ static uint8_t VFat_FileRead(VFat *v, uint32_t which, uint32_t x, uint8_t *buf, 
                 if (p + n > end)
                 {
                     /* Строка переходит в следующий сектор — с неё и начнём. */
-                    c->i = i; c->pos = p; c->valid = 1;
+                    c->i = i; c->pos = p; c->bads = (uint8_t)bads; c->valid = 1;
                     return 1;
                 }
                 p += n;
@@ -608,8 +642,19 @@ static uint8_t VFat_FileRead(VFat *v, uint32_t which, uint32_t x, uint8_t *buf, 
         }
         i++;
     }
-    c->i = i; c->pos = p; c->valid = 1;
+    c->i = i; c->pos = p; c->bads = (uint8_t)bads; c->valid = 1;
     return 1;
+}
+
+uint8_t VFat_UsesFlash(const VFat *v, uint32_t lba)
+{
+    if (lba < VFAT_PART_LBA + VFAT_DATA || lba >= VFAT_DISK_SECTORS)
+        return 0;
+    uint32_t c = (lba - VFAT_PART_LBA - VFAT_DATA) / VFAT_SPC + 2U;
+    for (uint32_t f = VFAT_FILE_DATA; f <= VFAT_FILE_OLD; f++)
+        if (v->ncl[f] && c >= v->clus[f] && c < (uint32_t)v->clus[f] + v->ncl[f])
+            return 1;
+    return 0;
 }
 
 static void VFat_Mbr(uint8_t *b)

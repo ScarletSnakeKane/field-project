@@ -2395,6 +2395,22 @@ static uint8_t vf_count_read(uint32_t a, uint8_t *b, uint32_t n)
 }
 static const LogFlashOps VF_COUNT_OPS = { vf_count_read, fm_program, fm_erase, NULL, fm_unlock };
 
+/* Помеха на SPI: следующие vf_glitch_left чтений адреса vf_glitch_addr
+ * приходят с одним перевёрнутым битом (CRC не сходится). */
+static long vf_glitch_addr = -1, vf_glitch_left;
+static uint8_t vf_glitch_read(uint32_t a, uint8_t *b, uint32_t n)
+{
+    vf_reads++;
+    uint8_t r = fm_read(a, b, n);
+    if (r && (long)a == vf_glitch_addr && vf_glitch_left > 0)
+    {
+        vf_glitch_left--;
+        b[30] ^= 0x04U;
+    }
+    return r;
+}
+static const LogFlashOps VF_GLITCH_OPS = { vf_glitch_read, fm_program, fm_erase, NULL, fm_unlock };
+
 /* Эталон: строка LogRecord_FormatCsv (буфер VFAT_LINE_BUF - 1) с \r\n вместо \n. */
 static int vf_ref_line(const LogRecord *r, char *out)
 {
@@ -2733,11 +2749,11 @@ static void test_vfat_volume(void)
     ok(dl == (long)VFAT_HEADER_LEN && memcmp(vf_got, VFAT_HEADER, VFAT_HEADER_LEN) == 0,
        "пустой журнал: data.txt — один заголовок");
 
-    vf_append(&r, 0, 1);
+    vf_append(&r, 800, 1);      /* метка 2026-02-06: не совпадает с фиксированной */
     vf_scenario("one", &r, 1);
     uint16_t date = 0;
     (void)vf_extract(vf_img, "DATA    TXT", vf_got, &date);
-    equ(date, VFat_FatDate(2026U, 1U, 1U), "дата файла — по последней записи (2026-01-01)");
+    equ(date, VFat_FatDate(2026U, 2U, 6U), "одна запись: дата файла — её метка (2026-02-06)");
 
     vf_append(&r, 1, 1000);
     vf_scenario("partial", &r, 1);
@@ -2785,16 +2801,37 @@ static void test_vfat_volume(void)
     ok(vf_vol.n_text > 0U && vf_vol.n_text < (60000U + LOG_TEXT_MAX - 1U) / LOG_TEXT_MAX,
        "часть импорта ушла по кругу, хвост — в data_old.txt");
 
+    /* От импорта осталась одна отметка «не влезло» (или текст ушёл по
+     * кругу): data_old.txt нет — info.txt на него не ссылается. */
+    fm_reset(LOG_FLASH_SECTORS);
+    LogRing_Start(&r, &FM_OPS, LOG_FLASH_SECTORS, 0, 0);
+    LogRecord_MakeImportEnd(&rec, 0, 0);
+    rec.b[LOG_PAYLOAD_OFS + 5] = 2;
+    LogRing_Append(&r, &rec);
+    vf_append(&r, 0, 10);
+    (void)VFat_Build(&vf_vol, &r, "test");
+    {
+        char info[VFAT_SECTOR];
+        uint32_t n = VFat_RenderInfo(&vf_vol, info, sizeof(info));
+        info[n] = 0;
+        ok(!vf_vol.present[VFAT_FILE_OLD] && strstr(info, "data_old.txt") == NULL &&
+           strstr(info, "old archive did not fit") != NULL, "info.txt: старый архив не влез, data_old.txt не упомянут");
+    }
+
     /* Журнал не открыт. */
     vf_scenario("no_archive", NULL, 0);
     LogRing closed = r;
     closed.mounted = 0;
     equ(VFat_Build(&vf_vol, &closed, "test"), VFAT_NO_ARCHIVE, "журнал не смонтирован — тома без data.txt");
 
-    /* Сбой чтения при сборке — data.txt не отдаётся. */
+    /* Разовый сбой чтения при сборке лечится повтором; стойкий — data.txt
+     * не отдаётся. */
     fm_read_fail = 100;
-    equ(VFat_Build(&vf_vol, &r, "test"), VFAT_EIO, "сбой чтения при сборке — EIO");
+    equ(VFat_Build(&vf_vol, &r, "test"), VFAT_OK, "разовый сбой чтения при сборке — повтор");
     fm_read_fail = -1;
+    fm_dead = 1;
+    equ(VFat_Build(&vf_vol, &r, "test"), VFAT_EIO, "сбой чтения при сборке — EIO");
+    fm_dead = 0;
     ok(vf_vol.present[VFAT_FILE_DATA] == 0 && vf_vol.present[VFAT_FILE_INFO], "после EIO — только info.txt");
 
     /* Журнал разошёлся с индексом (слот испортился после сборки): сектор на
@@ -2835,6 +2872,78 @@ static void test_vfat_volume(void)
                     memcmp(vf_img2 + VFAT_SECTOR, vf_img + s * VFAT_SECTOR, VFAT_SECTOR) == 0;
         }
         ok(same, "повторное чтение того же сектора — те же байты");
+    }
+
+    /* Произвольный порядок тоже не дороже прохода одного сектора журнала:
+     * курсор, оставшийся позади, не тащит чтение от начала файла. */
+    {
+        LogRing rc = r;
+        rc.ops = &VF_COUNT_OPS;
+        (void)VFat_Build(&vf_vol, &rc, "test");
+        uint32_t nsec = (vf_vol.size[VFAT_FILE_DATA] + VFAT_SECTOR - 1U) / VFAT_SECTOR;
+        (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA, vf_img2);
+        vf_reads = 0;
+        (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + nsec - 1U, vf_img2);
+        long last = vf_reads, worst = 0;
+        for (uint32_t k = 0; k < 400U; k++)
+        {
+            vf_reads = 0;
+            (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + fm_rand() % nsec, vf_img2);
+            if (vf_reads > worst) worst = vf_reads;
+        }
+        snprintf(what, sizeof(what), "вразброс: сектор не дороже 70 чтений (после нулевого — %ld, худший — %ld)",
+                 last, worst);
+        ok(last <= 70 && worst <= 70, what);
+    }
+
+    /* Помеха на SPI посреди сектора журнала. */
+    {
+        uint32_t dlen, olen;
+        vf_expect(&r, &dlen, &olen);
+        LogRing rg = r;
+        rg.ops = &VF_GLITCH_OPS;
+        uint32_t nsec = 0;
+        /* Разовая — лечится повтором: ни отказа, ни сдвига. */
+        (void)VFat_Build(&vf_vol, &rg, "test");
+        nsec = (vf_vol.size[VFAT_FILE_DATA] + VFAT_SECTOR - 1U) / VFAT_SECTOR;
+        vf_glitch_addr = 20L * 64L; vf_glitch_left = 1;
+        int all = 1;
+        for (uint32_t s = 0; s < nsec; s++)
+            all &= VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img + s * VFAT_SECTOR);
+        ok(all && vf_glitch_left == 0 && memcmp(vf_img, vf_exp_data, dlen) == 0,
+           "разовый сбой чтения посреди сектора журнала — повтор, файл верен");
+        /* Долгая (дольше повторов): ни одного сектора «OK» с чужими байтами. */
+        vf_vol.cur[0].valid = 0;
+        vf_glitch_left = 1000000;
+        int wrong = 0, failed = 0;
+        for (uint32_t s = 0; s < nsec; s++)
+        {
+            uint32_t x = s * VFAT_SECTOR, len = (dlen - x < VFAT_SECTOR) ? dlen - x : VFAT_SECTOR;
+            if (!VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img2)) { failed++; continue; }
+            if (memcmp(vf_img2, vf_exp_data + x, len) != 0) wrong++;
+        }
+        vf_glitch_left = 0;
+        ok(failed > 0 && wrong == 0, "долгий сбой посреди сектора журнала — отказ, а не сдвиг");
+        vf_vol.cur[0].valid = 0;
+        all = 1;
+        for (uint32_t s = 0; s < nsec; s++)
+            all &= VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img2 + s * VFAT_SECTOR);
+        ok(all && memcmp(vf_img2, vf_exp_data, dlen) == 0, "сбой прошёл — повтор хоста читает верно");
+        /* Обратное: при сборке слот не прочитался ни с одной попытки, при
+         * чтении цел — лишняя строка. Ловится на границе сектора журнала:
+         * сектор, через который она проходит, — отказ. */
+        vf_glitch_left = 3;
+        (void)VFat_Build(&vf_vol, &rg, "test");
+        ok(vf_glitch_left == 0 && vf_vol.n_bad == 1U, "долгий сбой при сборке — слот испорчен");
+        uint32_t bsec = vf_vol.off[0][1] / VFAT_SECTOR;
+        ok(VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + bsec, vf_img2) == 0,
+           "слот ожил после сборки — сектор на границе сектора журнала отказывает");
+        /* При сборке: разовый сбой не выкидывает строку из индекса. */
+        vf_glitch_left = 2;
+        (void)VFat_Build(&vf_vol, &rg, "test");
+        ok(vf_glitch_left == 0 && vf_vol.n_bad == 0U && vf_vol.size[VFAT_FILE_DATA] == dlen,
+           "разовый сбой при сборке — повтор, строка на месте");
+        vf_glitch_addr = -1;
     }
 
     /* Форматтеры разошлись (другая libc в сборке) — том переходит на
