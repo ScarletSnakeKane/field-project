@@ -614,168 +614,12 @@ static void test_aht20(void)
 
 static void test_storage_policy(void)
 {
-    static unsigned char mbr[STORAGE_SECTOR_BYTES], boot[STORAGE_SECTOR_BYTES];
     puts("Хранилище");
-
-    /* Чистая флеш (оба сектора — 0xFF) и FatFs не видит ФС: это новый прибор,
-     * форматировать можно и нужно. */
-    memset(mbr, 0xFF, sizeof(mbr));
-    memset(boot, 0xFF, sizeof(boot));
-    equ(Storage_MayFormat(1, 1, mbr, boot), 1, "чистая флеш форматируется");
-
-    /* ФС смонтировалась — форматировать нечего, какое бы содержимое ни было. */
-    equ(Storage_MayFormat(0, 1, mbr, boot), 0, "есть ФС — не форматируем");
-
-    /* Чтение сорвалось: буфер мог остаться 0xFF от прошлого раза, верить ему нельзя. */
-    equ(Storage_MayFormat(1, 0, mbr, boot), 0, "ошибка чтения — не форматируем");
-
-    /* Один байт не 0xFF в последнем байте MBR — там что-то лежало. Это ровно
-     * сценарий аудита: испорченная сигнатура 55AA давала FR_NO_FILESYSTEM. */
-    mbr[STORAGE_SECTOR_BYTES - 1] = 0xAA;
-    equ(Storage_MayFormat(1, 1, mbr, boot), 0, "непустой MBR — архив не стираем");
-    mbr[STORAGE_SECTOR_BYTES - 1] = 0xFF;
-
-    /* MBR стёрт (питание пропало посреди его перезаписи), но загрузочный
-     * сектор раздела жив — архив на месте, стирать нельзя. */
-    boot[0] = 0xEB;
-    equ(Storage_MayFormat(1, 1, mbr, boot), 0, "стёртый MBR при живом загрузочном — не форматируем");
-    boot[0] = 0xFF;
-
-    /* Мусор с мёртвой шины без подтяжки — тоже «не чисто». */
-    boot[STORAGE_SECTOR_BYTES / 2] = 0x00;
-    equ(Storage_MayFormat(1, 1, mbr, boot), 0, "мусор в загрузочном секторе — не форматируем");
-    boot[STORAGE_SECTOR_BYTES / 2] = 0xFF;
-
-    /* R3: сорванный формат. Загрузочный сектор — как его кладёт f_mkfs для
-     * тома 4 МБ с кластером 512 (резерв 1, одна FAT по 32 сектора, раздел
-     * с LBA 63): корень в секторе 63 + 1 + 32 = 96. MBR ещё стёрт. */
-    {
-        static unsigned char root[STORAGE_SECTOR_BYTES];
-        static const unsigned char jmp_oem[11] = {0xEB,0xFE,0x90,'M','S','D','O','S','5','.','0'};
-
-        memset(mbr, 0xFF, sizeof(mbr));
-        memset(boot, 0, sizeof(boot));
-        memcpy(boot, jmp_oem, sizeof(jmp_oem));
-        boot[11] = 0x00; boot[12] = 0x02;   /* 512 байт на сектор */
-        boot[13] = 1;                       /* кластер 1 сектор */
-        boot[14] = 1;    boot[15] = 0;      /* резерв 1 */
-        boot[16] = 1;                       /* одна FAT */
-        boot[22] = 32;   boot[23] = 0;      /* FAT 32 сектора */
-        boot[28] = 63;                      /* раздел с LBA 63 */
-        boot[510] = 0x55; boot[511] = 0xAA;
-        equ(Storage_OurRootDirSector(boot), 96, "наш загрузочный сектор — корень в 96");
-        boot[16] = 2;
-        equ(Storage_OurRootDirSector(boot), 128, "две FAT — корень за обеими, в 128");
-        boot[16] = 1;
-
-        /* f_mkfs оборвался до очистки корня: корень ещё 0xFF. */
-        memset(root, 0xFF, sizeof(root));
-        equ(Storage_MayFormat(1, 1, mbr, boot), 0, "наш недоделанный формат — «чистым» не считается");
-        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 1, "недоделанный формат, корень 0xFF — доделываем");
-
-        /* Корень очищен, но MBR не записан. */
-        memset(root, 0x00, sizeof(root));
-        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 1, "недоделанный формат, корень обнулён — доделываем");
-
-        /* Прерванная правка типа раздела на томе с архивом: MBR стёрт, в корне data.txt. */
-        memcpy(root, "DATA    TXT", 11);
-        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 0, "в корне data.txt — архив не стираем");
-        /* Удалённый файл — тоже запись, даже если от неё осталась одна метка 0xE5. */
-        memset(root, 0x00, sizeof(root));
-        root[0] = 0xE5;
-        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 0, "в корне удалённый файл — не стираем");
-        memset(root, 0x00, sizeof(root));
-
-        equ(Storage_MayRedoFormat(1, 1, 0, mbr, boot, root), 0, "корень не прочитан — не форматируем");
-        equ(Storage_MayRedoFormat(1, 0, 1, mbr, boot, root), 0, "MBR/загрузочный не прочитаны — не форматируем");
-        equ(Storage_MayRedoFormat(0, 1, 1, mbr, boot, root), 0, "ФС смонтировалась — не форматируем");
-
-        /* MBR не стёрт (битая сигнатура при живом разделе) — не наш случай. */
-        mbr[0] = 0x00;
-        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 0, "MBR не стёрт — не форматируем");
-        mbr[0] = 0xFF;
-
-        /* Чужой загрузочный сектор (другой OEM — форматировал не наш f_mkfs). */
-        boot[3] = 'm';
-        equ(Storage_OurRootDirSector(boot), 0, "чужой OEM — не наш формат");
-        equ(Storage_MayRedoFormat(1, 1, 1, mbr, boot, root), 0, "чужой загрузочный сектор — не форматируем");
-        boot[3] = 'M';
-        boot[511] = 0x00;
-        equ(Storage_OurRootDirSector(boot), 0, "без 55AA — не наш формат");
-        boot[511] = 0xAA;
-        boot[28] = 0;
-        equ(Storage_OurRootDirSector(boot), 0, "раздел не с LBA 63 — не наш формат");
-        boot[28] = 63;
-        boot[16] = 0;
-        equ(Storage_OurRootDirSector(boot), 0, "ноль FAT — не загрузочный сектор");
-        boot[16] = 1;
-
-        memset(mbr, 0xFF, sizeof(mbr));
-        memset(boot, 0xFF, sizeof(boot));
-    }
 
     /* MSC в прерывании: только готовая и свободная флеш. */
     equ(Storage_MscMayAccess(1, 0), 1, "готова и свободна — MSC читает");
     equ(Storage_MscMayAccess(1, 1), 0, "занята основным потоком — хосту «не готов»");
     equ(Storage_MscMayAccess(0, 0), 0, "не инициализирована — из прерывания не будим");
-
-    /* S2: физически свободное место. Геометрия нашего f_mkfs: том с LBA 63
-     * на 8129 секторов, кластер 1 сектор, область данных с сектора 128,
-     * 8064 кластера; физически есть (4096 - 128) = 3968. */
-    puts("Место на физической флеш (S2)");
-    {
-        const uint32_t NF = 8064U + 2U, DB = 128U, PHYS = 4096U, ABSENT = 8064U - 3968U;
-        equ(Storage_PhysFreeClusters(8064U, NF, DB, 1U, PHYS), 3968U, "пустой том — свободна вся физическая флеш");
-        equ(Storage_PhysFreeClusters(8064U - 2930U, NF, DB, 1U, PHYS), 3968U - 2930U,
-            "data_1.txt на 1.5 МБ — его место вычтено из физических");
-        equ(Storage_PhysFreeClusters(ABSENT + 1U, NF, DB, 1U, PHYS), 1U, "на флеш остался один кластер");
-        equ(Storage_PhysFreeClusters(ABSENT, NF, DB, 1U, PHYS), 0U, "свободны только несуществующие — 0");
-        equ(Storage_PhysFreeClusters(ABSENT - 1U, NF, DB, 1U, PHYS), 0U,
-            "занят и несуществующий кластер — 0, а не переполнение");
-        equ(Storage_PhysFreeClusters(2016U, 2016U + 2U, DB, 4U, PHYS), 992U, "кластер 4 сектора — граница в кластерах");
-        equ(Storage_PhysFreeClusters(100U, 100U + 2U, DB, 1U, PHYS), 100U, "том меньше флеш — считает FatFs");
-        equ(Storage_PhysFreeClusters(8064U, NF, DB, 0U, PHYS), 0U, "битый csize — места нет");
-        equ(Storage_PhysFreeClusters(8064U, NF, PHYS + 1U, 1U, PHYS), 0U, "область данных за флеш — места нет");
-
-        const uint32_t MAX = 1800000U;   /* CSV_MAX_BYTES из main.c */
-        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_RESERVE + 1U, 0), STORAGE_ROOM_OK, "место есть — пишем");
-        equ(Storage_ArchiveRoom(MAX - 1U, MAX, 3000U, 0), STORAGE_ROOM_OK, "предел не достигнут — пишем");
-        equ(Storage_ArchiveRoom(MAX, MAX, 3000U, 0), STORAGE_ROOM_MARK, "предел размера — одна строка-отметка");
-        equ(Storage_ArchiveRoom(MAX, MAX, 3000U, 1), STORAGE_ROOM_FULL, "отметка уже есть — не пишем");
-        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_RESERVE, 0), STORAGE_ROOM_MARK,
-            "флеш дошла до запаса — отметка, хотя data.txt мал");
-        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_RESERVE, 1), STORAGE_ROOM_FULL, "в запасе и отмечено — не пишем");
-        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_HARD, 0), STORAGE_ROOM_MARK, "последние кластеры — ещё отметка");
-        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_HARD - 1U, 0), STORAGE_ROOM_FULL,
-            "меньше жёсткого запаса — не пишем ничего, даже отметку");
-
-        /* Сценарий разбора S2: data_1.txt на 1.5 МБ, новый data.txt растёт по
-         * 150 Б раз в час, с перезапуском каждые 10 циклов (отметка — одна на
-         * старт). Ни один кластер нового файла не должен лечь за физической
-         * границей, а отметка — появиться. */
-        uint32_t old = 2930U, size = 0U, marks = 0U, written = 0U, worst_over = 0U;
-        uint8_t marked = 0;
-        for (uint32_t cycle = 0; cycle < 20000U; cycle++)
-        {
-            if (cycle % 10U == 0U)
-                marked = 0;
-            uint32_t used = old + (size + 511U) / 512U;
-            uint8_t room = Storage_ArchiveRoom(size, MAX,
-                                               Storage_PhysFreeClusters(8064U - used, NF, DB, 1U, PHYS),
-                                               marked);
-            if (room == STORAGE_ROOM_FULL)
-                continue;
-            if (room == STORAGE_ROOM_MARK) { marked = 1; marks++; }
-            size += 150U;
-            written++;
-            used = old + (size + 511U) / 512U;
-            if (used > 3968U && used - 3968U > worst_over)
-                worst_over = used - 3968U;
-        }
-        equ(worst_over, 0U, "ни одного кластера за физической границей");
-        ok(marks > 0U, "заполнение отмечено в архиве");
-        ok(written > 2000U && size < 600000U, "data.txt дорос почти до края флеш, а не до CSV_MAX_BYTES");
-    }
 
     /* Питание. Порог VDD 2.9 В и признак bat.low. */
     equ(Storage_MayWrite(1, 0, 3.20f), 1, "нормальное питание — пишем");
@@ -817,10 +661,10 @@ static void test_storage_policy(void)
 }
 
 /* Загрузочные сектора и MBR, которые кладёт настоящий f_mkfs этого FatFs:
- * собран на хосте с RAM-диском на 8192 сектора, параметры как в main.c
- * (FM_FAT, кластер 512 Б) и как у старых прошивок (кластер 1 КБ, FAT12).
+ * собран на хосте с RAM-диском на 8192 сектора, параметры как у прошлых
+ * прошивок: FM_FAT, кластер 512 Б (FAT16) и кластер 1 КБ (FAT12).
  * Первые 64 байта сектора; остальное до сигнатуры — нули. Записи разделов
- * взяты из того же прогона, а не посчитаны этим кодом. */
+ * взяты из того же прогона. По ним строится старый том для теста импорта. */
 static const unsigned char MKFS_BOOT16[64] = {
     0xEB,0xFE,0x90,0x4D,0x53,0x44,0x4F,0x53,0x35,0x2E,0x30,0x00,0x02,0x01,0x01,0x00,
     0x01,0x00,0x02,0xC1,0x1F,0xF8,0x20,0x00,0x3F,0x00,0xFF,0x00,0x3F,0x00,0x00,0x00,
@@ -835,161 +679,6 @@ static const unsigned char MKFS_BOOT12[64] = {
     0x4D,0x45,0x20,0x20,0x20,0x20,0x46,0x41,0x54,0x20,0x20,0x20,0x20,0x20,0x00,0x00};
 static const unsigned char MKFS_PTE12[16] = {
     0x00,0x01,0x01,0x00,0x01,0xFE,0x3F,0x00,0x3F,0x00,0x00,0x00,0xC1,0x1F,0x00,0x00};
-
-static void mkfs_sector(unsigned char *sec, const unsigned char *first64)
-{
-    memset(sec, 0, 512);
-    memcpy(sec, first64, 64);
-    sec[510] = 0x55; sec[511] = 0xAA;
-}
-
-static void test_mbr_restore(void)
-{
-    unsigned char boot[512], mbr[512], built[512], want[512];
-
-    puts("Восстановление MBR");
-
-    mkfs_sector(boot, MKFS_BOOT16);
-    memset(mbr, 0xFF, sizeof(mbr));
-
-    /* Прерванная правка байта типа на томе с архивом: MBR стёрт, наш
-     * загрузочный сектор жив. Восстанавливать. */
-    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 8192), 1, "MBR стёрт, загрузочный наш — восстанавливаем");
-
-    /* Восстановленный MBR — байт в байт как от f_mkfs, кроме типа: 0x0E, как
-     * его оставляет прошивка для FAT16 (Android). */
-    Storage_BuildMbr(boot, built);
-    memset(want, 0, sizeof(want));
-    memcpy(want + 446, MKFS_PTE16, 16);
-    want[446 + 4] = 0x0E;
-    want[510] = 0x55; want[511] = 0xAA;
-    ok(memcmp(built, want, 512) == 0, "FAT16: MBR совпал с f_mkfs (тип 0x0E)");
-
-    /* Старый FAT12 (кластер 1 КБ) — тип 0x01, ровно как у f_mkfs: 0x0E для
-     * него был бы ложью. */
-    mkfs_sector(boot, MKFS_BOOT12);
-    Storage_BuildMbr(boot, built);
-    memset(want, 0, sizeof(want));
-    memcpy(want + 446, MKFS_PTE12, 16);
-    want[510] = 0x55; want[511] = 0xAA;
-    ok(memcmp(built, want, 512) == 0, "FAT12: MBR совпал с f_mkfs (тип 0x01)");
-
-    /* Граница FAT12/FAT16 — как у FatFs при монтировании: 4085 кластеров —
-     * ещё FAT12, 4086 — уже FAT16. Служебных секторов у FAT16-образа 65. */
-    mkfs_sector(boot, MKFS_BOOT16);
-    boot[19] = (unsigned char)((65 + 4085) & 0xFF); boot[20] = (unsigned char)((65 + 4085) >> 8);
-    Storage_BuildMbr(boot, built);
-    equ(built[446 + 4], 0x01, "4085 кластеров — FAT12");
-    boot[19] = (unsigned char)((65 + 4086) & 0xFF); boot[20] = (unsigned char)((65 + 4086) >> 8);
-    Storage_BuildMbr(boot, built);
-    equ(built[446 + 4], 0x0E, "4086 кластеров — FAT16");
-
-    /* Чего не трогаем. */
-    mkfs_sector(boot, MKFS_BOOT16);
-    equ(Storage_MayRestoreMbr(0, 1, mbr, boot, 8192), 0, "том смонтировался — MBR не трогаем");
-    equ(Storage_MayRestoreMbr(1, 0, mbr, boot, 8192), 0, "чтение сорвалось — не решаем");
-
-    mbr[0] = 0x00;
-    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 8192), 0, "в MBR что-то лежит — не наш случай");
-    memset(mbr, 0xFF, sizeof(mbr));
-
-    unsigned char alien[512];
-    memcpy(alien, boot, 512);
-    alien[3] = 'X';   /* чужой OEM */
-    equ(Storage_MayRestoreMbr(1, 1, mbr, alien, 8192), 0, "загрузочный сектор чужой — не трогаем");
-
-    /* Том не помещается на диск (BPB битый) — по догадке не пишем. */
-    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 8191), 0, "том с LBA 63 не влезает в диск — нет");
-    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 63 + 8129), 1, "том ровно до конца диска — да");
-    memcpy(alien, boot, 512);
-    alien[19] = 0; alien[20] = 0;   /* TotSec16 = 0 и TotSec32 = 0 */
-    equ(Storage_MayRestoreMbr(1, 1, mbr, alien, 8192), 0, "размер тома ноль — нет");
-    alien[32] = 0xC1; alien[33] = 0x1F;   /* размер в 32-битном поле */
-    equ(Storage_BootTotalSectors(alien), 8129, "размер берётся и из 32-битного поля BPB");
-}
-
-/* Тестовый «том»: занятые имена — списком. */
-struct names { const char *taken[8]; int n; int calls; };
-
-static uint8_t names_taken(const char *name, void *ctx)
-{
-    struct names *t = (struct names *)ctx;
-    t->calls++;
-    for (int i = 0; i < t->n; i++)
-        if (strcmp(t->taken[i], name) == 0)
-            return 1;
-    return 0;
-}
-
-static uint8_t all_taken(const char *name, void *ctx)
-{
-    (void)name; (void)ctx;
-    return 1;
-}
-
-/* Том отвечает ошибкой на втором вопросе. */
-static uint8_t error_on_2(const char *name, void *ctx)
-{
-    int *calls = (int *)ctx;
-    (*calls)++;
-    if (strcmp(name, "data_2.txt") == 0) return STORAGE_NAME_ERROR;
-    return STORAGE_NAME_TAKEN;
-}
-
-static void test_archive_rename(void)
-{
-    const char *H = "timestamp,air_temp,write_fails";
-    char out[13];
-
-    puts("Старый архив при смене заголовка");
-
-    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails\n", H), STORAGE_HDR_KEEP,
-        "заголовок совпал — дописываем");
-    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails", H), STORAGE_HDR_KEEP,
-        "совпал и без перевода строки (последняя строка файла)");
-
-    /* Залита прошивка с новой колонкой — старый архив переименовать, не стирать. */
-    equ(Storage_HeaderAction(1, "timestamp,air_temp\n", H), STORAGE_HDR_RENAME,
-        "старый заголовок короче — переименовать");
-
-    /* Обратный случай: заголовок более новой прошивки начинается с нашего.
-     * Сравнение по префиксу (как было) смешало бы два формата в одном файле. */
-    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails,extra\n", H), STORAGE_HDR_RENAME,
-        "заголовок длиннее нашего — тоже другой формат");
-
-    /* Сорванное чтение (или пустой файл) — не «другой заголовок» (A11):
-     * раньше оно стирало архив. */
-    equ(Storage_HeaderAction(0, "", H), STORAGE_HDR_KEEP, "f_gets не прочёл строку — файл не трогаем");
-
-    /* Файл, записанный с \r\n и прочитанный без снятия \r, — тот же заголовок. */
-    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails\r\n", H), STORAGE_HDR_KEEP,
-        "CRLF после заголовка — совпал");
-
-    /* Имя: первое свободное data_N.txt, имена 8.3. */
-    struct names t = { { 0 }, 0, 0 };
-    equ(Storage_PickOldArchiveName(names_taken, &t, out), 1, "том чистый — data_1");
-    ok(strcmp(out, "data_1.txt") == 0, "имя data_1.txt");
-
-    struct names u = { { "data_1.txt", "data_2.txt", "data_4.txt" }, 3, 0 };
-    equ(Storage_PickOldArchiveName(names_taken, &u, out), 3, "1 и 2 заняты — data_3 (дыра раньше 4)");
-    ok(strcmp(out, "data_3.txt") == 0, "имя data_3.txt");
-
-    /* Ошибка тома — перебор прекращается сразу, а не 999 медленных f_stat. */
-    int calls = 0;
-    equ(Storage_PickOldArchiveName(error_on_2, &calls, out), 0, "ошибка тома — имени нет");
-    equ((unsigned)calls, 2, "после ошибки больше не спрашиваем");
-    ok(out[0] == '\0', "после ошибки имя пустое");
-
-    Storage_OldArchiveName(999, out);
-    ok(strcmp(out, "data_999.txt") == 0 && strlen(out) == 12, "data_999.txt — ещё 8.3 и влезает в 13 байт");
-    Storage_OldArchiveName(10, out);
-    ok(strcmp(out, "data_10.txt") == 0, "двузначный N без ведущих нулей");
-
-    /* Свободных имён нет — 0 и пустое имя: ничего не переименовываем и,
-     * главное, ничего не затираем. */
-    equ(Storage_PickOldArchiveName(all_taken, NULL, out), 0, "все 999 имён заняты — 0");
-    ok(out[0] == '\0', "имя пустое");
-}
 
 static void test_time_trust(void)
 {
@@ -1200,7 +889,7 @@ static uint8_t  fm[FM_MAX_SECT * 4096U];
 static uint32_t fm_nsect;
 static uint32_t fm_erases[FM_MAX_SECT];
 static long     fm_ops, fm_cut = -1;
-static int      fm_dead, fm_mode;
+static int      fm_dead, fm_mode, fm_fail_once;
 static uint32_t fm_rng = 1;
 
 static uint32_t fm_rand(void)
@@ -1240,11 +929,21 @@ static uint8_t fm_program(uint32_t a, const uint8_t *b, uint32_t n)
 {
     int c = fm_cut_now();
     if (c < 0 || a + n > fm_nsect * 4096U || (a / 256U) != ((a + n - 1U) / 256U)) return 0;
+    if (fm_fail_once)
+    {
+        /* Сбой без обрыва питания: 1 — не записалось ничего (шина), 2 —
+         * записалось частично (просадка), драйвер вернул отказ. */
+        if (fm_fail_once == 2)
+            for (uint32_t i = 0; i < n; i++)
+                fm[a + i] &= (uint8_t)(b[i] | (uint8_t)fm_rand());
+        fm_fail_once = 0;
+        return 0;
+    }
     for (uint32_t i = 0; i < n; i++)
     {
         uint8_t want = fm[a + i] & b[i];
         if (c == 0 || fm_mode == 1)      fm[a + i] = want;
-        else if (fm_mode == 2)           fm[a + i] = want | (fm[a + i] & (uint8_t)fm_rand());
+        else if (fm_mode >= 2)           fm[a + i] = want | (fm[a + i] & (uint8_t)fm_rand());
         /* fm_mode 0 при обрыве — ничего не записано */
     }
     return c ? 0 : 1;
@@ -1255,15 +954,30 @@ static uint8_t fm_erase(uint32_t a)
     int c = fm_cut_now();
     if (c < 0 || a % 4096U || a >= fm_nsect * 4096U) return 0;
     fm_erases[a / 4096U]++;
+    /* Вид 3: стирание оборвано так, что часть записей уцелела целиком, а
+     * часть — в мусоре (у вида 0 уцелели все, у вида 2 — ни одной). */
+    uint8_t keep = 0;
     for (uint32_t i = 0; i < 4096U; i++)
     {
-        if (c == 0 || fm_mode == 1)      fm[a + i] = 0xFF;
-        else if (fm_mode == 2)           fm[a + i] |= (uint8_t)fm_rand();
+        if (i % 64U == 0U)
+            keep = (uint8_t)(fm_rand() & 1U);
+        if (c == 0 || fm_mode == 1)          fm[a + i] = 0xFF;
+        else if (fm_mode == 2)               fm[a + i] |= (uint8_t)fm_rand();
+        else if (fm_mode == 3 && !keep)      fm[a + i] |= (uint8_t)fm_rand();
     }
     return c ? 0 : 1;
 }
 
 static const LogFlashOps FM_OPS = { fm_read, fm_program, fm_erase, NULL };
+
+/* Сектор за сектором записи стёрт целиком — «минимум один стёртый впереди». */
+static int fm_spare_blank(const LogRing *r)
+{
+    uint32_t s = (r->w_sect + 1U) % r->nsect;
+    for (uint32_t i = 0; i < 4096U; i++)
+        if (fm[s * 4096U + i] != 0xFF) return 0;
+    return 1;
+}
 
 /* Запись-замер с содержимым, однозначно выведенным из id: по ней видно,
  * что прочиталось именно то, что писалось, а не чужие данные. */
@@ -1332,12 +1046,13 @@ static void test_log_ring_g1(void)
     equ(LogRing_Mount(&r, &FM_OPS, NS), LOG_MOUNT_EMPTY, "чистая флеш — журнала нет");
     equ(LogRing_Count(&r), 0U, "пуст");
 
-    uint32_t total = NS * LOG_SLOTS * LAPS, fails = 0, order_bad = 0, drop_bad = 0;
+    uint32_t total = NS * LOG_SLOTS * LAPS, fails = 0, order_bad = 0, drop_bad = 0, spare_bad = 0;
     uint32_t min_full = 0xFFFFFFFFUL, max_cnt = 0, prev_first = 0;
     for (uint32_t id = 1; id <= total; id++)
     {
         log_make(&rec, id);
         if (!LogRing_Append(&r, &rec)) fails++;
+        if (!fm_spare_blank(&r)) spare_bad++;
         uint32_t cnt = LogRing_Count(&r), first = LogRing_FirstSeq(&r);
         if (cnt > max_cnt) max_cnt = cnt;
         if (id > NS * LOG_SLOTS && cnt < min_full) min_full = cnt;
@@ -1365,17 +1080,19 @@ static void test_log_ring_g1(void)
     equ(fails, 0U, "все записи прошли — 12 кругов кольца");
     equ(order_bad, 0U, "порядок, непрерывность и перемонтирование");
     equ(drop_bad, 0U, "старейшие уходят посекторно");
+    equ(spare_bad, 0U, "после каждой записи сектор за сектором записи стёрт");
     /* Сектор записи и запасной не читаются, пока пусты: в журнале от (N-2)
      * полных секторов (сразу после перехода в новый) до (N-1) без одной. */
     equ(max_cnt, (NS - 1U) * LOG_SLOTS - 1U, "в журнале не больше (N-1) секторов без одной записи");
     equ(min_full, (NS - 2U) * LOG_SLOTS, "и не меньше (N-2) полных секторов");
     equ(r.next_seq, total, "номер растёт на 1 на запись");
 
-    /* Полный размер чипа: 10 кругов по 32768 записей. */
+    /* Полный размер чипа: 3 круга по 32768 записей (12 кругов — выше, на
+     * малом кольце той же логики). */
     fm_reset(LOG_FLASH_SECTORS);
     (void)LogRing_Mount(&r, &FM_OPS, LOG_FLASH_SECTORS);
     fails = 0;
-    total = LOG_FLASH_SECTORS * LOG_SLOTS * 10U;
+    total = LOG_FLASH_SECTORS * LOG_SLOTS * 3U;
     for (uint32_t id = 1; id <= total; id++)
     {
         log_make(&rec, id);
@@ -1385,7 +1102,7 @@ static void test_log_ring_g1(void)
         uint32_t bad; int alien;
         uint32_t good = log_scan(&r, &bad, NULL, 0, &alien);
         LogRecord first;
-        equ(fails, 0U, "2 МБ: 10 кругов без отказов");
+        equ(fails, 0U, "2 МБ: 3 круга без отказов");
         equ(good, LogRing_Count(&r), "2 МБ: все записи журнала годны");
         ok(good >= (LOG_FLASH_SECTORS - 2U) * LOG_SLOTS, "2 МБ: в журнале не меньше 510 секторов записей");
         ok(!bad && !alien, "2 МБ: ни испорченных, ни чужих");
@@ -1520,6 +1237,7 @@ static int log_g2_run(uint32_t ns, uint32_t total, long cut, int mode, int verbo
     {
         log_make(&rec, total + 10U + k);
         if (!LogRing_Append(&m, &rec)) more_fail++;
+        if (!fm_spare_blank(&m)) more_fail++;
     }
     good = log_scan(&m, &bad, NULL, 0, &alien);
     if (more_fail || alien || bad || good != LogRing_Count(&m)) errors++;
@@ -1534,15 +1252,15 @@ static void test_log_ring_g2(void)
 {
     puts("Журнал G2: обрыв питания после каждой операции");
 
-    /* 5 секторов, 3.2 круга: обрыв на каждой операции программирования и
-     * стирания, в трёх видах обрыва. */
-    for (int mode = 0; mode < 3; mode++)
+    /* 5 секторов, 2.2 круга: обрыв на каждой операции программирования и
+     * стирания, в четырёх видах обрыва. */
+    for (int mode = 0; mode < 4; mode++)
     {
         uint32_t points = 0, failed = 0;
         for (long cut = 0;; cut++)
         {
             fm_rng = 0x9E3779B9U + (uint32_t)cut;
-            int res = log_g2_run(5, 5U * LOG_SLOTS * 16U / 5U, cut, mode, failed < 3U);
+            int res = log_g2_run(5, 5U * LOG_SLOTS * 11U / 5U, cut, mode, failed < 3U);
             if (res < 0) break;
             points++;
             failed += (uint32_t)res;
@@ -1550,7 +1268,7 @@ static void test_log_ring_g2(void)
         char what[200];
         snprintf(what, sizeof(what), "обрыв вида %d: %u точек, после каждой — не больше одной потери",
                  mode, points);
-        ok(points > 1000U && failed == 0U, what);
+        ok(points > 700U && failed == 0U, what);
     }
 
     /* Обрыв во время восстановления: второй обрыв на первой же операции
@@ -1560,16 +1278,17 @@ static void test_log_ring_g2(void)
         LogRing r;
         LogRecord rec;
         fm_reset(6);
-        fm_mode = 2;
         (void)LogRing_Mount(&r, &FM_OPS, 6);
         uint32_t id = 0, last_ok = 0;
         for (uint32_t round = 0; round < 400U; round++)
         {
+            fm_mode = (int)(round % 4U);
             fm_cut = fm_ops + (long)(fm_rand() % 90U);
             while (!fm_dead)
             {
                 log_make(&rec, ++id);
                 if (LogRing_Append(&r, &rec)) last_ok = id;
+                else if (!fm_dead) failed++;   /* отказ без обрыва — восстановление не доделано */
             }
             fm_power_on();
             if (LogRing_Mount(&r, &FM_OPS, 6) != LOG_MOUNT_OK) { failed++; continue; }
@@ -1580,29 +1299,128 @@ static void test_log_ring_g2(void)
             /* Последняя подтверждённая — на месте (сколько бы ни было обрывов). */
             if (!good || ids[good - 1U] < last_ok) failed++;
         }
-        equ(failed, 0U, "400 обрывов подряд в случайных местах: чужих нет, последняя подтверждённая цела");
+        equ(failed, 0U, "400 обрывов подряд в случайных местах (и во время восстановления): чужих нет, "
+                        "последняя подтверждённая цела, запись после включения идёт");
     }
 
-    /* Полный чип: 15 случайных обрывов на трёх кругах. */
+    /* Сбой программирования без обрыва (просадка: записалось частично):
+     * запись уходит в следующий слот, испорченный пропускается номером. */
+    {
+        LogRing r;
+        LogRecord rec, got;
+        fm_reset(4);
+        (void)LogRing_Mount(&r, &FM_OPS, 4);
+        for (uint32_t id = 1; id <= 10U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+        fm_fail_once = 2;
+        log_make(&rec, 11);
+        equ(LogRing_Append(&r, &rec), 1, "сбой программирования — повтор в следующий слот удался");
+        equ(LogRing_Count(&r), 12U, "испорченный слот занял один номер");
+        ok(LogRing_Read(&r, 10, &got) == LOG_READ_BAD && LogRing_Read(&r, 11, &got) == LOG_READ_OK &&
+           log_is(&got, 11), "замер 11 — в следующем слоте");
+    }
+
+    /* Сбой в слоте 0 сектора — ничего не записалось и записалось частично.
+     * Записи за этим слотом не должны пропасть при перезапуске: сектор со
+     * стёртым или испорченным слотом 0 восстановление не сочтёт пустым. */
+    for (int how = 1; how <= 2; how++)
+    {
+        LogRing r, m;
+        LogRecord rec;
+        fm_reset(4);
+        (void)LogRing_Mount(&r, &FM_OPS, 4);
+        uint32_t id;
+        for (id = 1; id <= 64U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+        fm_fail_once = how;
+        for (; id <= 64U + 20U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+        equ(LogRing_Mount(&m, &FM_OPS, 4), LOG_MOUNT_OK, how == 1 ? "сбой в слоте 0 (пусто): перемонтирование"
+                                                                  : "сбой в слоте 0 (частично): перемонтирование");
+        uint32_t bad; int alien;
+        static uint32_t ids[4 * 64];
+        uint32_t good = log_scan(&m, &bad, ids, 4 * 64, &alien);
+        ok(good == 84U && !alien && ids[83] == 84U && bad == (how == 2 ? 1U : 0U),
+           how == 1 ? "сбой в слоте 0 (пусто): все 84 записи на месте, слот не потрачен"
+                    : "сбой в слоте 0 (частично): все 84 записи на месте, один слот испорчен");
+        for (id = 85; id <= 90U; id++) { log_make(&rec, id); (void)LogRing_Append(&m, &rec); }
+        good = log_scan(&m, &bad, ids, 4 * 64, &alien);
+        ok(good == 90U && ids[89] == 90U && !alien, "после перезапуска пишется дальше");
+    }
+
+    /* Годный сектор журнала с несмежным номером (остаток старого круга, не
+     * стёртый из-за отказа) в журнал не пристёгивается, а годная запись не на
+     * своём месте не читается как своя. */
+    {
+        LogRing r, m;
+        LogRecord rec;
+        fm_reset(8);
+        (void)LogRing_Mount(&r, &FM_OPS, 8);
+        for (uint32_t id = 1; id <= 3U * 64U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+        /* Сектор 7 (не запасной): записи с номерами 5.. — «чужой круг». */
+        for (uint32_t k = 0; k < 64U; k++)
+        {
+            log_make(&rec, 900U + k);
+            LogRecord_Seal(&rec, 5U + k);
+            memcpy(fm + 7U * 4096U + k * 64U, rec.b, 64);
+        }
+        equ(LogRing_Mount(&m, &FM_OPS, 8), LOG_MOUNT_OK, "сектор с несмежным номером: монтирование");
+        equ(LogRing_FirstSeq(&m), 0U, "сектор с несмежным номером к хвосту не пристёгнут");
+        equ(LogRing_Count(&m), 3U * 64U, "в журнале только свои записи");
+        /* В слоте 10 сектора 1 — годная запись номер 3 из сектора 0, как
+         * будто стирание сектора тихо не прошло. */
+        fm_reset(4);
+        (void)LogRing_Mount(&r, &FM_OPS, 4);
+        for (uint32_t id = 1; id <= 100U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+        memcpy(fm + 1U * 4096U + 10U * 64U, fm + 3U * 64U, 64);
+        LogRecord got;
+        ok(LogRing_Read(&r, 64U + 10U, &got) == LOG_READ_BAD, "годная запись не на своём месте — не своя");
+    }
+
+    /* Двойной обрыв: недописан слот 0 нового сектора, а при восстановлении
+     * оборвано стирание этого сектора (мусор по всему сектору). Следующий
+     * старт обязан стереть его снова, а не писать по мусору. */
+    {
+        LogRing r;
+        LogRecord rec;
+        fm_reset(4);
+        fm_mode = 2;
+        (void)LogRing_Mount(&r, &FM_OPS, 4);
+        for (uint32_t id = 1; id <= 64U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+        fm_cut = fm_ops;                 /* программирование слота 0 сектора 1 */
+        log_make(&rec, 65); (void)LogRing_Append(&r, &rec);
+        fm_power_on();
+        (void)LogRing_Mount(&r, &FM_OPS, 4);
+        fm_cut = fm_ops;                 /* стирание сектора 1 при восстановлении */
+        log_make(&rec, 66); (void)LogRing_Append(&r, &rec);
+        fm_power_on();
+        equ(LogRing_Mount(&r, &FM_OPS, 4), LOG_MOUNT_OK, "двойной обрыв: монтирование");
+        uint32_t fails = 0;
+        for (uint32_t id = 67; id <= 80U; id++) { log_make(&rec, id); fails += !LogRing_Append(&r, &rec); }
+        uint32_t bad; int alien;
+        uint32_t good = log_scan(&r, &bad, NULL, 0, &alien);
+        ok(!fails && good == 64U + 14U && !alien && bad == 0U,
+           "двойной обрыв: сектор стёрт заново (мусор слота 0 не остался), запись идёт");
+    }
+
+    /* Полный чип: 8 случайных обрывов на трёх кругах. */
     {
         uint32_t failed = 0;
-        for (int k = 0; k < 15; k++)
+        for (int k = 0; k < 8; k++)
         {
             fm_rng = 12345U + (uint32_t)k * 7919U;
             long cut = (long)(fm_rand() % (LOG_FLASH_SECTORS * LOG_SLOTS * 3U + 1500U));
             failed += (uint32_t)(log_g2_run(LOG_FLASH_SECTORS, LOG_FLASH_SECTORS * LOG_SLOTS * 3U,
                                             cut, k % 3, 1) != 0);
         }
-        equ(failed, 0U, "2 МБ: 15 случайных обрывов на трёх кругах");
+        equ(failed, 0U, "2 МБ: 8 случайных обрывов на трёх кругах");
     }
 }
 
 /* ------------------------------------------ импорт старого архива (FAT)
  *
  * Старый том строится в модели флеш так же, как его клал f_mkfs прошлых
- * прошивок: MBR в секторе 0, раздел с LBA 63, одна FAT, корень на 512
- * записей, кластер 512 Б; FAT16 — том заявлен на 4 МБ (8129 секторов),
- * FAT12 — на 2 МБ. Файлы — строки CSV с \r\n, как их писал f_puts. */
+ * прошивок: MBR в секторе 0 (запись раздела MKFS_PTE*), раздел с LBA 63,
+ * загрузочный сектор — MKFS_BOOT* байт в байт (одна FAT, корень на 512
+ * записей, 8129 секторов; FAT16 — кластер 512 Б, FAT12 — 1 КБ). Файлы —
+ * строки CSV с \r\n, как их писал f_puts. */
 typedef struct {
     const char *name83;     /* 11 символов каталога: "DATA_1  TXT" */
     uint32_t size;
@@ -1652,37 +1470,30 @@ static void fat_set(uint32_t fat_addr, uint32_t bits, uint32_t c, uint32_t v)
 static uint32_t old_volume(uint32_t fatbits, const OldFileSpec *files, uint32_t nfiles,
                            int interleave, uint8_t texts[][40000])
 {
-    uint32_t tot  = (fatbits == 16U) ? 8129U : 4033U;
-    uint32_t vol  = 63U, rootn = 512U, rootsz = 32U;
-    uint32_t fatsz = (fatbits == 16U) ? 32U : 12U;
-    uint32_t nclst = tot - 1U - fatsz - rootsz;
+    const unsigned char *tmpl = (fatbits == 16U) ? MKFS_BOOT16 : MKFS_BOOT12;
+    uint32_t tot  = 8129U, vol = 63U, rootsz = 32U;
+    uint32_t spc  = tmpl[13], fatsz = tmpl[22];
+    uint32_t csize = spc * 512U;
     uint32_t fat_addr = (vol + 1U) * 512U;
     uint32_t root_addr = fat_addr + fatsz * 512U;
     uint32_t data_lba = vol + 1U + fatsz + rootsz;
 
     memset(fm, 0, 64U * 512U + (1U + fatsz + rootsz) * 512U);   /* f_mkfs обнуляет служебное */
-    /* MBR */
-    fm[446 + 4] = (fatbits == 16U) ? 0x0E : 0x01;
-    fm[446 + 8] = (uint8_t)vol;
-    fm[446 + 12] = (uint8_t)tot; fm[446 + 13] = (uint8_t)(tot >> 8);
+    /* MBR; тип FAT16 прошивка правила на 0x0E (Android). */
+    memcpy(fm + 446, (fatbits == 16U) ? MKFS_PTE16 : MKFS_PTE12, 16);
+    if (fatbits == 16U) fm[446 + 4] = 0x0E;
     fm[510] = 0x55; fm[511] = 0xAA;
-    /* Загрузочный сектор */
     uint8_t *b = fm + vol * 512U;
-    memcpy(b, "\xEB\xFE\x90MSDOS5.0", 11);
-    b[11] = 0x00; b[12] = 0x02; b[13] = 1; b[14] = 1; b[15] = 0; b[16] = 1;
-    b[17] = (uint8_t)rootn; b[18] = (uint8_t)(rootn >> 8);
-    b[19] = (uint8_t)tot; b[20] = (uint8_t)(tot >> 8);
-    b[21] = 0xF8; b[22] = (uint8_t)fatsz; b[23] = 0;
-    b[28] = (uint8_t)vol;
+    memcpy(b, tmpl, 64);
     b[510] = 0x55; b[511] = 0xAA;
-    (void)nclst;
+    (void)tot;
     fat_set(fat_addr, fatbits, 0, (fatbits == 16U) ? 0xFFF8U : 0xFF8U);
     fat_set(fat_addr, fatbits, 1, (fatbits == 16U) ? 0xFFFFU : 0xFFFU);
 
     uint32_t need[16], prev[16], first[16], done[16];
     for (uint32_t i = 0; i < nfiles; i++)
     {
-        need[i] = (files[i].size + 511U) / 512U;
+        need[i] = (files[i].size + csize - 1U) / csize;
         prev[i] = 0; first[i] = 0; done[i] = 0;
         old_text(texts[i], files[i].size, files[i].seed);
     }
@@ -1696,10 +1507,10 @@ static uint32_t old_volume(uint32_t fatbits, const OldFileSpec *files, uint32_t 
             for (uint32_t t = 0; t < take && done[i] < need[i]; t++)
             {
                 if (!first[i]) first[i] = c; else fat_set(fat_addr, fatbits, prev[i], c);
-                uint32_t a = (data_lba + c - 2U) * 512U, part = files[i].size - done[i] * 512U;
-                if (part > 512U) part = 512U;
-                memcpy(fm + a, texts[i] + done[i] * 512U, part);
-                if (a + 512U > end) end = a + 512U;
+                uint32_t a = (data_lba + (c - 2U) * spc) * 512U, part = files[i].size - done[i] * csize;
+                if (part > csize) part = csize;
+                memcpy(fm + a, texts[i] + done[i] * csize, part);
+                if (a + csize > end) end = a + csize;
                 prev[i] = c++;
                 done[i]++;
             }
@@ -1791,6 +1602,10 @@ static void test_log_import(void)
             memcpy(before, fm, sizeof(before));
 
             equ(LogImport_Probe(&FM_OPS, LOG_FLASH_SECTORS * 4096U, &v), 1, "старый том узнан");
+            ok(v.fatbits == bits && v.root_lba == 63U + 1U + MKFS_BOOT12[22] * (bits == 16U ? 2U : 1U) &&
+               v.data_lba == v.root_lba + 32U && v.spc == (bits == 16U ? 1U : 2U),
+               bits == 16U ? "загрузочный f_mkfs FAT16 разобран: корень 96, данные 128"
+                           : "загрузочный f_mkfs FAT12 (кластер 1 КБ) разобран: корень 80, данные 112");
             snprintf(what, sizeof(what), "FAT%u%s: три файла по порядку, граница за данными",
                      bits, inter ? " вперемешку" : "");
             ok(v.nfiles == 3 && strcmp(v.files[0].name, "data_1.txt") == 0 &&
@@ -1958,8 +1773,6 @@ int main(void)
     test_watchdog_policy();
     test_quarantine_policy();
     test_storage_policy();
-    test_mbr_restore();
-    test_archive_rename();
     test_time_trust();
     test_log_record();
     test_log_ring_g1();

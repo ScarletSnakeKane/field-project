@@ -1,3 +1,7 @@
+/* Реализация кольцевого журнала (single-header, log_ring.h) — здесь, в
+ * существующем .c: новый файл сборка CubeIDE не увидела бы (Debug/ не в git).
+ * Макрос — до первого включения: spiflash.h сам включает log_ring.h. */
+#define LOG_RING_IMPLEMENTATION
 #include "spiflash.h"
 #include <string.h>
 

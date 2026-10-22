@@ -396,14 +396,18 @@ static uint8_t LogRing_TryAppend(LogRing *r, LogRecord *rec)
     LogRecord_Seal(rec, r->next_seq);
     uint32_t addr = LogRing_Addr(r->w_sect, r->w_slot);
     uint8_t ok = r->ops->program(addr, rec->b, LOG_RECORD_SIZE);
+
+    /* Программирование на просевшем питании «проходит» без единой ошибки
+     * шины — сверяем всегда. Не записалось ни бита (сбой шины до команды) —
+     * слот остаётся свободным и номер не тратится: за стёртым слотом не
+     * должно быть записанных, иначе восстановление, увидев стёртый слот 0,
+     * сочло бы сектор пустым и стёрло бы записи за ним. */
+    LogRecord back;
+    uint8_t rd = r->ops->read(addr, back.b, LOG_RECORD_SIZE);
     if (ok)
-    {
-        /* Программирование на просевшем питании «проходит» без единой
-         * ошибки шины — сверяем. */
-        LogRecord back;
-        ok = r->ops->read(addr, back.b, LOG_RECORD_SIZE) &&
-             memcmp(back.b, rec->b, LOG_RECORD_SIZE) == 0;
-    }
+        ok = rd && memcmp(back.b, rec->b, LOG_RECORD_SIZE) == 0;
+    if (!ok && rd && LogRecord_IsErased(&back))
+        return 0;
     LogRing_Advance(r);
 
     /* Запись перешла в новый сектор — стираем следующий запасной сразу,
@@ -414,8 +418,9 @@ static uint8_t LogRing_TryAppend(LogRing *r, LogRecord *rec)
 }
 
 /* Дописать запись. Номер проставляется здесь. Не сошлось — одна повторная
- * попытка в следующий слот: испорченный слот уже занят, его номер пропущен,
- * а замер не теряется. Возвращает 1 при успехе. */
+ * попытка: в следующий слот, если испорченный уже занят (его номер
+ * пропущен), или в тот же, если в нём не записалось ничего. Замер при этом
+ * не теряется. Возвращает 1 при успехе. */
 uint8_t LogRing_Append(LogRing *r, LogRecord *rec)
 {
     if (!r->mounted)
