@@ -240,17 +240,19 @@ static uint8_t Archive_Open(uint8_t may_write)
 
 /* Метка последнего замера в архиве — для Policy_TimeTrusted (A6). Сразу
  * после импорта замеров в журнале ещё нет: тогда метка берётся из хвоста
- * перенесённого текста, как раньше из хвоста data.txt. */
-static void Archive_LastTimestamp(char *out)
+ * перенесённого текста, как раньше из хвоста data.txt. Возвращает 1, если
+ * архив прочитан (метки может и не быть), 0 — сбой чтения. */
+static uint8_t Archive_LastTimestamp(char *out)
 {
   LogRecord rec;
   uint32_t  idx;
   out[0] = '\0';
-  if (!LogRing_Newest(&log_ring, &rec, &idx))
-      return;
+  uint8_t st = LogRing_Newest(&log_ring, &rec, &idx);
+  if (st != LOG_READ_OK)
+      return (st == LOG_READ_NONE) ? 1U : 0U;   /* сбой чтения — архив не прочитан */
   if (LogRecord_Type(&rec) == LOG_TYPE_IMPORT_END &&
       (idx == 0U || LogRing_Read(&log_ring, --idx, &rec) != LOG_READ_OK))
-      return;
+      return 1;
   if (LogRecord_Type(&rec) == LOG_TYPE_MEAS)
   {
       LogMeas m;
@@ -260,7 +262,7 @@ static void Archive_LastTimestamp(char *out)
           memcpy(out, m.ts, STORAGE_TS_LEN);
           out[STORAGE_TS_LEN] = '\0';
       }
-      return;
+      return 1;
   }
   /* Хвост текста: до четырёх последних записей TEXT (~200 байт) — хватает
    * на последнюю строку целиком. */
@@ -283,6 +285,7 @@ static void Archive_LastTimestamp(char *out)
           break;
   }
   (void)Storage_LastTimestamp(tail, n, from_start, out);
+  return 1;
 }
 
 /* Дописать запись в журнал. Отказ — write_fails и переоткрытие журнала в
@@ -706,10 +709,9 @@ int main(void)
   {
       char last_ts[STORAGE_TS_LEN + 1] = "";
       char build_ts[STORAGE_TS_LEN + 1];
-      if (fs_ok)
-          Archive_LastTimestamp(last_ts);
+      uint8_t archive_read = fs_ok && Archive_LastTimestamp(last_ts);
       Time_BuildTimestamp(build_ts, sizeof(build_ts));
-      time_ok = Policy_TimeTrusted(time_sync, Time_GetTrusted(), fs_ok, last_ts, build_ts);
+      time_ok = Policy_TimeTrusted(time_sync, Time_GetTrusted(), archive_read, last_ts, build_ts);
       Time_SetTrusted(time_ok);
   }
 

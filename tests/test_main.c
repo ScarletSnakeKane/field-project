@@ -908,8 +908,11 @@ static void fm_reset(uint32_t nsect)
 
 static void fm_power_on(void) { fm_dead = 0; fm_cut = -1; }
 
+static long fm_read_fail = -1;   /* через сколько чтений одно откажет */
+
 static uint8_t fm_read(uint32_t a, uint8_t *b, uint32_t n)
 {
+    if (fm_read_fail >= 0 && fm_read_fail-- == 0) return 0;
     if (fm_dead || a + n > fm_nsect * 4096U) return 0;
     memcpy(b, fm + a, n);
     return 1;
@@ -1061,7 +1064,7 @@ static void test_log_ring_g1(void)
         prev_first = first;
         /* Самая новая запись — только что записанная. */
         LogRecord nw;
-        if (!LogRing_Newest(&r, &nw, NULL) || !log_is(&nw, id)) order_bad++;
+        if (LogRing_Newest(&r, &nw, NULL) != LOG_READ_OK || !log_is(&nw, id)) order_bad++;
         if (id % (LOG_SLOTS * 3U) == 0U)
         {
             /* Порядок и непрерывность: годные идут подряд, без пропусков. */
@@ -1343,6 +1346,31 @@ static void test_log_ring_g2(void)
         for (id = 85; id <= 90U; id++) { log_make(&rec, id); (void)LogRing_Append(&m, &rec); }
         good = log_scan(&m, &bad, ids, 4 * 64, &alien);
         ok(good == 90U && ids[89] == 90U && !alien, "после перезапуска пишется дальше");
+    }
+
+    /* Сбой программирования слота 0 и тут же сбой чтения сверки: что легло
+     * в слот, неизвестно. Журнал закрывается без повтора, после
+     * переоткрытия ни одна подтверждённая запись не пропадает. */
+    {
+        LogRing r, m;
+        LogRecord rec;
+        fm_reset(4);
+        fm_mode = 1;
+        (void)LogRing_Mount(&r, &FM_OPS, 4);
+        uint32_t id;
+        for (id = 1; id <= 64U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+        fm_fail_once = 1;
+        fm_read_fail = 0;
+        log_make(&rec, 65);
+        equ(LogRing_Append(&r, &rec), 0, "сбой записи и чтения сверки — отказ без повтора");
+        fm_read_fail = -1;
+        equ(LogRing_Mount(&m, &FM_OPS, 4), LOG_MOUNT_OK, "переоткрытие");
+        for (id = 66; id <= 64U + 40U; id++) { log_make(&rec, id); (void)LogRing_Append(&m, &rec); }
+        equ(LogRing_Mount(&m, &FM_OPS, 4), LOG_MOUNT_OK, "перезапуск");
+        uint32_t bad; int alien;
+        static uint32_t ids[4 * 64];
+        uint32_t good = log_scan(&m, &bad, ids, 4 * 64, &alien);
+        ok(good == 64U + 39U && ids[good - 1U] == 104U && !alien, "все подтверждённые на месте");
     }
 
     /* Годный сектор журнала с несмежным номером (остаток старого круга, не
@@ -1701,15 +1729,90 @@ static void test_log_import(void)
     {
         static const OldFileSpec B[2] = { { "DATA    TXT", 8000, 4 }, { "DATA_1  TXT", 8000, 5 } };
         static const uint32_t BO[1] = { 0 };
-        /* Флеш 96 КБ: том кончается на 80 КБ, выше — 4 сектора. Один файл
-         * (156 записей) с запасным в них влезает, два — нет. */
-        fm_reset(24);
+        /* Флеш 100 КБ: том кончается на 80 КБ, выше — 5 секторов. Один файл
+         * (156 записей, сектор перехода и запасной) в них влезает, два — нет. */
+        fm_reset(25);
         (void)old_volume(16, B, 2, 0, old_texts);
-        equ(LogArchive_Open(&r, &FM_OPS, 24, 1, &v), LOG_OPEN_OK, "не помещается — импорт без старейших");
+        equ(LogArchive_Open(&r, &FM_OPS, 25, 1, &v), LOG_OPEN_OK, "не помещается — импорт без старейших");
         equ((unsigned)import_check(&r, B, BO, 1, old_texts, 1), 0, "перенесён самый новый файл, data.txt");
         LogRecord last;
-        ok(LogRing_Newest(&r, &last, NULL) && LogRecord_Type(&last) == LOG_TYPE_IMPORT_END &&
+        ok(LogRing_Newest(&r, &last, NULL) == LOG_READ_OK && LogRecord_Type(&last) == LOG_TYPE_IMPORT_END &&
            last.b[LOG_PAYLOAD_OFS + 5] == 1, "в IMPORT_END — один файл не поместился");
+    }
+
+    /* Не влезает и один файл — переносятся заголовок и самый новый хвост
+     * с границы строки; срез отмечен в IMPORT_FILE. */
+    {
+        static const OldFileSpec T[1] = { { "DATA    TXT", 30000, 6 } };
+        fm_reset(32);
+        (void)old_volume(16, T, 1, 0, old_texts);
+        equ(LogArchive_Open(&r, &FM_OPS, 32, 1, &v), LOG_OPEN_OK, "большой data.txt: импорт хвоста");
+        static uint8_t got[40000];
+        uint32_t len = 0, skip = 0, nf = 0, ends = 0;
+        LogRecord rec;
+        for (uint32_t i = 0; i < LogRing_Count(&r); i++)
+        {
+            if (LogRing_Read(&r, i, &rec) != LOG_READ_OK) continue;
+            const uint8_t *t;
+            uint32_t l = LogRecord_Text(&rec, &t, NULL);
+            if (l) { memcpy(got + len, t, l); len += l; }
+            else if (LogRecord_Type(&rec) == LOG_TYPE_IMPORT_FILE) { nf++; skip = LogRecord_Get32(rec.b + LOG_PAYLOAD_OFS + 18); }
+            else if (LogRecord_Type(&rec) == LOG_TYPE_IMPORT_END) ends++;
+        }
+        const uint8_t *src = old_texts[0];
+        uint32_t hdr = (uint32_t)((const uint8_t *)memchr(src, '\n', 30000) - src) + 1U;
+        uint32_t tail = (len > hdr) ? len - hdr : 0U;
+        ok(nf == 1 && ends == 1 && skip > 0 && skip < 30000, "большой data.txt: срез отмечен");
+        ok(len > hdr && memcmp(got, src, hdr) == 0, "большой data.txt: заголовок сохранён");
+        ok(memcmp(got + hdr, src + 30000 - tail, tail) == 0 && src[30000 - tail - 1] == '\n',
+           "большой data.txt: хвост байт в байт с начала строки до конца");
+        /* Выше тома (~94 КБ) — 8 секторов, из них 2 — переход и запасной:
+         * текста влезает ~6 × 64 × 52 ≈ 19.9 КБ. */
+        ok(tail > 15000U, "большой data.txt: перенесено почти всё, что влезло");
+    }
+
+    /* Не влезает ничего — журнал с нуля, но с отметкой о выпавшем архиве. */
+    {
+        static const OldFileSpec T[1] = { { "DATA    TXT", 3000, 6 } };
+        fm_reset(18);   /* том кончается на 68 КБ, выше — 1 сектор: не хватает ни на что */
+        (void)old_volume(16, T, 1, 0, old_texts);
+        equ(LogArchive_Open(&r, &FM_OPS, 18, 1, &v), LOG_OPEN_OK, "не влезло ничего: журнал открыт");
+        LogRecord last;
+        ok(LogRing_Newest(&r, &last, NULL) == LOG_READ_OK && LogRecord_Type(&last) == LOG_TYPE_IMPORT_END &&
+           last.b[LOG_PAYLOAD_OFS + 5] == 1, "не влезло ничего: в журнале IMPORT_END с одним выпавшим файлом");
+    }
+
+    /* Сбой чтения при проверке незаконченного импорта — не «импорта нет»:
+     * открытие сообщает EIO, следующее доводит импорт. */
+    {
+        static const OldFileSpec G[1] = { { "DATA    TXT", 6000, 7 } };
+        static const uint32_t GO[1] = { 0 };
+        fm_reset(LOG_FLASH_SECTORS);
+        fm_mode = 1;
+        (void)old_volume(16, G, 1, 0, old_texts);
+        fm_ops = 0;
+        fm_cut = 40;
+        (void)LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v);
+        fm_power_on();
+        /* Монтирование читает по 64 Б: 512 слотов 0 + хвост головы + запасной;
+         * сбой — на первом чтении после него (это LogRing_Newest). */
+        LogRing probe;
+        uint32_t reads = 0;
+        {
+            /* Сосчитать чтения монтирования. */
+            static long cnt;
+            cnt = 0;
+            fm_read_fail = 1L << 30;
+            (void)LogRing_Mount(&probe, &FM_OPS, LOG_FLASH_SECTORS);
+            cnt = (1L << 30) - fm_read_fail;
+            reads = (uint32_t)cnt;
+        }
+        fm_read_fail = (long)reads;
+        equ(LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v), LOG_OPEN_EIO,
+            "сбой чтения при проверке импорта — EIO, а не «журнал открыт»");
+        fm_read_fail = -1;
+        equ(LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v), LOG_OPEN_OK, "следующее открытие доводит импорт");
+        equ((unsigned)import_check(&r, G, GO, 1, old_texts, 1), 0, "после сбоя чтения импорт полон");
     }
 
     /* Не наш том или флеш с мусором — журнал с начала, без импорта. */
