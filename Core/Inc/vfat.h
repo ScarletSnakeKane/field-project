@@ -124,6 +124,7 @@ typedef struct {
     uint32_t imp_files, imp_dropped;
     char     first_ts[20], last_ts[20];
     uint8_t  last_time_ok;
+    uint32_t last_seq;              /* номер последнего замера */
     uint32_t last_wf, last_lps, last_boot;
     /* Индекс: смещение в файле начала сектора журнала k (записи k*64). */
     uint32_t off[2][VFAT_CHUNKS_MAX + 1U];
@@ -371,11 +372,16 @@ static uint16_t VFat_FatDate(uint32_t y, uint32_t mo, uint32_t d)
 }
 
 /* Дата файлов — по последнему замеру, если часам можно верить. Иначе (и при
- * разобранной не до конца метке) — фиксированная 2026-01-01 00:00. */
+ * разобранной не до конца метке) — фиксированная 2026-01-01, а время дня
+ * растёт с номером последнего замера (шаг FAT — 2 с, круг — 43 200
+ * замеров, ~5 лет ежечасных). С одной датой на все копии синхронизатор,
+ * сравнивающий размер и время (robocopy, FreeFileSync), пропустил бы
+ * обновление, когда на полном кольце длина файла не изменилась (V4, П5б+). */
 static void VFat_Stamp(VFat *v)
 {
+    uint32_t k = v->last_seq % 43200U;
     v->fdate = VFat_FatDate(2026U, 1U, 1U);
-    v->ftime = 0;
+    v->ftime = (uint16_t)(((k / 1800U) << 11) | (((k / 30U) % 60U) << 5) | (k % 30U));
     if (!v->last_time_ok || v->last_ts[0] == '\0')
         return;
     const char *t = v->last_ts;
@@ -532,6 +538,7 @@ static uint8_t VFat_Scan(VFat *v, uint8_t check)
         LogRecord_UnpackMeas(&last, &m);
         memcpy(v->last_ts, m.ts, sizeof(v->last_ts));
         v->last_time_ok = m.time_ok;
+        v->last_seq = LogRecord_Seq(&last);
         v->last_wf = m.write_fails;
         v->last_lps = m.lowpower_skips;
         v->last_boot = m.boot_count;
