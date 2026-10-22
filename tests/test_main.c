@@ -2875,6 +2875,7 @@ static void test_vfat_volume(void)
     LogRing closed = r;
     closed.mounted = 0;
     equ(VFat_Build(&vf_vol, &closed, "test"), VFAT_NO_ARCHIVE, "журнал не смонтирован — тома без data.txt");
+    equ(vf_vol.serial, VFat_Serial(vf_uid), "том без архива — тот же серийный номер");
 
     /* Разовый сбой чтения при сборке лечится повтором; стойкий — data.txt
      * не отдаётся. */
@@ -3007,6 +3008,10 @@ static void test_vfat_volume(void)
         (void)VFat_Build(&vf_vol, &r, "test");
         vf_break = 0;
         ok(vf_vol.slow == 1 && vf_vol.state == VFAT_OK, "самопроверка: расхождение — медленный путь");
+        {
+            uint32_t want = VFat_Serial(vf_uid);
+            equ(vf_vol.serial, want, "медленный путь — тот же серийный номер");
+        }
         for (uint32_t s = 0; s < VFAT_DISK_SECTORS; s++)
             (void)VFat_Read(&vf_vol, s, vf_img + s * VFAT_SECTOR);
         ok(vf_check_file(vf_img, "DATA    TXT", vf_exp_data, dlen), "медленный путь: data.txt байт в байт");

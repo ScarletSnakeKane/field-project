@@ -552,9 +552,12 @@ static uint8_t VFat_Scan(VFat *v, uint8_t check)
 
 uint8_t VFat_Build(VFat *v, const LogRing *r, const char *fw)
 {
+    uint32_t uid[3];
+    VFAT_DEVICE_UID(uid);
     memset(v, 0, sizeof(*v));
     v->ring = r;
     v->fw = fw;
+    v->serial = VFat_Serial(uid);   /* и тому без архива — тот же номер */
     if (r == NULL || !r->mounted)
     {
         v->state = VFAT_NO_ARCHIVE;
@@ -576,6 +579,7 @@ uint8_t VFat_Build(VFat *v, const LogRing *r, const char *fw)
             memset(v, 0, sizeof(*v));
             v->ring = keep;
             v->fw = fw;
+            v->serial = VFat_Serial(uid);
             v->n = LogRing_Count(r);
             v->nchunks = (v->n + LOG_SLOTS - 1U) / LOG_SLOTS;
             v->slow = 1;
@@ -593,11 +597,6 @@ uint8_t VFat_Build(VFat *v, const LogRing *r, const char *fw)
     {
         v->present[VFAT_FILE_DATA] = 1;
         v->present[VFAT_FILE_OLD] = (v->size[VFAT_FILE_OLD] > 0U);
-    }
-    {
-        uint32_t uid[3];
-        VFAT_DEVICE_UID(uid);
-        v->serial = VFat_Serial(uid);
     }
     VFat_Layout(v);
     return v->state;

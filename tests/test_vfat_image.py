@@ -423,8 +423,18 @@ static void run(int fail){
   int last = tx_n - 1;
   uint32_t residue = 0; uint8_t status = 0xFF;
   if (last >= 0 && tx_len[last] == 13) { memcpy(&residue, tx_buf[last] + 8, 4); status = tx_buf[last][12]; }
-  printf("FAIL %d DATA %d STALL %d EARLY %d STATUS %u RESIDUE %lu\n", fail, data, stalled, early,
-         (unsigned)status, (unsigned long)residue);
+  uint32_t tag = 0;
+  if (last >= 0 && tx_len[last] == 13) memcpy(&tag, tx_buf[last] + 4, 4);
+  /* Следующая команда после отказа — TEST UNIT READY: класс снова принимает
+   * CBW и отвечает PASSED. */
+  int before = tx_n;
+  h.cbw.dTag = 0x5678; h.cbw.dDataLength = 0; h.cbw.bmFlags = 0; h.cbw.bCBLength = 6;
+  memset(h.cbw.CB, 0, 16);
+  MSC_BOT_DataOut(&dev, 1);
+  int next_ok = (tx_n == before + 1 && tx_len[before] == 13 && tx_buf[before][12] == 0 &&
+                 tx_buf[before][4] == 0x78 && tx_buf[before][5] == 0x56);
+  printf("FAIL %d DATA %d STALL %d EARLY %d STATUS %u RESIDUE %lu TAG %lu NEXT %d\n", fail, data, stalled,
+         early, (unsigned)status, (unsigned long)residue, (unsigned long)tag, next_ok);
 }
 int main(void){ run(-1); run(100); run(102); return 0; }
 """
@@ -456,8 +466,9 @@ class MscBot(unittest.TestCase):
             # CLEAR_FEATURE, статус FAILED, остаток — непереданные секторы.
             for fail, sent in ((100, 0), (102, 2)):
                 r = res[fail]
-                self.assertEqual((r["DATA"], r["STALL"], r["EARLY"], r["STATUS"], r["RESIDUE"]),
-                                 (sent, 1, 0, 1, (4 - sent) * 512), "отказ на LBA %d: %s" % (fail, out))
+                self.assertEqual((r["DATA"], r["STALL"], r["EARLY"], r["STATUS"], r["RESIDUE"],
+                                  r["TAG"], r["NEXT"]),
+                                 (sent, 1, 0, 1, (4 - sent) * 512, 0x1234, 1), "отказ на LBA %d: %s" % (fail, out))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
