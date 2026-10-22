@@ -22,6 +22,48 @@
 
 /* USER CODE BEGIN 0 */
 
+/* Запуск часового кварца и откат на LSI (A5).
+ *
+ * Раньше LSE поднимала SystemClock_Config — при старте и на КАЖДОМ
+ * пробуждении, — а отказ кварца уводил в Error_Handler: перезагрузка сторожем
+ * через ~30 с, и снова то же. До записи строки дело не доходило, так что
+ * колонка lse_ok = 0, заведённая ровно для этого случая, записаться не могла;
+ * в архиве — ноль строк, батарея садится втрое быстрее.
+ *
+ * Теперь кварц запускается один раз здесь, с таймаутом LSE_STARTUP_TIMEOUT.
+ * Не завёлся — RTC идёт от LSI (17–47 кГц: время уплывает, но прибор
+ * просыпается и пишет), а в каждой строке lse_ok = 0. Смена источника RTC
+ * сбрасывает backup-домен вместе с календарём — это честно: время после
+ * отказа кварца и так недостоверно, и time_service это увидит. */
+static uint8_t rtc_lse_ok = 0;
+
+static void RTC_StartClockSource(void)
+{
+  RCC_OscInitTypeDef osc = {0};
+
+  osc.OscillatorType = RCC_OSCILLATORTYPE_LSE;
+  osc.LSEState = RCC_LSE_ON;
+  osc.PLL.PLLState = RCC_PLL_NONE;
+  if (HAL_RCC_OscConfig(&osc) == HAL_OK)
+  {
+    rtc_lse_ok = 1;
+    return;
+  }
+
+  /* Глушим недозапустившийся генератор — он продолжал бы потреблять — и
+   * поднимаем LSI. Он нужен и сторожу, так что отдельной цены у него нет. */
+  rtc_lse_ok = 0;
+  osc.OscillatorType = RCC_OSCILLATORTYPE_LSE | RCC_OSCILLATORTYPE_LSI;
+  osc.LSEState = RCC_LSE_OFF;
+  osc.LSIState = RCC_LSI_ON;
+  (void)HAL_RCC_OscConfig(&osc);
+}
+
+uint8_t RTC_LseOk(void)
+{
+  return rtc_lse_ok;
+}
+
 /* USER CODE END 0 */
 
 RTC_HandleTypeDef hrtc;
@@ -31,7 +73,7 @@ void MX_RTC_Init(void)
 {
 
   /* USER CODE BEGIN RTC_Init 0 */
-
+  RTC_StartClockSource();
   /* USER CODE END RTC_Init 0 */
 
   RTC_TimeTypeDef sTime = {0};
@@ -83,6 +125,7 @@ void MX_RTC_Init(void)
   HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
 
   // LSE 32.768 кГц, предделители уже настроены -> RTC_WAKEUPCLOCK_CK_SPRE_16BITS даёт шаг 1 сек.
+  // На LSI (кварц не завёлся) тот же шаг — «секунда» LSI, то есть 0.7–1.9 с.
   // Интервал задан в rtc.h (RTC_WAKEUP_INTERVAL_SEC) — сейчас тестовое значение, для поля переключить на 3600.
   if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc,
                                   RTC_WAKEUP_INTERVAL_SEC,
@@ -101,7 +144,21 @@ void HAL_RTC_MspInit(RTC_HandleTypeDef* rtcHandle)
   if(rtcHandle->Instance==RTC)
   {
   /* USER CODE BEGIN RTC_MspInit 0 */
-
+    /* Кварц не завёлся — сгенерированный ниже выбор LSE ушёл бы в таймаут и
+     * в Error_Handler. Выбираем LSI сами и выходим, минуя его. */
+    if (!rtc_lse_ok)
+    {
+      PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_RTC;
+      PeriphClkInitStruct.RTCClockSelection = RCC_RTCCLKSOURCE_LSI;
+      if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+      {
+        Error_Handler();
+      }
+      __HAL_RCC_RTC_ENABLE();
+      HAL_NVIC_SetPriority(RTC_WKUP_IRQn, 0, 0);
+      HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);
+      return;
+    }
   /* USER CODE END RTC_MspInit 0 */
 
   /** Initializes the peripherals clock

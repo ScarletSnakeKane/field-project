@@ -127,8 +127,12 @@
  #define LSE_VALUE  32768U    /*!< Value of the External Low Speed oscillator in Hz */
 #endif /* LSE_VALUE */
 
+/* 10 с, а не 5: кварц 32.768 кГц на холоде и с влагой на плате заводится
+ * секундами, а отказ запуска теперь не фатален — RTC уходит на LSI с
+ * lse_ok = 0 (A5). Ждём один раз при старте, не на каждом пробуждении.
+ * В FieldSensor.ioc это RCC → LSE Startup Timeout — поправить и там. */
 #if !defined  (LSE_STARTUP_TIMEOUT)
-  #define LSE_STARTUP_TIMEOUT    5000U   /*!< Time out for LSE start up, in ms */
+  #define LSE_STARTUP_TIMEOUT    10000U  /*!< Time out for LSE start up, in ms */
 #endif /* LSE_STARTUP_TIMEOUT */
 
 /**

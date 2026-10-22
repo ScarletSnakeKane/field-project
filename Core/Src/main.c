@@ -272,19 +272,21 @@ static uint8_t SleepUntilNextSample(void)
   HAL_SuspendTick();
   HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
 
-  /* --- пробуждение: ядро на HSI без PLL, обязательно поднять клоки прежде чем
-   * трогать что-либо ещё (I2C/SPI/ADC/DWT-задержки зависят от реальной частоты) --- */
+  /* --- пробуждение: ядро на HSI без PLL. Шины и задержки работают от того
+   * же HSI 16 МГц, что и до сна (делители и латентность флеш STOP сохраняет),
+   * так что SystemClock_Config здесь больше не нужна: PLL нужен только USB,
+   * и его поднимает Usb_Start. Раньше она же на каждом пробуждении заново
+   * запускала LSE, и один отказ кварца уводил в Error_Handler (A5). --- */
   /* Тик поднимаем ДО настройки тактирования, а не после. Все ожидания внутри
    * HAL_RCC_OscConfig/ClockConfig отмеряют свой таймаут по HAL_GetTick(), а он
    * растёт только в прерывании SysTick — том самом, которое HAL_SuspendTick()
    * выключил перед сном. Пока тик стоит, разность (HAL_GetTick() - tickstart)
    * всегда ноль, условие выхода по таймауту не выполняется НИКОГДА, и отказ
-   * запуска кварца превращался бы не в HAL_TIMEOUT, а в вечный горячий цикл
-   * прямо внутри драйвера — то есть даже не доходил бы до Error_Handler.
-   * Частота на этом участке та же, что была до сна (HSI 16 МГц), поэтому
+   * запуска генератора превращался бы не в HAL_TIMEOUT, а в вечный горячий
+   * цикл прямо внутри драйвера. То же относится к Usb_Start, который
+   * поднимает HSE и PLL. Частота та же, что была до сна (HSI 16 МГц), поэтому
    * перенастраивать SysTick не нужно: достаточно вернуть его прерывание. */
   HAL_ResumeTick();
-  SystemClock_Config();
 
   /* В аналоге PA0 читается нулём, то есть «зажата», — вернуть подтяжку до
    * того, как цикл удержания спросит кнопку, иначе залипание не кончилось
@@ -355,9 +357,9 @@ int main(void)
   MX_I2C1_Init();
   MX_SPI1_Init();
   MX_RTC_Init();
-  // LSE НЕ запустился → RTC не на кварце → метки времени будут неправильными.
-  // Раньше это "помечалось" записью в PA0, но там теперь вход кнопки — пишем флаг в CSV.
-  lse_ok = (__HAL_RCC_GET_FLAG(RCC_FLAG_LSERDY) != RESET) ? 1U : 0U;
+  // LSE НЕ запустился → RTC идёт от LSI → метки времени уплывают. Плата при
+  // этом живёт и пишет (A5), а флаг уходит в каждую строку CSV.
+  lse_ok = RTC_LseOk();
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
@@ -761,8 +763,11 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSE;
-  RCC_OscInitStruct.LSEState = RCC_LSE_ON;
+  /* LSE отсюда убран (A5): его запускает MX_RTC_Init один раз, с откатом на
+   * LSI. Здесь его отказ уводил в Error_Handler — цикл перезагрузок без
+   * единой строки в архиве. CubeMX при перегенерации вернёт LSE сюда —
+   * после перегенерации эту правку повторить. */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -827,9 +832,9 @@ void Error_Handler(void)
    * архив просто перестаёт расти, банка садится за считанные дни на ~8 мА, и
    * заказчик узнаёт об этом, только приехав за данными через месяц.
    *
-   * Попасть сюда можно из SystemClock_Config(), а она вызывается на КАЖДОМ
-   * пробуждении и каждый раз поднимает LSE. Достаточно один раз не запуститься
-   * кварцу 32.768 кГц — от холода, влаги, треснувшей пайки.
+   * Раньше сюда вёл отказ кварца 32.768 кГц на любом пробуждении; теперь он
+   * не фатален (A5, rtc.c), но остаются отказы инициализации I2C, SPI, RTC,
+   * ADC и USB.
    *
    * Поэтому вместо цикла — перезапуск сторожевым таймером, причём ожидание
    * сброса проходит в STOP, а не на полной частоте. IWDG тактируется от LSI,
