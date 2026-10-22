@@ -142,7 +142,9 @@ typedef struct {
 uint8_t VFat_Build(VFat *v, const LogRing *r, const char *fw);
 
 /* Сектор диска lba (0..VFAT_DISK_SECTORS-1) в buf (512 Б). 1 — готово, 0 —
- * отказ флеш или журнал разошёлся с индексом (хост повторит чтение). */
+ * отказ флеш или журнал разошёлся с индексом. Отказ, а не сдвинутые байты:
+ * хост получит ошибку чтения (04/11). Windows её повторит, Linux/Android —
+ * нет, копирование оборвётся с ошибкой ввода-вывода. */
 uint8_t VFat_Read(VFat *v, uint32_t lba, uint8_t *buf);
 
 /* Строка data.txt для записи замера: те же байты, что LogRecord_FormatCsv

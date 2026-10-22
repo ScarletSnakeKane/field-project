@@ -14,6 +14,9 @@ FAT: fsck.vfat -n (dosfstools), mtools и pyfatfs — какие есть. Ка�
 Второй тест — под qemu с newlib-nano (если есть arm-none-eabi-gcc и
 qemu-system-arm): быстрый форматтер vfat.h сверяется с snprintf прошивочной
 libc, и считаются инструкции Cortex-M4 на строку и на сектор 512 Б.
+
+Третий — класс MSC ST на хосте с заглушками LL: отказ чтения посреди READ10
+должен дать STALL IN и CSW FAILED после CLEAR_FEATURE (V1, П5б+).
 """
 import os
 import shutil
@@ -315,6 +318,139 @@ class Newlib(unittest.TestCase):
                   " сборка — %.0f на запись; сектор — худший %.0f, подряд %.0f"
                   % (ins["FAST"], ins["SLOW"], ins["BUILD"] / recs, ins["WORST"], ins["SEQ"] / nsec),
                   file=sys.stderr)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# Класс MSC ST собирается на хосте с заглушками LL: READ10 на 4 сектора, отказ
+# Read на k-м секторе (V1, П5б+). По BOT ошибка в фазе данных — STALL IN, а
+# CSW FAILED (с остатком) — только после CLEAR_FEATURE.
+BOT_CONF = r"""/* Заглушка usbd_conf.h для хостовой сборки класса MSC. */
+#ifndef __USBD_CONF__H__
+#define __USBD_CONF__H__
+#include <stdint.h>
+#include <string.h>
+#define USBD_MAX_NUM_INTERFACES 1U
+#define USBD_MAX_NUM_CONFIGURATION 1U
+#define USBD_MAX_STR_DESC_SIZ 512U
+#define USBD_DEBUG_LEVEL 0U
+#define USBD_LPM_ENABLED 0U
+#define USBD_SELF_POWERED 1U
+#define MSC_MEDIA_PACKET 512U
+#define DEVICE_FS 0
+#define USBD_malloc(x) malloc(x)
+#define USBD_free(x) free(x)
+#define USBD_memset memset
+#define USBD_memcpy memcpy
+#define USBD_Delay(x)
+#define USBD_UsrLog(...)
+#define USBD_ErrLog(...)
+#define USBD_DbgLog(...)
+#include <stdlib.h>
+#define __IO volatile
+#define UNUSED(x) ((void)(x))
+#define __STATIC_INLINE static inline
+#define __PACKED __attribute__((packed))
+#define __ALIGN_BEGIN
+#define __ALIGN_END
+#endif
+"""
+
+BOT_BENCH = r"""#include <stdio.h>
+#include "usbd_msc.h"
+uint8_t MSCInEpAdd = 0x81U, MSCOutEpAdd = 0x01U;
+static int stall_in, tx_n, tx_len[16];
+static uint8_t tx_buf[16][16];
+USBD_StatusTypeDef USBD_LL_StallEP(USBD_HandleTypeDef *p, uint8_t ep){ (void)p; if (ep & 0x80U) stall_in++; return USBD_OK; }
+USBD_StatusTypeDef USBD_LL_ClearStallEP(USBD_HandleTypeDef *p, uint8_t ep){ (void)p; (void)ep; return USBD_OK; }
+USBD_StatusTypeDef USBD_LL_FlushEP(USBD_HandleTypeDef *p, uint8_t ep){ (void)p; (void)ep; return USBD_OK; }
+uint32_t USBD_LL_GetRxDataSize(USBD_HandleTypeDef *p, uint8_t ep){ (void)p; (void)ep; return 31U; }
+USBD_StatusTypeDef USBD_LL_PrepareReceive(USBD_HandleTypeDef *p, uint8_t ep, uint8_t *b, uint32_t n){ (void)p; (void)ep; (void)b; (void)n; return USBD_OK; }
+USBD_StatusTypeDef USBD_LL_Transmit(USBD_HandleTypeDef *p, uint8_t ep, uint8_t *b, uint32_t n){
+  (void)p; (void)ep;
+  if (tx_n < 16) { tx_len[tx_n] = (int)n; memcpy(tx_buf[tx_n], b, n < 16U ? n : 16U); tx_n++; }
+  return USBD_OK;
+}
+uint8_t USBD_LL_IsStallEP(USBD_HandleTypeDef *p, uint8_t ep){ (void)p; (void)ep; return 0; }
+USBD_StatusTypeDef USBD_CtlSendData(USBD_HandleTypeDef *p, uint8_t *b, uint32_t n){ (void)p; (void)b; (void)n; return USBD_OK; }
+
+static int fail_at = -1;
+static int8_t s_init(uint8_t l){ (void)l; return 0; }
+static int8_t s_cap(uint8_t l, uint32_t *n, uint16_t *s){ (void)l; *n = 32768U; *s = 512U; return 0; }
+static int8_t s_ready(uint8_t l){ (void)l; return 0; }
+static int8_t s_wp(uint8_t l){ (void)l; return 1; }
+static int8_t s_read(uint8_t l, uint8_t *b, uint32_t a, uint16_t n){ (void)l; (void)n; memset(b, (int)a, 512); return ((int)a == fail_at) ? -1 : 0; }
+static int8_t s_write(uint8_t l, uint8_t *b, uint32_t a, uint16_t n){ (void)l; (void)b; (void)a; (void)n; return -1; }
+static int8_t s_maxlun(void){ return 0; }
+static int8_t inq[36];
+static USBD_StorageTypeDef st = { s_init, s_cap, s_ready, s_wp, s_read, s_write, s_maxlun, inq };
+
+static USBD_HandleTypeDef dev;
+static USBD_MSC_BOT_HandleTypeDef h;
+
+/* READ10 на 4 сектора с LBA 100; отказ чтения на fail. Печатает, что увидел хост. */
+static void run(int fail){
+  memset(&dev, 0, sizeof dev); memset(&h, 0, sizeof h);
+  dev.pClassDataCmsit[0] = &h; dev.pUserData[0] = &st; dev.dev_speed = USBD_SPEED_FULL;
+  stall_in = 0; tx_n = 0; fail_at = fail;
+  MSC_BOT_Init(&dev);
+  h.scsi_medium_state = SCSI_MEDIUM_UNLOCKED;
+  h.scsi_blk[0].nbr = 32768U; h.scsi_blk[0].size = 512U;      /* как после READ CAPACITY */
+  h.cbw.dSignature = USBD_BOT_CBW_SIGNATURE; h.cbw.dTag = 0x1234; h.cbw.dDataLength = 4U * 512U;
+  h.cbw.bmFlags = 0x80U; h.cbw.bLUN = 0; h.cbw.bCBLength = 10;
+  memset(h.cbw.CB, 0, 16); h.cbw.CB[0] = 0x28; h.cbw.CB[5] = 100; h.cbw.CB[8] = 4;
+  MSC_BOT_DataOut(&dev, 1);                         /* CBW принят, первый сектор ушёл */
+  for (int i = 0; i < 6 && !stall_in; i++)
+  {
+    int before = tx_n;
+    MSC_BOT_DataIn(&dev, 0x81);                     /* пакет ушёл хосту */
+    if (tx_n == before) break;
+    if (tx_len[tx_n - 1] == 13) break;              /* CSW */
+  }
+  int stalled = stall_in;
+  int early = 0;                                    /* CSW ушёл в фазе данных, без STALL */
+  for (int i = 0; i < tx_n; i++) if (tx_len[i] == 13) early = 1;
+  if (stalled) MSC_BOT_CplClrFeature(&dev, 0x81);   /* хост: CLEAR_FEATURE(HALT) */
+  int data = 0;
+  for (int i = 0; i < tx_n; i++) if (tx_len[i] == 512) data++;
+  int last = tx_n - 1;
+  uint32_t residue = 0; uint8_t status = 0xFF;
+  if (last >= 0 && tx_len[last] == 13) { memcpy(&residue, tx_buf[last] + 8, 4); status = tx_buf[last][12]; }
+  printf("FAIL %d DATA %d STALL %d EARLY %d STATUS %u RESIDUE %lu\n", fail, data, stalled, early,
+         (unsigned)status, (unsigned long)residue);
+}
+int main(void){ run(-1); run(100); run(102); return 0; }
+"""
+
+
+class MscBot(unittest.TestCase):
+    def test_read_fail_stalls_in(self):
+        if not have("gcc"):
+            self.skipTest("нет gcc")
+        lib = os.path.join(ROOT, "Middlewares", "ST", "STM32_USB_Device_Library")
+        tmp = tempfile.mkdtemp(prefix="msc_bot_")
+        try:
+            for fn, text in (("usbd_conf.h", BOT_CONF), ("bench.c", BOT_BENCH)):
+                with open(os.path.join(tmp, fn), "w") as f:
+                    f.write(text)
+            exe = os.path.join(tmp, "b")
+            src = [os.path.join(lib, "Class", "MSC", "Src", n)
+                   for n in ("usbd_msc_bot.c", "usbd_msc_scsi.c", "usbd_msc_data.c")]
+            subprocess.run(["gcc", "-std=c11", "-I" + tmp, "-I" + os.path.join(lib, "Class", "MSC", "Inc"),
+                            "-I" + os.path.join(lib, "Core", "Inc"), "-o", exe,
+                            os.path.join(tmp, "bench.c")] + src, check=True, capture_output=True)
+            out = subprocess.run([exe], check=True, capture_output=True, text=True).stdout
+            res = {}
+            for line in out.splitlines():
+                kv = dict(zip(*[iter(line.split())] * 2))
+                res[int(kv["FAIL"])] = {k: int(v) for k, v in kv.items()}
+            self.assertEqual((res[-1]["DATA"], res[-1]["STALL"], res[-1]["STATUS"]), (4, 0, 0), out)
+            # Отказ первого сектора и посреди команды: STALL, CSW не раньше
+            # CLEAR_FEATURE, статус FAILED, остаток — непереданные секторы.
+            for fail, sent in ((100, 0), (102, 2)):
+                r = res[fail]
+                self.assertEqual((r["DATA"], r["STALL"], r["EARLY"], r["STATUS"], r["RESIDUE"]),
+                                 (sent, 1, 0, 1, (4 - sent) * 512), "отказ на LBA %d: %s" % (fail, out))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

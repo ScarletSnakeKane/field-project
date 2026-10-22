@@ -198,7 +198,14 @@ void MSC_BOT_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
     case USBD_BOT_DATA_IN:
       if (SCSI_ProcessCmd(pdev, hmsc->cbw.bLUN, &hmsc->cbw.CB[0]) < 0)
       {
-        MSC_BOT_SendCSW(pdev, USBD_CSW_CMD_FAILED);
+        /* FieldSensor (П5б+, V1): правка вне USER CODE — CubeMX при
+         * перегенерации вернёт MSC_BOT_SendCSW(FAILED). Отказ Read посреди
+         * READ10: хост ждёт ещё данных, CSW вместо них он примет за
+         * короткий пакет данных и будет ждать настоящего CSW до таймаута
+         * (~30 с), потом сбросит устройство. По BOT ошибка в фазе данных —
+         * STALL конечной точки IN; CSW FAILED уйдёт после CLEAR_FEATURE
+         * (MSC_BOT_CplClrFeature), остаток в dDataResidue уже посчитан. */
+        MSC_BOT_Abort(pdev);
       }
       break;
 
