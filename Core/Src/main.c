@@ -31,6 +31,7 @@
 #include <math.h>
 #include "aht20.h"
 #include "spiflash.h"
+#include "storage_policy.h"
 #include "time_service.h"
 #include "soil_sensor.h"
 #include "battery.h"
