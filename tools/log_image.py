@@ -385,6 +385,10 @@ def summary(journal, vol):
     return out
 
 
+SIZE_WARN = ("!! образ %d Б, а флеш прибора — %d Б: недоснятый образ (.part)? Число секторов"
+             " меняет заворот кольца, разбор может врать")
+
+
 def is_image(raw):
     """Образ флеш, а не CSV: кратен сектору и несёт байты, которых в тексте
     не бывает (0xFF стёртой флеш, нули и двоичные поля записей)."""
@@ -401,6 +405,8 @@ def read_archive(path):
     j = Journal(raw)
     vol = Volume(j)
     note = ["образ журнала %d Б: " % len(raw) + "; ".join(summary(j, vol))]
+    if len(raw) != FLASH_BYTES:
+        note.append(SIZE_WARN % (len(raw), FLASH_BYTES))
     if vol.import_pending():
         note.append("!! импорт старого архива не закончен — прошивка повторит его")
     return vol.data, note
@@ -414,6 +420,8 @@ def main(argv):
         img = f.read()
     j = Journal(img)
     vol = Volume(j)
+    if len(img) != FLASH_BYTES:
+        print("   " + SIZE_WARN % (len(img), FLASH_BYTES))
     for line in summary(j, vol):
         print("   " + line)
     if vol.import_pending():

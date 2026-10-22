@@ -73,8 +73,8 @@ class SrcTree:
         self.dir = tempfile.mkdtemp()
         os.makedirs(os.path.join(self.dir, "Core", "Src"))
         self.path = os.path.join(self.dir, "Core", "Src", "main.c")
-        s = io.open(os.path.join(ROOT, "Core", "Src", "main.c"),
-                    encoding="utf-8", newline="").read().replace("\r\n", "\n")
+        with io.open(os.path.join(ROOT, "Core", "Src", "main.c"), encoding="utf-8", newline="") as f:
+            s = f.read().replace("\r\n", "\n")
         self.orig = s.replace("\n", eol).encode("utf-8")
         spit(self.path, self.orig)
 
@@ -132,7 +132,8 @@ class PatchCompiles(unittest.TestCase):
     у владельца)."""
 
     def compile(self, *patch_args):
-        sync = open(os.path.join(TOOLS, "syncheck.sh"), encoding="utf-8").read()
+        with open(os.path.join(TOOLS, "syncheck.sh"), encoding="utf-8") as f:
+            sync = f.read()
         inc = re.search(r'^INC="([^"]*)"', sync, re.M).group(1).split()
         t = SrcTree("\n")
         try:
@@ -1010,6 +1011,25 @@ BASH = shutil.which("bash")
 BENCH_SECTORS = 16
 
 
+def bench_record(seq, kind, payload):
+    rec = bytes([kind, log_image.VERSION]) + struct.pack("<I", seq) + bytes(payload)
+    return rec + struct.pack("<I", log_image.crc32(rec))
+
+
+def bench_import_pending(sectors=BENCH_SECTORS):
+    """Импорт старого архива начат и не закончен: FILE и TEXT без END."""
+    img = bytearray(b"\xff" * (sectors * log_image.SECTOR_SIZE))
+    p = bytearray(log_image.PAYLOAD_SIZE)
+    p[5:15] = b"data_1.txt"
+    img[0:64] = bench_record(0, log_image.TYPE_IMPORT_FILE, p)
+    for i in range(1, 6):
+        p = bytearray(log_image.PAYLOAD_SIZE)
+        p[1] = 10
+        p[2:12] = b"old text\r\n"
+        img[i * 64:(i + 1) * 64] = bench_record(i, log_image.TYPE_TEXT, p)
+    return bytes(img)
+
+
 def bench_journal(n=150, sectors=BENCH_SECTORS):
     """Образ журнала: n замеров подряд с сектора 0, как пишет LogRing_Append
     на чистой флеш."""
@@ -1131,6 +1151,23 @@ class ReadDataBench(unittest.TestCase):
         self.assertEqual(rc, 1, out + err)
         self.assertIn("ARCHIVE NOT AVAILABLE", err)
 
+    def test_usb_found_among_drives(self):
+        # Без FS_VOLUME том ищется перебором корней (на Windows — буквы
+        # дисков); чужой диск с другим info.txt пропускается.
+        self.usb_volume()
+        other = os.path.join(self.root, "other")
+        os.makedirs(other)
+        spit(os.path.join(other, "info.txt"), b"not a sensor\r\n")
+        rc, out, err = self.run_sh(FS_VOLUME="", FS_ROOTS="%s %s /nonexistent" % (other, self.vol))
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("том: " + self.vol, out)
+
+    def test_usb_default_roots_are_drive_letters(self):
+        # R7: маска /[d-z] в Git Bash не раскрывается — буквы перебираются явно.
+        sh = slurp(os.path.join(TOOLS, "read_data.sh")).decode("utf-8")
+        self.assertIn("for drv in d e f g h i j k l m n o p q r s t u v w x y z", sh)
+        self.assertNotRegex(sh, r"for d in /\[")
+
     def test_usb_no_volume(self):
         rc, out, err = self.run_sh()
         self.assertEqual(rc, 2, out + err)
@@ -1200,6 +1237,18 @@ class ReadDataBench(unittest.TestCase):
         rc, out, err = self.run_sh("--wipe")
         self.assertEqual(rc, 1, out + err)
         self.assertNotEqual(self.board_now()[:4], b"\xff" * 4)
+
+    def test_wipe_refused_on_pending_import(self):
+        # Импорт старого архива не закончен: старый том цел только на флеш,
+        # в журнале его текст не весь. Разбор — не 0, второй дампер не
+        # прошивается, флеш не тронута.
+        img = bench_import_pending()
+        self.board(img)
+        rc, out, err = self.run_sh("--wipe")
+        self.assertEqual(rc, 1, out + err)
+        self.assertEqual(self.board_now(), img)
+        self.assertEqual(len(self.flashed()), 2, "второй дампер не прошивался")
+        self.assertEqual(self.archive(), [])
 
     def test_foreign_edit_not_flashed(self):
         # R4: правка main.c во время снятия (здесь — даже не собирающаяся)

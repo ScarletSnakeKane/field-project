@@ -13,8 +13,8 @@
 # USB: воткнуть USB самой платы; диск появляется через 5–20 с (прошивка
 # собирает том по журналу). Скрипт ждёт его до USB_WAIT_SEC (60 с), копирует
 # файлы и сверяет data.txt с info.txt того же тома (число строк, последняя
-# метка). Где искать том: FS_VOLUME=<каталог тома>; иначе — диски /d../z
-# (Git Bash), /media, /run/media, /Volumes.
+# метка). Где искать том: FS_VOLUME=<каталог тома>; иначе — диски D:..Z:
+# (Git Bash), /media, /run/media, /Volumes (FS_ROOTS=<каталоги> — свой список).
 #
 # --swd — когда USB нет или не поднимается, и для диагностики флеш: дампер
 # (tools/dump_patch.py) вставляется в main.c перед открытием журнала,
@@ -76,9 +76,12 @@ shelve() {
     done
 }
 
+# Сводка — справка, а не проверка: на пустом архиве (только заголовок, сразу
+# после --wipe) она отвечает 1, и снятие из-за этого не должно считаться
+# сорванным.
 summary() {
     echo
-    python "$ROOT/tools/summarize_data.py" "$OUT"
+    python "$ROOT/tools/summarize_data.py" "$OUT" || true
 }
 
 # ------------------------------------------------------------------ USB
@@ -94,8 +97,15 @@ find_volume() {
         is_volume "$FS_VOLUME" && echo "$FS_VOLUME"
         return 0
     fi
-    # /a и /b не трогаем: опрос пустого дисковода на Windows висит секундами.
-    for d in /[d-z] /media/*/* /run/media/*/* /Volumes/*; do
+    # Буквы дисков перебираются явно: в Git Bash /c, /d — точки монтирования,
+    # корневой каталог их не перечисляет, и маска /[d-z] не раскрывается (R7,
+    # как в cubeide.sh). /a и /b не трогаем: опрос пустого дисковода висит.
+    local roots="${FS_ROOTS:-}" drv
+    if [ -z "$roots" ]; then
+        for drv in d e f g h i j k l m n o p q r s t u v w x y z; do roots="$roots /$drv"; done
+        roots="$roots $(echo /media/*/* /run/media/*/* /Volumes/*)"
+    fi
+    for d in $roots; do
         [ -d "$d" ] || continue
         if is_volume "$d"; then
             echo "$d"
@@ -121,7 +131,7 @@ read_usb() {
         waited=$((waited + 2))
     done
     echo ">> том: $vol"
-    shelve "$OUT" "$OLD" "$INFO"
+    shelve "$OUT" "$OLD" "$INFO" "$IMG"
     cp "$vol/info.txt" "$INFO"
     if [ ! -f "$vol/data.txt" ]; then
         # Журнал не открыт: на томе только info.txt с причиной.
@@ -340,6 +350,9 @@ get_chunk() {
         [ "${#w[@]}" -ge 14 ] || continue
         len=$((16#${w[12]}))
         [ "$len" -gt 0 ] || continue
+        # Смещение — то, что просили: искажённое чтение слов не положит кусок
+        # не на своё место (без хеша всей флеш его бы никто не заметил).
+        [ $((16#${w[11]})) -eq $(( (n - 1) * 32768 )) ] || continue
         # Программатор читает только кратно четырём байтам, поэтому лишний хвост
         # отрезаем уже на стороне компьютера.
         "$PROG" -c port=SWD mode=HOTPLUG -r "$BUF" $(( (len + 3) / 4 * 4 )) "$(cygpath -w "$TMPBIN")" \
@@ -375,7 +388,7 @@ save_archive() {
 require_prog
 require_stlink
 
-shelve "$OUT" "$OLD" "$IMG"
+shelve "$OUT" "$OLD" "$IMG" "$INFO"
 rm -f "$IMG.part"
 
 FAIL=""       # почему данных нет — код 1
@@ -449,13 +462,15 @@ if [ -n "$WIPE" ]; then
         # Плата сейчас крутится в первом дампере и не спит — окно ловить не надо.
         flash_now
         locate_map
-        wait_dump
+        if ! wait_dump; then
+            wipe=-1
+        fi
         case $(( wipe & 0xFF )) in
             1) echo "   флеш стёрта и проверена; рабочая прошивка начнёт журнал с нуля" ;;
             2) WIPE_FAIL="дампер отказался: флеш уже не та, что сохранена (на диске 0x$saved_hash, на плате 0x$flash_hash)" ;;
             3) WIPE_FAIL="стирание не удалось: защита не снялась или $(( wipe >> 8 )) секторов не стёрлись — архив, возможно, стёрт частично; копия: ${ARCHIVE#$ROOT/}" ;;
             4) WIPE_FAIL="флеш не прочиталась при сверке — не тронута" ;;
-            *) WIPE_FAIL="дампер не сообщил итог стирания (wipe=$wipe)" ;;
+            *) WIPE_FAIL="дампер не сообщил итог стирания (wipe=$wipe) — стёрта ли флеш, неизвестно; копия образа: ${ARCHIVE#$ROOT/}" ;;
         esac
     fi
 fi

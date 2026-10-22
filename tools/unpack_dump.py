@@ -109,7 +109,8 @@ def usb(data_path, info_path):
     data = slurp(data_path)
     info = slurp(info_path).decode("ascii", "replace")
     if "ARCHIVE NOT AVAILABLE" in info:
-        print("   !! том сообщает: %s" % info.strip().splitlines()[1], file=sys.stderr)
+        why = [l for l in info.splitlines() if "ARCHIVE NOT AVAILABLE" in l][0]
+        print("   !! том сообщает: %s" % why.strip(), file=sys.stderr)
         return 1
     m = re.search(r"data\.txt: (\d+) lines, first (\S+ \S+|-), last (\S+ \S+|-)", info)
     if not m:
