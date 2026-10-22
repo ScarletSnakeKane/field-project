@@ -16,5 +16,6 @@ for f in Core/Src/*.c FATFS/Target/user_diskio.c FATFS/App/fatfs.c USB_DEVICE/Ap
   [ -n "$out" ] && { echo "== $f"; echo "$out"; }
   echo "$out" | grep -q "error" && fail=1
 done
+sh tools/cubemx_guard.sh || fail=1
 [ $fail -eq 0 ] && echo "syncheck: OK (ошибок нет)" || echo "syncheck: ЕСТЬ ОШИБКИ"
 exit $fail

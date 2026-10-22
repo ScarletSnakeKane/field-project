@@ -496,8 +496,28 @@ class LogFormat(unittest.TestCase):
         self.assertEqual(got, {n: (lo, w) for n, lo, w in log_image.MEAS_BITS})
 
     def test_crc(self):
-        # LogRecord_Crc32 — CRC32 IEEE с отражением (0xEDB88320), как у zip.
-        self.assertIn("0xEDB88320UL", self.h)
+        # LogRecord_Crc32 — CRC32 IEEE с отражением (0xEDB88320), как у zip,
+        # по полубайтам (П5б+). Без gcc его не вызвать, поэтому сверяем сам
+        # текст функции: таблица — ровно полубайтовая таблица этого полинома,
+        # начальное значение и финальная инверсия — как у zip. Разбор образа
+        # считает CRC через zlib, и это сходится, только если всё три верно.
+        m = re.search(r"uint32_t\s+LogRecord_Crc32\s*\([^)]*\)\s*\{(.*?)\n\}", self.h, re.S)
+        self.assertIsNotNone(m, "не найден LogRecord_Crc32 в log_record.h")
+        body = m.group(1)
+        t = re.search(r"t\[16\]\s*=\s*\{([^}]*)\}", body)
+        self.assertIsNotNone(t, "таблица t[16] в LogRecord_Crc32 не найдена")
+        got = [int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{8})UL", t.group(1))]
+        want = []
+        for n in range(16):
+            c = n
+            for _ in range(4):
+                c = (c >> 1) ^ (0xEDB88320 if c & 1 else 0)
+            want.append(c)
+        self.assertEqual(got, want, "таблица CRC в прошивке не та, что у zip")
+        self.assertRegex(body, r"c\s*=\s*0xFFFFFFFFUL", "начальное значение CRC не 0xFFFFFFFF")
+        self.assertRegex(body, r"return\s+~c\s*;", "нет финальной инверсии CRC")
+        self.assertEqual(len(re.findall(r"c\s*=\s*\(c\s*>>\s*4\)\s*\^\s*t\[c\s*&\s*15U?\]", body)), 2,
+                         "на байт должно быть два шага по полубайту")
         self.assertEqual(log_image.crc32(b"123456789"), 0xCBF43926)
 
 

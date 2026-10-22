@@ -65,7 +65,9 @@ build_quiet() {
 }
 
 case "${1:-build}" in
-  build)   build_quiet ;;
+  # Сначала сторож правок, которые CubeMX затирает при перегенерации: иначе
+  # прошивка с откатившимися находками A3/A5/V1 соберётся и уйдёт на плату.
+  build)   sh "$ROOT/tools/cubemx_guard.sh" && build_quiet ;;
   rebuild) make -C "$ROOT/Debug" clean >/dev/null && build_quiet ;;
   size)    "$GCC_BIN/arm-none-eabi-size.exe" "$ELF" ;;
   connect) prog_retry "Device ID" -c port=SWD mode=UR | grep -Ei "Device ID|Revision|CPU" ;;

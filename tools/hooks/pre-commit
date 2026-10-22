@@ -18,4 +18,9 @@ if [ -n "$bad" ]; then
     echo "Уберите его: python tools/dump_patch.py --revert  (или git checkout -- <файл>)" >&2
     exit 1
 fi
+# Правки вне USER CODE, которые CubeMX затирает при перегенерации (A3, A5, V1).
+sh tools/cubemx_guard.sh >&2 || {
+    echo "pre-commit: похоже, проект перегенерирован CubeMX — верните правки выше" >&2
+    exit 1
+}
 exit 0
