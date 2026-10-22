@@ -17,8 +17,11 @@
 #include "battery_curve.h"
 #include "ds18b20_decode.h"
 #include "power_policy.h"
+#include "sensor_policy.h"
 #include "soil_curve.h"
 #include "storage_policy.h"
+
+#define BTN_TEST_POLL_MS 100U   /* шаг опроса кнопки в прошивке */
 
 static int checks = 0, failures = 0;
 
@@ -258,57 +261,222 @@ static void test_soil(void)
     ok(isnan(Soil_VoltageToMoisture(3.01f)), "3.01 В — за верхним краем окна, NAN");
 }
 
-/* --------------------------------------------- стирание архива при старте */
-
-static void test_wipe_policy(void)
-{
-    puts("Стирание архива");
-
-    /* Жест как задуман: кнопку держат, сброс не программный. */
-    equ(Policy_ShouldWipeArchive(1, 0), 1, "KEY зажата при сбросе кнопкой — стираем");
-
-    /* Та самая ошибка, ради которой правило усложнилось. Чтобы прошить спящую
-     * плату, KEY приходится держать, а программатор в конце делает программный
-     * сброс. Без учёта источника сброса каждое обновление прошивки уносило бы
-     * весь накопленный архив — молча и необратимо. */
-    equ(Policy_ShouldWipeArchive(1, 1), 0,
-        "KEY зажата, но сброс программный (прошивка) — архив цел");
-
-    equ(Policy_ShouldWipeArchive(0, 0), 0, "кнопку не держат — не стираем");
-    equ(Policy_ShouldWipeArchive(0, 1), 0, "ни кнопки, ни повода — не стираем");
-}
-
 /* ------------------------------------------------------- уход в STOP */
+
+/* Счётчик для Policy_CounterMoves: значение 0, начиная с чтения at — 1. */
+typedef struct { uint32_t at; uint32_t calls; } Fake_Counter;
+
+static uint32_t Fake_CounterRead(void *ctx)
+{
+    Fake_Counter *c = (Fake_Counter *)ctx;
+    uint32_t v = (c->at != 0U && c->calls >= c->at) ? 1U : 0U;
+    c->calls++;
+    return v;
+}
 
 static void test_sleep_policy(void)
 {
     const uint32_t MAX = 300000U;   /* тот же потолок, что и в прошивке: 5 минут */
+    Policy_Button b = {0};
 
-    puts("Уход в сон");
+    puts("Уход в сон: кнопка");
 
-    equ(Policy_MayEnterSleep(0, 0, 0, MAX), 1, "ничего не держит — спим");
-
-    equ(Policy_MayEnterSleep(1, 0, 0, MAX),       0, "кнопку зажали — не спим");
-    equ(Policy_MayEnterSleep(1, 0, MAX - 1, MAX), 0, "кнопка зажата, потолок не достигнут");
+    equ(Policy_ButtonKeepsAwake(&b, 0, 0, MAX), 0, "кнопку не держат — спать можно");
+    equ(Policy_ButtonKeepsAwake(&b, 1, 0, MAX), 1, "кнопку зажали — не спим");
+    equ(Policy_ButtonKeepsAwake(&b, 1, MAX - 1, MAX), 1, "потолок не достигнут — не спим");
 
     /* Потолок нужен на случай залипшей или залитой водой кнопки: без него
      * прибор не уснул бы никогда и высадил бы батарею за несколько дней. */
-    equ(Policy_MayEnterSleep(1, 0, MAX, MAX),     1, "кнопка залипла — потолок сработал");
-    equ(Policy_MayEnterSleep(1, 0, MAX + 1, MAX), 1, "потолок перейдён — спим");
+    equ(Policy_ButtonKeepsAwake(&b, 1, 1, MAX), 0, "кнопка залипла — потолок сработал");
+    equ(b.stuck, 1, "залипание запомнено");
 
-    /* А вот на USB потолок не распространяется, и это не оговорка: пока кабель
-     * воткнут, плата питается от хоста, бодрствование батарею не расходует,
-     * а уход в STOP оборвал бы чтение и оставил хосту недочитанный файл. */
-    equ(Policy_MayEnterSleep(0, 1, 0, MAX),           0, "USB воткнут — не спим");
-    equ(Policy_MayEnterSleep(0, 1, MAX * 10, MAX),    0, "USB воткнут давно — всё равно не спим");
-    equ(Policy_MayEnterSleep(1, 1, MAX * 10, MAX),    0, "USB важнее потолка по кнопке");
+    /* Ради этого правило и переписано (A1). Раньше потолок отсчитывался
+     * заново в каждом цикле удержания, и залипшая кнопка держала плату по
+     * 5 минут КАЖДЫЙ час. Новый цикл начинается с dt = 0 — проверяем, что
+     * ни в одном следующем цикле она больше не держит. */
+    for (int cycle = 0; cycle < 24; cycle++)
+    {
+        uint8_t awake = Policy_ButtonKeepsAwake(&b, 1, 0, MAX);
+        awake |= Policy_ButtonKeepsAwake(&b, 1, BTN_TEST_POLL_MS, MAX);
+        if (awake) { ok(0, "залипшая кнопка снова держит в следующем цикле"); break; }
+    }
+    equ(b.stuck, 1, "сутки циклов — кнопка всё ещё признана залипшей");
 
-    /* Отпустили кнопку и выдернули кабель — прибор обязан уснуть сразу,
-     * не дожидаясь никаких таймеров. */
-    equ(Policy_MayEnterSleep(0, 0, MAX * 10, MAX), 1, "всё отпущено — спим немедленно");
+    /* Отпустили — следующее нажатие снова честное, с полным потолком. */
+    equ(Policy_ButtonKeepsAwake(&b, 0, 0, MAX), 0, "отпустили — спим");
+    equ(b.stuck, 0, "отпускание снимает залипание");
+    equ(b.held_ms, 0, "отпускание обнуляет счёт удержания");
+    equ(Policy_ButtonKeepsAwake(&b, 1, 0, MAX), 1, "после отпускания нажатие снова держит");
+
+    /* Удержание копится через циклы: две половины потолка в разных циклах —
+     * это один потолок, а не два. */
+    Policy_Button c = {0};
+    Policy_ButtonKeepsAwake(&c, 1, 0, MAX);
+    equ(Policy_ButtonKeepsAwake(&c, 1, MAX / 2, MAX), 1, "половина потолка — ещё держит");
+    Policy_ButtonKeepsAwake(&c, 1, 0, MAX);   /* следующий цикл, dt = 0 */
+    equ(Policy_ButtonKeepsAwake(&c, 1, MAX / 2, MAX), 0, "вторая половина в другом цикле — потолок");
+
+    /* Огромный dt не переполняет счёт и не «обнуляет» его. */
+    Policy_Button d = {0};
+    Policy_ButtonKeepsAwake(&d, 1, MAX - 10, MAX);
+    equ(Policy_ButtonKeepsAwake(&d, 1, 0xFFFFFFF0U, MAX), 0, "dt у края uint32 — потолок, не переполнение");
 
     /* Потолок задаётся снаружи; нулевой означает «не ждать вовсе». */
-    equ(Policy_MayEnterSleep(1, 0, 0, 0), 1, "нулевой потолок не заставляет ждать");
+    Policy_Button z = {0};
+    equ(Policy_ButtonKeepsAwake(&z, 1, 0, 0), 0, "нулевой потолок не заставляет ждать");
+}
+
+static void test_usb_policy(void)
+{
+    const uint32_t ENUM = 10000U;   /* USB_ENUM_MAX_MS в прошивке */
+    Policy_Usb u = {0};
+
+    puts("Уход в сон: USB");
+
+    equ(Policy_UsbKeepsAwake(&u, 0, 0, 0, 0, ENUM), 0, "VBUS нет — USB не держит");
+
+    /* Хост перечислил — держим сколько угодно: плата питается от него, а
+     * уход в STOP оборвал бы чтение. */
+    equ(Policy_UsbKeepsAwake(&u, 1, 1, 1, 0, ENUM), 1, "хост перечислил — не спим");
+    equ(Policy_UsbKeepsAwake(&u, 1, 1, 0, ENUM * 100, ENUM), 1, "сессия длинная — всё равно не спим");
+
+    /* VBUS без хоста (A9): зарядка, пауэрбанк, влага на делителе. Ждём
+     * перечисления не дольше потолка и уходим спать. */
+    Policy_Usb c = {0};
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 1, 0, ENUM), 1, "VBUS появился — ждём хоста");
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, ENUM - 1, ENUM), 1, "хоста ещё нет, потолок не достигнут");
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 1, ENUM), 0, "хоста нет 10 с — это зарядка, спим");
+
+    /* Следующие пробуждения с тем же VBUS — сразу спать, без новых 10 с:
+     * на ложном VBUS каждое такое ожидание стоило бы батарее. */
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 0, ENUM), 0, "зарядка и в следующем цикле — спим сразу");
+
+    /* Вставили кабель заново (фронт VBUS) — у нового хоста свой шанс. */
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 1, 0, ENUM), 1, "фронт VBUS — снова ждём хоста");
+    Policy_UsbKeepsAwake(&c, 1, 0, 0, ENUM, ENUM);
+    equ(Policy_UsbKeepsAwake(&c, 0, 0, 0, 0, ENUM), 0, "кабель вынули — спим");
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 0, ENUM), 1, "VBUS пропадал — прошлая неудача не в счёт");
+
+    /* Хост ушёл в сон (SUSPENDED, не CONFIGURED) — отсчёт идёт заново. */
+    Policy_Usb h = {0};
+    Policy_UsbKeepsAwake(&h, 1, 0, 1, 0, ENUM);
+    Policy_UsbKeepsAwake(&h, 1, 0, 0, ENUM - 2, ENUM);   /* перечислился в последний миг */
+    Policy_UsbKeepsAwake(&h, 1, 1, 0, 1, ENUM);
+    equ(Policy_UsbKeepsAwake(&h, 1, 0, 0, ENUM - 1, ENUM), 1, "хост уснул — ещё ждём");
+    equ(Policy_UsbKeepsAwake(&h, 1, 0, 0, 1, ENUM), 0, "хост спит дольше потолка — спим и мы");
+
+    /* Замер по расписанию, пока плата держится на шине (C8). */
+    equ(Policy_MeasureDue(3599999U, 3600000U), 0, "интервал не прошёл — замера нет");
+    equ(Policy_MeasureDue(3600000U, 3600000U), 1, "прошёл интервал — замер, не засыпая");
+}
+
+static void test_watchdog_policy(void)
+{
+    puts("Сторож и причина сброса");
+
+    /* Час сна кусками по 15 с: ровно 240 кусков, в сумме ровно час —
+     * пинки сторожу не сдвигают расписание замеров. */
+    uint32_t left = 3600U, n = 0U, longest = 0U;
+    while (left > 0U && n < 10000U)
+    {
+        uint32_t c = Policy_SleepChunkSec(left, 15U);
+        if (c == 0U) break;
+        if (c > longest) longest = c;
+        left -= c; n++;
+    }
+    equ(n, 240U, "3600 с по 15 с — 240 кусков");
+    equ(left, 0U, "куски складываются ровно в интервал");
+    equ(longest, 15U, "ни один кусок не длиннее шага сторожа");
+
+    /* Интервал, не кратный шагу: последний кусок — остаток. */
+    equ(Policy_SleepChunkSec(37U, 15U), 15U, "37 с: первый кусок 15");
+    equ(Policy_SleepChunkSec(7U, 15U), 7U, "остаток 7 с — кусок 7, а не 15");
+    equ(Policy_SleepChunkSec(15U, 15U), 15U, "ровно шаг — один кусок");
+    equ(Policy_SleepChunkSec(0U, 15U), 0U, "спать нечего — 0");
+
+    /* S1: RTC от остановившегося LSE. Счётчик меняется на чтении номер at
+     * (с нуля), at = 0 — не меняется никогда. */
+    puts("Идёт ли RTC (остановка LSE)");
+    {
+        Fake_Counter c;
+        c = (Fake_Counter){0, 0};
+        equ(Policy_CounterMoves(Fake_CounterRead, &c, 100U), 0, "кварц встал — SSR стоит, откат на LSI");
+        equ(c.calls, 100U, "стоящий счётчик опрошен все 100 раз, не меньше");
+        c = (Fake_Counter){1, 0};
+        equ(Policy_CounterMoves(Fake_CounterRead, &c, 100U), 1, "SSR сменился сразу — RTC идёт");
+        c = (Fake_Counter){99, 0};
+        equ(Policy_CounterMoves(Fake_CounterRead, &c, 100U), 1, "SSR сменился на последнем чтении — идёт");
+        c = (Fake_Counter){100, 0};
+        equ(Policy_CounterMoves(Fake_CounterRead, &c, 100U), 0, "сменился бы только за окном — не идёт");
+    }
+
+    /* Флаги RCC_CSR после подачи питания на F401: POR + PIN + BOR. */
+    const uint32_t POR = POLICY_CSR_PORRSTF | POLICY_CSR_PINRSTF | POLICY_CSR_BORRSTF;
+    equ(Policy_ResetCause(POR, 0), 7U, "подача питания — POR|PIN|BOR");
+    equ(Policy_ResetCause(POLICY_CSR_PINRSTF, 0), 2U, "кнопка RESET — PIN");
+    equ(Policy_ResetCause(POLICY_CSR_IWDGRSTF | POLICY_CSR_PINRSTF, 0), 18U, "сторож — IWDG (и PIN)");
+    equ(Policy_ResetCause(POLICY_CSR_LPWRRSTF | POLICY_CSR_WWDGRSTF, 0), 96U, "WWDG и LPWR — свои биты");
+
+    /* HardFault: обработчик оставил код и сбросил программно. */
+    equ(Policy_ResetCause(POLICY_CSR_SFTRSTF | POLICY_CSR_PINRSTF,
+                          POLICY_FAULT_MAGIC | POLICY_FAULT_HARD),
+        8U | 2U | (POLICY_FAULT_HARD << 8), "HardFault — SFT и код 1 в старшем байте");
+
+    /* Error_Handler сбрасывает сторожем — его код тоже засчитывается. */
+    equ(Policy_ResetCause(POLICY_CSR_IWDGRSTF, POLICY_FAULT_MAGIC | POLICY_FAULT_ERROR),
+        16U | (POLICY_FAULT_ERROR << 8), "Error_Handler — IWDG и код 6");
+
+    /* Код от прошлого раза при сбросе питанием — не причина этого старта. */
+    equ(Policy_ResetCause(POR, POLICY_FAULT_MAGIC | POLICY_FAULT_HARD), 7U,
+        "старый код сбоя при подаче питания не засчитывается");
+
+    /* Без метки — мусор или ноль backup-домена. */
+    equ(Policy_ResetCause(POLICY_CSR_SFTRSTF, 0x00000001U), 8U, "код без метки — не код");
+    equ(Policy_ResetCause(POLICY_CSR_SFTRSTF, POLICY_FAULT_MAGIC | 0x1234U), 8U,
+        "код вне диапазона — не код");
+}
+
+/* Прогон одного цикла карантина так, как это делает main.c. */
+static uint8_t quarantine_cycle(Policy_Quarantine *q, uint8_t rail_dead, uint32_t skip)
+{
+    uint8_t powered = Policy_SensorsPowerAllowed(q);
+    Policy_QuarantineUpdate(q, powered, powered && rail_dead, skip);
+    return powered;
+}
+
+static void test_quarantine_policy(void)
+{
+    const uint32_t SKIP = 6U;   /* 6 часов при часовом интервале */
+    Policy_Quarantine q = {0};
+
+    puts("Карантин питания датчиков");
+
+    equ(quarantine_cycle(&q, 1, SKIP), 1, "1-й отказ — питание подаём");
+    equ(quarantine_cycle(&q, 1, SKIP), 1, "2-й отказ — подаём");
+    equ(quarantine_cycle(&q, 1, SKIP), 1, "3-й отказ — подаём, но это последний");
+
+    /* Дальше SKIP циклов без питания — и ровно SKIP, не больше и не меньше. */
+    unsigned off = 0;
+    while (!Policy_SensorsPowerAllowed(&q) && off < 100U) { quarantine_cycle(&q, 1, SKIP); off++; }
+    equ(off, SKIP, "карантин длится ровно SKIP циклов");
+
+    /* Пробная попытка не удалась — сразу обратно в карантин, без двух
+     * лишних циклов на полном токе. */
+    equ(quarantine_cycle(&q, 1, SKIP), 1, "после карантина — одна попытка");
+    equ(Policy_SensorsPowerAllowed(&q), 0, "попытка не удалась — снова карантин");
+
+    /* Отработали карантин, попытка удалась — всё по-старому: следующий
+     * одиночный отказ карантина не вызывает. */
+    for (unsigned i = 0; i < SKIP; i++) quarantine_cycle(&q, 1, SKIP);
+    equ(quarantine_cycle(&q, 0, SKIP), 1, "рельса ожила — питание есть");
+    equ(quarantine_cycle(&q, 1, SKIP), 1, "одиночный отказ после выздоровления — питание есть");
+    equ(Policy_SensorsPowerAllowed(&q), 1, "одиночный отказ карантина не включает");
+
+    /* Отказы не подряд — не карантин. */
+    Policy_Quarantine r = {0};
+    for (unsigned i = 0; i < 20U; i++)
+        quarantine_cycle(&r, (i % 3U) != 2U, SKIP);   /* два отказа, успех, два отказа… */
+    equ(Policy_SensorsPowerAllowed(&r), 1, "два отказа и успех вперемешку — карантина нет");
 }
 
 /* ----------------------------------------------------------------- AHT20 */
@@ -548,6 +716,64 @@ static void test_storage_policy(void)
     equ(Storage_MscMayAccess(1, 1), 0, "занята основным потоком — хосту «не готов»");
     equ(Storage_MscMayAccess(0, 0), 0, "не инициализирована — из прерывания не будим");
 
+    /* S2: физически свободное место. Геометрия нашего f_mkfs: том с LBA 63
+     * на 8129 секторов, кластер 1 сектор, область данных с сектора 128,
+     * 8064 кластера; физически есть (4096 - 128) = 3968. */
+    puts("Место на физической флеш (S2)");
+    {
+        const uint32_t NF = 8064U + 2U, DB = 128U, PHYS = 4096U, ABSENT = 8064U - 3968U;
+        equ(Storage_PhysFreeClusters(8064U, NF, DB, 1U, PHYS), 3968U, "пустой том — свободна вся физическая флеш");
+        equ(Storage_PhysFreeClusters(8064U - 2930U, NF, DB, 1U, PHYS), 3968U - 2930U,
+            "data_1.txt на 1.5 МБ — его место вычтено из физических");
+        equ(Storage_PhysFreeClusters(ABSENT + 1U, NF, DB, 1U, PHYS), 1U, "на флеш остался один кластер");
+        equ(Storage_PhysFreeClusters(ABSENT, NF, DB, 1U, PHYS), 0U, "свободны только несуществующие — 0");
+        equ(Storage_PhysFreeClusters(ABSENT - 1U, NF, DB, 1U, PHYS), 0U,
+            "занят и несуществующий кластер — 0, а не переполнение");
+        equ(Storage_PhysFreeClusters(2016U, 2016U + 2U, DB, 4U, PHYS), 992U, "кластер 4 сектора — граница в кластерах");
+        equ(Storage_PhysFreeClusters(100U, 100U + 2U, DB, 1U, PHYS), 100U, "том меньше флеш — считает FatFs");
+        equ(Storage_PhysFreeClusters(8064U, NF, DB, 0U, PHYS), 0U, "битый csize — места нет");
+        equ(Storage_PhysFreeClusters(8064U, NF, PHYS + 1U, 1U, PHYS), 0U, "область данных за флеш — места нет");
+
+        const uint32_t MAX = 1800000U;   /* CSV_MAX_BYTES из main.c */
+        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_RESERVE + 1U, 0), STORAGE_ROOM_OK, "место есть — пишем");
+        equ(Storage_ArchiveRoom(MAX - 1U, MAX, 3000U, 0), STORAGE_ROOM_OK, "предел не достигнут — пишем");
+        equ(Storage_ArchiveRoom(MAX, MAX, 3000U, 0), STORAGE_ROOM_MARK, "предел размера — одна строка-отметка");
+        equ(Storage_ArchiveRoom(MAX, MAX, 3000U, 1), STORAGE_ROOM_FULL, "отметка уже есть — не пишем");
+        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_RESERVE, 0), STORAGE_ROOM_MARK,
+            "флеш дошла до запаса — отметка, хотя data.txt мал");
+        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_RESERVE, 1), STORAGE_ROOM_FULL, "в запасе и отмечено — не пишем");
+        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_HARD, 0), STORAGE_ROOM_MARK, "последние кластеры — ещё отметка");
+        equ(Storage_ArchiveRoom(1000U, MAX, STORAGE_ROOM_HARD - 1U, 0), STORAGE_ROOM_FULL,
+            "меньше жёсткого запаса — не пишем ничего, даже отметку");
+
+        /* Сценарий разбора S2: data_1.txt на 1.5 МБ, новый data.txt растёт по
+         * 150 Б раз в час, с перезапуском каждые 10 циклов (отметка — одна на
+         * старт). Ни один кластер нового файла не должен лечь за физической
+         * границей, а отметка — появиться. */
+        uint32_t old = 2930U, size = 0U, marks = 0U, written = 0U, worst_over = 0U;
+        uint8_t marked = 0;
+        for (uint32_t cycle = 0; cycle < 20000U; cycle++)
+        {
+            if (cycle % 10U == 0U)
+                marked = 0;
+            uint32_t used = old + (size + 511U) / 512U;
+            uint8_t room = Storage_ArchiveRoom(size, MAX,
+                                               Storage_PhysFreeClusters(8064U - used, NF, DB, 1U, PHYS),
+                                               marked);
+            if (room == STORAGE_ROOM_FULL)
+                continue;
+            if (room == STORAGE_ROOM_MARK) { marked = 1; marks++; }
+            size += 150U;
+            written++;
+            used = old + (size + 511U) / 512U;
+            if (used > 3968U && used - 3968U > worst_over)
+                worst_over = used - 3968U;
+        }
+        equ(worst_over, 0U, "ни одного кластера за физической границей");
+        ok(marks > 0U, "заполнение отмечено в архиве");
+        ok(written > 2000U && size < 600000U, "data.txt дорос почти до края флеш, а не до CSV_MAX_BYTES");
+    }
+
     /* Питание. Порог VDD 2.9 В и признак bat.low. */
     equ(Storage_MayWrite(1, 0, 3.20f), 1, "нормальное питание — пишем");
     equ(Storage_MayWrite(1, 1, 3.20f), 0, "банка ниже порога LDO — не пишем");
@@ -587,15 +813,285 @@ static void test_storage_policy(void)
     }
 }
 
+/* Загрузочные сектора и MBR, которые кладёт настоящий f_mkfs этого FatFs:
+ * собран на хосте с RAM-диском на 8192 сектора, параметры как в main.c
+ * (FM_FAT, кластер 512 Б) и как у старых прошивок (кластер 1 КБ, FAT12).
+ * Первые 64 байта сектора; остальное до сигнатуры — нули. Записи разделов
+ * взяты из того же прогона, а не посчитаны этим кодом. */
+static const unsigned char MKFS_BOOT16[64] = {
+    0xEB,0xFE,0x90,0x4D,0x53,0x44,0x4F,0x53,0x35,0x2E,0x30,0x00,0x02,0x01,0x01,0x00,
+    0x01,0x00,0x02,0xC1,0x1F,0xF8,0x20,0x00,0x3F,0x00,0xFF,0x00,0x3F,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x80,0x00,0x29,0x00,0x00,0x00,0x00,0x4E,0x4F,0x20,0x4E,0x41,
+    0x4D,0x45,0x20,0x20,0x20,0x20,0x46,0x41,0x54,0x20,0x20,0x20,0x20,0x20,0x00,0x00};
+static const unsigned char MKFS_PTE16[16] = {
+    0x00,0x01,0x01,0x00,0x04,0xFE,0x3F,0x00,0x3F,0x00,0x00,0x00,0xC1,0x1F,0x00,0x00};
+static const unsigned char MKFS_BOOT12[64] = {
+    0xEB,0xFE,0x90,0x4D,0x53,0x44,0x4F,0x53,0x35,0x2E,0x30,0x00,0x02,0x02,0x01,0x00,
+    0x01,0x00,0x02,0xC1,0x1F,0xF8,0x10,0x00,0x3F,0x00,0xFF,0x00,0x3F,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x80,0x00,0x29,0x00,0x00,0x00,0x00,0x4E,0x4F,0x20,0x4E,0x41,
+    0x4D,0x45,0x20,0x20,0x20,0x20,0x46,0x41,0x54,0x20,0x20,0x20,0x20,0x20,0x00,0x00};
+static const unsigned char MKFS_PTE12[16] = {
+    0x00,0x01,0x01,0x00,0x01,0xFE,0x3F,0x00,0x3F,0x00,0x00,0x00,0xC1,0x1F,0x00,0x00};
+
+static void mkfs_sector(unsigned char *sec, const unsigned char *first64)
+{
+    memset(sec, 0, 512);
+    memcpy(sec, first64, 64);
+    sec[510] = 0x55; sec[511] = 0xAA;
+}
+
+static void test_mbr_restore(void)
+{
+    unsigned char boot[512], mbr[512], built[512], want[512];
+
+    puts("Восстановление MBR");
+
+    mkfs_sector(boot, MKFS_BOOT16);
+    memset(mbr, 0xFF, sizeof(mbr));
+
+    /* Прерванная правка байта типа на томе с архивом: MBR стёрт, наш
+     * загрузочный сектор жив. Восстанавливать. */
+    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 8192), 1, "MBR стёрт, загрузочный наш — восстанавливаем");
+
+    /* Восстановленный MBR — байт в байт как от f_mkfs, кроме типа: 0x0E, как
+     * его оставляет прошивка для FAT16 (Android). */
+    Storage_BuildMbr(boot, built);
+    memset(want, 0, sizeof(want));
+    memcpy(want + 446, MKFS_PTE16, 16);
+    want[446 + 4] = 0x0E;
+    want[510] = 0x55; want[511] = 0xAA;
+    ok(memcmp(built, want, 512) == 0, "FAT16: MBR совпал с f_mkfs (тип 0x0E)");
+
+    /* Старый FAT12 (кластер 1 КБ) — тип 0x01, ровно как у f_mkfs: 0x0E для
+     * него был бы ложью. */
+    mkfs_sector(boot, MKFS_BOOT12);
+    Storage_BuildMbr(boot, built);
+    memset(want, 0, sizeof(want));
+    memcpy(want + 446, MKFS_PTE12, 16);
+    want[510] = 0x55; want[511] = 0xAA;
+    ok(memcmp(built, want, 512) == 0, "FAT12: MBR совпал с f_mkfs (тип 0x01)");
+
+    /* Граница FAT12/FAT16 — как у FatFs при монтировании: 4085 кластеров —
+     * ещё FAT12, 4086 — уже FAT16. Служебных секторов у FAT16-образа 65. */
+    mkfs_sector(boot, MKFS_BOOT16);
+    boot[19] = (unsigned char)((65 + 4085) & 0xFF); boot[20] = (unsigned char)((65 + 4085) >> 8);
+    Storage_BuildMbr(boot, built);
+    equ(built[446 + 4], 0x01, "4085 кластеров — FAT12");
+    boot[19] = (unsigned char)((65 + 4086) & 0xFF); boot[20] = (unsigned char)((65 + 4086) >> 8);
+    Storage_BuildMbr(boot, built);
+    equ(built[446 + 4], 0x0E, "4086 кластеров — FAT16");
+
+    /* Чего не трогаем. */
+    mkfs_sector(boot, MKFS_BOOT16);
+    equ(Storage_MayRestoreMbr(0, 1, mbr, boot, 8192), 0, "том смонтировался — MBR не трогаем");
+    equ(Storage_MayRestoreMbr(1, 0, mbr, boot, 8192), 0, "чтение сорвалось — не решаем");
+
+    mbr[0] = 0x00;
+    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 8192), 0, "в MBR что-то лежит — не наш случай");
+    memset(mbr, 0xFF, sizeof(mbr));
+
+    unsigned char alien[512];
+    memcpy(alien, boot, 512);
+    alien[3] = 'X';   /* чужой OEM */
+    equ(Storage_MayRestoreMbr(1, 1, mbr, alien, 8192), 0, "загрузочный сектор чужой — не трогаем");
+
+    /* Том не помещается на диск (BPB битый) — по догадке не пишем. */
+    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 8191), 0, "том с LBA 63 не влезает в диск — нет");
+    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 63 + 8129), 1, "том ровно до конца диска — да");
+    memcpy(alien, boot, 512);
+    alien[19] = 0; alien[20] = 0;   /* TotSec16 = 0 и TotSec32 = 0 */
+    equ(Storage_MayRestoreMbr(1, 1, mbr, alien, 8192), 0, "размер тома ноль — нет");
+    alien[32] = 0xC1; alien[33] = 0x1F;   /* размер в 32-битном поле */
+    equ(Storage_BootTotalSectors(alien), 8129, "размер берётся и из 32-битного поля BPB");
+}
+
+/* Тестовый «том»: занятые имена — списком. */
+struct names { const char *taken[8]; int n; int calls; };
+
+static uint8_t names_taken(const char *name, void *ctx)
+{
+    struct names *t = (struct names *)ctx;
+    t->calls++;
+    for (int i = 0; i < t->n; i++)
+        if (strcmp(t->taken[i], name) == 0)
+            return 1;
+    return 0;
+}
+
+static uint8_t all_taken(const char *name, void *ctx)
+{
+    (void)name; (void)ctx;
+    return 1;
+}
+
+/* Том отвечает ошибкой на втором вопросе. */
+static uint8_t error_on_2(const char *name, void *ctx)
+{
+    int *calls = (int *)ctx;
+    (*calls)++;
+    if (strcmp(name, "data_2.txt") == 0) return STORAGE_NAME_ERROR;
+    return STORAGE_NAME_TAKEN;
+}
+
+static void test_archive_rename(void)
+{
+    const char *H = "timestamp,air_temp,write_fails";
+    char out[13];
+
+    puts("Старый архив при смене заголовка");
+
+    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails\n", H), STORAGE_HDR_KEEP,
+        "заголовок совпал — дописываем");
+    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails", H), STORAGE_HDR_KEEP,
+        "совпал и без перевода строки (последняя строка файла)");
+
+    /* Залита прошивка с новой колонкой — старый архив переименовать, не стирать. */
+    equ(Storage_HeaderAction(1, "timestamp,air_temp\n", H), STORAGE_HDR_RENAME,
+        "старый заголовок короче — переименовать");
+
+    /* Обратный случай: заголовок более новой прошивки начинается с нашего.
+     * Сравнение по префиксу (как было) смешало бы два формата в одном файле. */
+    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails,extra\n", H), STORAGE_HDR_RENAME,
+        "заголовок длиннее нашего — тоже другой формат");
+
+    /* Сорванное чтение (или пустой файл) — не «другой заголовок» (A11):
+     * раньше оно стирало архив. */
+    equ(Storage_HeaderAction(0, "", H), STORAGE_HDR_KEEP, "f_gets не прочёл строку — файл не трогаем");
+
+    /* Файл, записанный с \r\n и прочитанный без снятия \r, — тот же заголовок. */
+    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails\r\n", H), STORAGE_HDR_KEEP,
+        "CRLF после заголовка — совпал");
+
+    /* Имя: первое свободное data_N.txt, имена 8.3. */
+    struct names t = { { 0 }, 0, 0 };
+    equ(Storage_PickOldArchiveName(names_taken, &t, out), 1, "том чистый — data_1");
+    ok(strcmp(out, "data_1.txt") == 0, "имя data_1.txt");
+
+    struct names u = { { "data_1.txt", "data_2.txt", "data_4.txt" }, 3, 0 };
+    equ(Storage_PickOldArchiveName(names_taken, &u, out), 3, "1 и 2 заняты — data_3 (дыра раньше 4)");
+    ok(strcmp(out, "data_3.txt") == 0, "имя data_3.txt");
+
+    /* Ошибка тома — перебор прекращается сразу, а не 999 медленных f_stat. */
+    int calls = 0;
+    equ(Storage_PickOldArchiveName(error_on_2, &calls, out), 0, "ошибка тома — имени нет");
+    equ((unsigned)calls, 2, "после ошибки больше не спрашиваем");
+    ok(out[0] == '\0', "после ошибки имя пустое");
+
+    Storage_OldArchiveName(999, out);
+    ok(strcmp(out, "data_999.txt") == 0 && strlen(out) == 12, "data_999.txt — ещё 8.3 и влезает в 13 байт");
+    Storage_OldArchiveName(10, out);
+    ok(strcmp(out, "data_10.txt") == 0, "двузначный N без ведущих нулей");
+
+    /* Свободных имён нет — 0 и пустое имя: ничего не переименовываем и,
+     * главное, ничего не затираем. */
+    equ(Storage_PickOldArchiveName(all_taken, NULL, out), 0, "все 999 имён заняты — 0");
+    ok(out[0] == '\0', "имя пустое");
+}
+
+static void test_time_trust(void)
+{
+    const char *B = "2026-10-22 10:00:00";   /* время сборки */
+    char ts[20];
+
+    puts("Достоверность часов");
+
+    /* Обычный сброс — как было. */
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NONE, 1, 0, "", B), 1, "сброс, часы шли и им верили — верим");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NONE, 0, 1, "", B), 0, "сброс после недоверия — не верим и дальше");
+
+    /* Прошивка с компьютера при живом календаре. */
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NEW_BUILD, 0, 1, "2026-10-21 09:00:00", B), 1,
+        "новая сборка, календарь жив, архив раньше сборки — верим");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NEW_BUILD, 0, 0, "", B), 1,
+        "новая сборка, архив не прочитан — верим (календарь жив)");
+    /* Инкрементальная сборка со старым time_service.o: «новая» по отпечатку,
+     * а время сборки — месяцы назад. Архив уже ушёл дальше — не верим. */
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NEW_BUILD, 1, 1, "2027-01-01 00:00:00", B), 0,
+        "новая сборка старше архива (старый .o) — не верим");
+
+    /* Замена банки в поле (A6): календарь потерян, часы на времени сборки,
+     * а в архиве уже месяцы строк после неё. */
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_LOST, 1, 1, "2027-03-05 14:00:01", B), 0,
+        "календарь потерян, в архиве строки позже сборки — не верим");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_LOST, 1, 1, B, B), 0,
+        "последняя строка ровно во время сборки — тоже не верим");
+
+    /* Свежая прошивка на обесточенной плате: строки только от старых сборок. */
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_LOST, 0, 1, "2026-09-01 08:00:00", B), 1,
+        "архив кончается раньше сборки — свежая прошивка, верим");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_LOST, 0, 1, "", B), 1, "архив пуст — верим времени сборки");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_LOST, 1, 0, "", B), 0, "архив не прочитан — не верим");
+
+    /* Метка последней строки из хвоста файла. */
+    const char *t1 = "4.20,1,1,0,0,0,0\n2026-10-22 11:00:00,21.5,40.0\n2026-10-22 12:00:00,21.7,41.0\n";
+    equ(Storage_LastTimestamp(t1, (uint32_t)strlen(t1), 0, ts), 1, "метка последней строки нашлась");
+    ok(strcmp(ts, "2026-10-22 12:00:00") == 0, "это именно последняя строка");
+
+    /* Хвост оборван посреди последней строки — берём её начало, если метка целиком. */
+    const char *t2 = "x\n2026-10-22 11:00:00,21.5\n2026-10-22 12:0";
+    equ(Storage_LastTimestamp(t2, (uint32_t)strlen(t2), 0, ts), 1, "оборванная последняя — берём предыдущую");
+    ok(strcmp(ts, "2026-10-22 11:00:00") == 0, "метка предыдущей строки");
+
+    /* Файл из одного заголовка — строк нет. */
+    const char *t3 = "timestamp,air_temp,air_hum\n";
+    equ(Storage_LastTimestamp(t3, (uint32_t)strlen(t3), 1, ts), 0, "только заголовок — меток нет");
+    ok(ts[0] == '\0', "метка пустая");
+
+    /* Хвост с начала файла, где первая строка — уже данные (заголовка нет). */
+    const char *t4 = "2026-10-22 09:00:00,1,2";
+    equ(Storage_LastTimestamp(t4, (uint32_t)strlen(t4), 1, ts), 1, "с начала файла — первая строка в счёт");
+    equ(Storage_LastTimestamp(t4, (uint32_t)strlen(t4), 0, ts), 0, "не с начала — обрывок не в счёт");
+
+    /* Похоже, но не метка. */
+    const char *t5 = "\n2026-1O-22 12:00:00,1\n";   /* буква O вместо нуля */
+    equ(Storage_LastTimestamp(t5, (uint32_t)strlen(t5), 0, ts), 0, "буква вместо цифры — не метка");
+}
+
+static void test_bmp280(void)
+{
+    puts("BMP280 и сверка воздуха");
+
+    /* Пример из даташита BMP280 (3.12): dig_T1 = 27504, dig_T2 = 26435,
+     * dig_T3 = -1000, adc_T = 519888 -> 25.08 °C. Независимый эталон. */
+    eqf(Bmp280_CompensateT(519888, 27504, 26435, -1000), 25.08f, 0.001f, "пример даташита — 25.08 °C");
+    ok(Bmp280_CalibOk(27504, 26435, -1000), "калибровка из даташита пригодна");
+
+    /* Отказы, которые раньше превращались в правдоподобное число. */
+    ok(isnan(Bmp280_CompensateT(0x80000, 27504, 26435, -1000)), "отсчёт 0x80000 (замера не было) — NAN");
+    ok(isnan(Bmp280_CompensateT(0, 27504, 26435, -1000)), "нулевой отсчёт — NAN");
+    ok(isnan(Bmp280_CompensateT(0xFFFFF, 27504, 26435, -1000)), "отсчёт из единиц (шина в воздухе) — NAN");
+    ok(isnan(Bmp280_CompensateT(1000000, 27504, 26435, -1000)), "пересчёт вне −40..85 °C — NAN");
+    ok(!Bmp280_CalibOk(0, 0, 0), "нулевая калибровка — непригодна");
+    ok(!Bmp280_CalibOk(0xFFFF, -1, -1), "стёртая калибровка (0xFF) — непригодна");
+    ok(!Bmp280_CalibOk(27504, 0, -1000), "dig_T2 = 0 — непригодна");
+    ok(Bmp280_IdOk(0x58) && Bmp280_IdOk(0x60) && Bmp280_IdOk(0x56), "BMP280, BME280 и образцы — свои");
+    ok(!Bmp280_IdOk(0x00) && !Bmp280_IdOk(0xFF) && !Bmp280_IdOk(0x55), "0x00/0xFF/чужой ID — не датчик");
+
+    /* Правило сверки (порог 2.0 °C — обоснование в sensor_policy.h). */
+    equ(Sensor_AirCrossCheck(21.0f, 21.9f), SENSOR_XCHK_OK, "расхождение 0.9 °C — сошлись");
+    equ(Sensor_AirCrossCheck(21.0f, 23.0f), SENSOR_XCHK_OK, "ровно 2.0 °C — ещё сошлись");
+    equ(Sensor_AirCrossCheck(21.0f, 23.1f), SENSOR_XCHK_DIFF, "2.1 °C — расхождение");
+    equ(Sensor_AirCrossCheck(25.0f, 21.0f), SENSOR_XCHK_DIFF, "расхождение в другую сторону — тоже");
+    equ(Sensor_AirCrossCheck(21.0f, NAN), SENSOR_XCHK_NO_BMP, "BMP280 не ответил — сверки нет");
+    equ(Sensor_AirCrossCheck(NAN, 21.0f), SENSOR_XCHK_NO_AHT, "AHT20 nan — сверять нечего");
+    equ(Sensor_AirCrossCheck(NAN, NAN), SENSOR_XCHK_NO_AHT, "оба nan — сверять нечего");
+}
+
 int main(void)
 {
     test_ds18b20();
     test_battery();
     test_soil();
     test_aht20();
-    test_wipe_policy();
+    test_bmp280();
     test_sleep_policy();
+    test_usb_policy();
+    test_watchdog_policy();
+    test_quarantine_policy();
     test_storage_policy();
+    test_mbr_restore();
+    test_archive_rename();
+    test_time_trust();
 
     printf("\n%d проверок, %d провалов\n", checks, failures);
     return failures ? 1 : 0;

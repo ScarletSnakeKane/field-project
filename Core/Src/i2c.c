@@ -118,5 +118,61 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
 
 /* USER CODE BEGIN 1 */
 
+/* Полпериода SCL ~5–8 мкс на HSI 16 МГц: шина 100 кГц и медленнее, это
+ * любой ведомый примет. Циклом, без DWT и тика — ничего не требует. */
+static void I2C1_BusDelay(void)
+{
+  for (volatile uint32_t i = 0U; i < 20U; i++)
+  {
+  }
+}
+
+/* Ключ PB0 обесточивает датчики каждый час. Ведомый, потерявший питание
+ * или такт посреди байта, после включения может держать SDA в нуле,
+ * дожидаясь недостающих тактов; периферия I2C F4 такую шину видит занятой
+ * (BUSY) и сама не выходит — замеры воздуха пропадают до сброса. Стандартный
+ * выход (UM10204, 3.1.16): до девяти тактов SCL, пока ведомый не отпустит
+ * SDA, затем STOP — и шина снова в покое. */
+uint8_t I2C1_BusRecover(void)
+{
+  GPIO_InitTypeDef g = {0};
+
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
+  g.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+  g.Mode = GPIO_MODE_OUTPUT_OD;
+  g.Pull = GPIO_PULLUP;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &g);
+  I2C1_BusDelay();
+
+  if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_SET &&
+      HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8) == GPIO_PIN_SET)
+    return I2C_BUS_FREE;
+
+  for (uint8_t i = 0; i < 9U; i++)
+  {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+    I2C1_BusDelay();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+    I2C1_BusDelay();
+    if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_SET)
+      break;
+  }
+
+  /* STOP: SDA из нуля в единицу при высоком SCL. */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+  I2C1_BusDelay();
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
+  I2C1_BusDelay();
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+  I2C1_BusDelay();
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
+  I2C1_BusDelay();
+
+  return (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == GPIO_PIN_SET &&
+          HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8) == GPIO_PIN_SET) ? I2C_BUS_FREED : I2C_BUS_STUCK;
+}
+
 /* USER CODE END 1 */
 

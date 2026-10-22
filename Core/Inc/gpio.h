@@ -46,6 +46,13 @@ void MX_GPIO_SleepRestore(void);
 
 /* USER CODE BEGIN Prototypes */
 
+/* Залипшая KEY (A1): на время сна снять с PA0 подтяжку и EXTI, чтобы через
+ * замкнутый контакт не тёк ток весь час, и вернуть как было. После Restore
+ * уровень на выводе надо подождать (ButtonSettle), прежде чем читать. */
+void MX_GPIO_ButtonPark(void);
+void MX_GPIO_ButtonRestore(void);
+void MX_GPIO_ButtonSettle(void);
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

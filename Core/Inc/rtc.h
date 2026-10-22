@@ -62,6 +62,13 @@ void MX_RTC_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
+/* Завёлся ли часовой кварц при старте (A5). 0 — RTC тактируется от LSI:
+ * прибор живёт и пишет, но метки времени уплывают на десятки процентов. */
+uint8_t RTC_LseOk(void);
+
+/* Сработал ли таймер пробуждения с прошлого вызова; флаг снимается. */
+uint8_t RTC_TakeWakeup(void);
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

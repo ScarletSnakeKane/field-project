@@ -24,7 +24,8 @@ import re
 import statistics as st
 import sys
 
-# Расшифровка кодов ds_err живёт в одном месте — в summarize_data.py.
+# Расшифровка кодов (ds_err, air_xchk, i2c_rec, reset_cause) и списки
+# колонок-отказов живут в одном месте — в summarize_data.py.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import summarize_data  # noqa: E402
 
@@ -61,21 +62,30 @@ def volts_to_pct(v):
             return p0 + (p1 - p0) * (v - v0) / (v1 - v0)
     return CURVE[-1][1]
 
-ERROR_COLS = ("aht_init_st", "aht_read_st", "ds_err", "write_fails", "aht_i2c_err")
-FLAG_COLS = ("soil_valid", "lse_ok")
+ERROR_COLS = summarize_data.ERROR_COLS
+FLAG_COLS = summarize_data.FLAG_COLS
 
 
 def load(path, lo=None, hi=None):
+    """Строки окна. ts — метки; у строк с time_ok = 0 (часы откатились на
+    время сборки, A6) вместо метки None: отказы, диапазоны и старты по ним
+    считаются, а интервалы, «время назад» и разряд — нет. В окно --from/--to
+    такие строки не попадают: их место на оси времени неизвестно.
+    Пятый элемент — сколько строк с time_ok = 0 в файле."""
     raw = open(path, "rb").read()
     text = raw.decode("ascii", "replace").replace("\r\n", "\n").replace("\r", "\n")
     lines = [l for l in text.split("\n") if l.strip()]
     head = lines[0].split(",")
     rows = [l.split(",") for l in lines[1:] if len(l.split(",")) == len(head)]
     col = {n: [r[i] for r in rows] for i, n in enumerate(head)}
-    ts = [dt.datetime.strptime(x, "%Y-%m-%d %H:%M:%S") for x in col["timestamp"]]
-    keep = [i for i in range(len(ts))
-            if (lo is None or ts[i] >= lo) and (hi is None or ts[i] <= hi)]
-    return head, {n: [col[n][i] for i in keep] for n in head}, [ts[i] for i in keep], raw
+    bad_time = summarize_data.time_untrusted(col)
+    ts = [None if i in bad_time else dt.datetime.strptime(x, "%Y-%m-%d %H:%M:%S")
+          for i, x in enumerate(col["timestamp"])]
+    windowed = lo is not None or hi is not None
+    keep = [i for i in range(len(ts)) if not windowed or (ts[i] is not None and
+            (lo is None or ts[i] >= lo) and (hi is None or ts[i] <= hi))]
+    return (head, {n: [col[n][i] for i in keep] for n in head}, [ts[i] for i in keep], raw,
+            len(bad_time))
 
 
 # Значение DS18B20 по сбросу: преобразование не выполнилось, а не 85 °C почвы.
@@ -143,7 +153,7 @@ def days_left(pct_per_hour, pct_now):
     return pct_now / -pct_per_hour / 24.0
 
 
-def ranges(head, col, nrows, skip=()):
+def ranges(head, col, nrows, skip=summarize_data.NOT_RANGES):
     """Диапазоны колонок без nan и без заведомого мусора; nan считаются отдельно."""
     for n in head:
         if n == "timestamp" or n in skip:
@@ -171,30 +181,31 @@ def ranges(head, col, nrows, skip=()):
 
 
 def report(path, lo, hi):
-    head, col, ts, raw = load(path, lo, hi)
-    if not ts:
+    head, col, ts_all, raw, untrusted = load(path, lo, hi)
+    nrows = len(ts_all)
+    if not nrows:
         print("в заданном окне нет строк")
         return
-    print("%s: %d строк, %s .. %s" % (path, len(ts), ts[0], ts[-1]))
+    good = [i for i, t in enumerate(ts_all) if t is not None]
+    ts = [ts_all[i] for i in good]
+    if ts:
+        print("%s: %d строк, %s .. %s" % (path, nrows, ts[0], ts[-1]))
+    else:
+        print("%s: %d строк, ни одной с достоверной меткой" % (path, nrows))
+    if untrusted:
+        print("  строк с time_ok = 0 (часы откатились на время сборки): %d — в отказах и"
+              " диапазонах они есть, в интервалах и разряде нет" % (nrows - len(good)))
 
     if raw.count(b"\r") != raw.count(b"\n"):
         print("  !! CR (%d) != LF (%d) — двойной перевод строки"
               % (raw.count(b"\r"), raw.count(b"\n")))
 
-    bad = []
-    for n in ERROR_COLS:
-        if n in col:
-            k = sum(1 for v in col[n] if v.strip() not in ("0", "0x00", ""))
-            if k:
-                bad.append("%s != 0 в %d из %d" % (n, k, len(ts)))
-                if n == "ds_err":
-                    bad[-1] += " (%s)" % summarize_data.ds_err_detail(col[n])
-    for n in FLAG_COLS:
-        if n in col:
-            k = sum(1 for v in col[n] if v.strip() in ("0", ""))
-            if k:
-                bad.append("%s == 0 в %d из %d" % (n, k, len(ts)))
+    bad = summarize_data.failures(col, nrows)
     print("  отказы: " + ("; ".join(bad) if bad else "нет"))
+    st_ = summarize_data.starts(col)
+    if st_:
+        print("  стартов: %d (%s)" % (sum(st_.values()),
+              ", ".join("%s x%d" % (t, n) for t, n in st_.most_common())))
 
     # Значения, которые физически невозможны и означают мусор, а не измерение.
     for n, lim, why in (("air_temp", -40.0, "пустой кадр AHT20 даёт -50.00"),
@@ -209,7 +220,7 @@ def report(path, lo, hi):
             print("  !! soil_temp = 85.00 в %d строках (значение DS18B20 по сбросу:"
                   " преобразование не выполнилось) — в диапазон не входит" % k)
 
-    ranges(head, col, len(ts))
+    ranges(head, col, nrows)
 
     gaps = [(ts[i + 1] - ts[i]).total_seconds() for i in range(len(ts) - 1)]
     if gaps:
@@ -219,15 +230,24 @@ def report(path, lo, hi):
         if back:
             print("  время шло назад %d раз (след перепрошивки: часы встают на время сборки)" % back)
 
-    if "vbat" in col:
+    vb = num(col, "vbat")
+    vb = [vb[i] for i in good] if vb else vb
+    if not ts and "vbat" in col:
+        # Все метки недоверенные: часы шли от времени сборки, но шли — ход
+        # внутри одного такого участка верен. Разряд по нему, с оговоркой.
+        rel = [dt.datetime.strptime(x, "%Y-%m-%d %H:%M:%S") for x in col["timestamp"]]
+        if all(b >= a for a, b in zip(rel, rel[1:])):
+            ts, vb = rel, num(col, "vbat")
+            print("  разряд — по недоверенным меткам: их ход верен, абсолютное время нет")
+    if "vbat" in col and ts:
         hours = [(t - ts[0]).total_seconds() / 3600.0 for t in ts]
-        r = regress(hours, num(col, "vbat"))
+        r = regress(hours, vb)
         if r:
             k, se, sd, n = r
             print()
             print("  РАЗРЯД: %+.3f мВ/ч (ст. ошибка %.3f), разброс точек %.1f мВ, %d точек за %.1f ч"
                   % (k, se, sd, n, hours[-1]))
-            c = charge(hours, num(col, "vbat"))
+            c = charge(hours, vb)
             if c:
                 kp, p0, p1 = c
                 print("  по кривой прошивки: %.0f %% -> %.0f %%, %+.4f %%/ч" % (p0, p1, kp))
@@ -244,7 +264,10 @@ def compare(a, b):
     """Сравнение двух режимов на одной банке: систематика сокращается."""
     out = []
     for p in (a, b):
-        head, col, ts, _ = load(p, None, None)
+        head, col, ts_all, _, _ = load(p, None, None)
+        good = [i for i, t in enumerate(ts_all) if t is not None]
+        col = {n: [col[n][i] for i in good] for n in head}
+        ts = [ts_all[i] for i in good]
         hours = [(t - ts[0]).total_seconds() / 3600.0 for t in ts]
         r = regress(hours, num(col, "vbat"))
         c = charge(hours, num(col, "vbat"))

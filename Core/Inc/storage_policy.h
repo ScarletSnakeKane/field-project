@@ -107,6 +107,211 @@ static inline uint8_t Storage_MayRedoFormat(uint8_t no_fs, uint8_t reads_ok, uin
     return Storage_IsEmptyDir(root);
 }
 
+/* Тип раздела, который наша прошивка держит в MBR для FAT16: 0x0E (FAT16
+ * LBA) — его Android монтирует, а 0x04 от f_mkfs пропускает (см. main.c). */
+#define STORAGE_MBR_TYPE_FAT16_LBA  0x0EU
+#define STORAGE_MBR_TABLE           446U
+
+static inline uint32_t Storage_Ld16(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+}
+
+static inline uint32_t Storage_Ld32(const uint8_t *p)
+{
+    return Storage_Ld16(p) | (Storage_Ld16(p + 2) << 16);
+}
+
+/* Размер тома в секторах по BPB: 16-битное поле, а если оно ноль — 32-битное. */
+static inline uint32_t Storage_BootTotalSectors(const uint8_t *boot)
+{
+    uint32_t tot = Storage_Ld16(boot + 19);
+    return tot ? tot : Storage_Ld32(boot + 32);
+}
+
+/* Можно ли восстановить стёртый MBR по загрузочному сектору (решение
+ * владельца по остатку R3). Так выглядит прерванная правка байта типа
+ * раздела (main.c, RMW блока 0) на томе с архивом: MBR стёрт целиком, а
+ * загрузочный сектор раздела жив. Без MBR FatFs тома не видит, прибор
+ * навсегда остаётся с fs_ok = 0, а хост не видит раздела, хотя архив цел.
+ *
+ * MBR, который кладёт f_mkfs, однозначно выводится из загрузочного сектора
+ * (ff.c, «Create partition table»): один раздел с LBA 63, размер — из BPB,
+ * тип — по числу кластеров. Восстанавливаем только то, в чём уверены:
+ * MBR стёрт целиком (любой байт не 0xFF — там что-то другое, разбирать
+ * человеку), загрузочный сектор узнаётся как наш, а том помещается на диск.
+ *   disk_sectors — сколько секторов отдаёт драйвер (GET_SECTOR_COUNT). */
+static inline uint8_t Storage_MayRestoreMbr(uint8_t no_fs, uint8_t reads_ok,
+                                            const uint8_t *mbr, const uint8_t *boot,
+                                            uint32_t disk_sectors)
+{
+    if (!no_fs || !reads_ok)
+        return 0;
+    if (!Storage_IsErased(mbr, STORAGE_SECTOR_BYTES))
+        return 0;
+    if (Storage_OurRootDirSector(boot) == 0)
+        return 0;
+    uint32_t tot = Storage_BootTotalSectors(boot);
+    if (tot == 0 || tot > disk_sectors || STORAGE_BOOT_SECTOR > disk_sectors - tot)
+        return 0;
+    return 1;
+}
+
+/* MBR для тома, описанного загрузочным сектором boot, — байт в байт как
+ * f_mkfs (ff.c около 5727–5742), только тип FAT16 сразу 0x0E, как его
+ * оставляет наша прошивка. Вызывать после Storage_MayRestoreMbr. */
+static inline void Storage_BuildMbr(const uint8_t *boot, uint8_t *mbr)
+{
+    uint32_t tot   = Storage_BootTotalSectors(boot);
+    uint32_t spc   = boot[13];
+    uint32_t rsvd  = Storage_Ld16(boot + 14);
+    uint32_t nfats = boot[16];
+    uint32_t rootn = Storage_Ld16(boot + 17);
+    uint32_t fatsz = Storage_Ld16(boot + 22);
+    uint32_t meta  = rsvd + nfats * fatsz + (rootn * 32U + STORAGE_SECTOR_BYTES - 1U) / STORAGE_SECTOR_BYTES;
+    uint32_t nclst = (spc && tot > meta) ? (tot - meta) / spc : 0;
+    uint8_t  sys;
+
+    /* Та же граница FAT12/FAT16, по которой FatFs различает тип при
+     * монтировании (MAX_FAT12 = 0xFF5). */
+    if (tot >= 0x10000UL)
+        sys = 0x06;
+    else
+        sys = (nclst > 0xFF5U) ? STORAGE_MBR_TYPE_FAT16_LBA : 0x01;
+
+    memset(mbr, 0, STORAGE_SECTOR_BYTES);
+    uint8_t *pte = mbr + STORAGE_MBR_TABLE;
+    uint32_t n = (STORAGE_BOOT_SECTOR + tot) / (63U * 255U);
+    pte[0] = 0;                          /* не загрузочный */
+    pte[1] = 1;  pte[2] = 1;  pte[3] = 0; /* начало CHS */
+    pte[4] = sys;
+    pte[5] = 254;                        /* конец CHS — как у f_mkfs */
+    pte[6] = (uint8_t)(n >> 2 | 63);
+    pte[7] = (uint8_t)n;
+    pte[8]  = (uint8_t)STORAGE_BOOT_SECTOR;
+    pte[9]  = 0; pte[10] = 0; pte[11] = 0;
+    pte[12] = (uint8_t)tot;         pte[13] = (uint8_t)(tot >> 8);
+    pte[14] = (uint8_t)(tot >> 16); pte[15] = (uint8_t)(tot >> 24);
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+}
+
+/* Что делать со старым data.txt при старте (A11/C5). Раньше любое отличие
+ * первой строки от CSV_HEADER — в том числе сорванное чтение — вело к
+ * f_unlink: перепрошивка с новой колонкой молча стирала архив за полгода.
+ * Теперь архив не удаляется никогда: другой заголовок — файл переименуется
+ * (Storage_PickOldArchiveName) и начнётся новый. Сорванное чтение — не
+ * «другой заголовок»: файл не трогаем и дописываем как есть. Пустой файл
+ * (f_gets ничего не прочёл) тоже не трогаем — заголовок допишет первая же
+ * дозапись.
+ *   read_ok — f_gets вернул строку;
+ *   line    — прочитанная первая строка (f_gets снимает \r, оставляет \n). */
+#define STORAGE_HDR_KEEP    0U
+#define STORAGE_HDR_RENAME  1U
+
+static inline uint8_t Storage_HeaderAction(uint8_t read_ok, const char *line,
+                                           const char *header)
+{
+    if (!read_ok)
+        return STORAGE_HDR_KEEP;
+
+    /* Совпасть должна строка целиком: заголовок более новой прошивки
+     * начинается с нашего, и сравнение по префиксу смешало бы форматы. */
+    size_t n = strlen(header);
+    if (strncmp(line, header, n) != 0)
+        return STORAGE_HDR_RENAME;
+    char c = line[n];
+    return (c == '\0' || c == '\n' || c == '\r') ? STORAGE_HDR_KEEP : STORAGE_HDR_RENAME;
+}
+
+/* Имя для старого архива: data_N.txt с первым свободным N от 1. Имена 8.3 —
+ * FatFs собран без длинных имён, поэтому N не больше 999. taken(name, ctx)
+ * — занято ли имя (в прошивке — f_stat; ошибка тома — STORAGE_NAME_ERROR:
+ * ничего не переименовываем и ничего не затираем). Возвращает N, а имя
+ * кладёт в out (13 байт); 0 — свободных имён нет, out пуст. */
+#define STORAGE_OLD_ARCHIVE_MAX  999U
+
+/* Ответ taken: 0 — имя свободно, 1 — занято, 2 — том не ответил: перебор
+ * прекращается (на сбоящей флеш каждый f_stat ждёт секундами, и 999 таких
+ * вызовов без пинка сторожа кончились бы сбросом на каждом старте). */
+#define STORAGE_NAME_FREE   0U
+#define STORAGE_NAME_TAKEN  1U
+#define STORAGE_NAME_ERROR  2U
+
+typedef uint8_t (*Storage_NameTaken)(const char *name, void *ctx);
+
+static inline void Storage_OldArchiveName(uint32_t n, char *out)
+{
+    /* Без snprintf: формат тривиален, а заголовку незачем тянуть stdio. */
+    char digits[4];
+    uint32_t len = 0;
+    do { digits[len++] = (char)('0' + n % 10U); n /= 10U; } while (n && len < 3U);
+    memcpy(out, "data_", 5);
+    for (uint32_t i = 0; i < len; i++)
+        out[5 + i] = digits[len - 1U - i];
+    memcpy(out + 5 + len, ".txt", 5);
+}
+
+static inline uint32_t Storage_PickOldArchiveName(Storage_NameTaken taken, void *ctx, char *out)
+{
+    for (uint32_t n = 1; n <= STORAGE_OLD_ARCHIVE_MAX; n++)
+    {
+        Storage_OldArchiveName(n, out);
+        uint8_t t = taken(out, ctx);
+        if (t == STORAGE_NAME_FREE)
+            return n;
+        if (t != STORAGE_NAME_TAKEN)
+            break;
+    }
+    out[0] = '\0';
+    return 0;
+}
+
+/* Метка времени последней строки архива — для Policy_TimeTrusted (A6).
+ * tail — последние n байт файла; from_start — tail начинается с начала
+ * файла (иначе первая строка в нём, скорее всего, обрезана и не в счёт).
+ * Ищется последняя строка, которая начинается с "YYYY-MM-DD hh:mm:ss";
+ * заголовок и обрывки не подходят. Метка (19 символов и ноль) — в out[20].
+ * Возвращает 1, если нашлась. */
+#define STORAGE_TS_LEN  19U
+
+static inline uint8_t Storage_IsTimestamp(const char *p)
+{
+    static const char pat[] = "dddd-dd-dd dd:dd:dd";
+    for (uint32_t i = 0; i < STORAGE_TS_LEN; i++)
+    {
+        if (pat[i] == 'd' ? (p[i] < '0' || p[i] > '9') : (p[i] != pat[i]))
+            return 0;
+    }
+    return 1;
+}
+
+static inline uint8_t Storage_LastTimestamp(const char *tail, uint32_t n, uint8_t from_start,
+                                            char *out)
+{
+    /* С конца: начало строки — сразу после '\n' (или начало файла). */
+    for (uint32_t i = n; i > 0U; i--)
+    {
+        uint32_t start = i;   /* кандидат: tail[i] — сразу после tail[i - 1] */
+        if (tail[i - 1U] != '\n')
+            continue;
+        if (n - start >= STORAGE_TS_LEN && Storage_IsTimestamp(tail + start))
+        {
+            memcpy(out, tail + start, STORAGE_TS_LEN);
+            out[STORAGE_TS_LEN] = '\0';
+            return 1;
+        }
+    }
+    if (from_start && n >= STORAGE_TS_LEN && Storage_IsTimestamp(tail))
+    {
+        memcpy(out, tail, STORAGE_TS_LEN);
+        out[STORAGE_TS_LEN] = '\0';
+        return 1;
+    }
+    out[0] = '\0';
+    return 0;
+}
+
 /* Можно ли MSC (из прерывания OTG) читать флеш прямо сейчас. Не готова —
  * значит не инициализирована или спит, и будить её из прерывания нельзя:
  * задержки там не идут. Занята — основной поток посреди операции FatFs, и
@@ -115,6 +320,67 @@ static inline uint8_t Storage_MayRedoFormat(uint8_t no_fs, uint8_t reads_ok, uin
 static inline uint8_t Storage_MscMayAccess(uint8_t flash_ready, uint8_t flash_busy)
 {
     return (flash_ready && !flash_busy) ? 1U : 0U;
+}
+
+/* Сколько свободных кластеров физически есть на флеш (S2). Том заявлен на
+ * 4 МБ (ради FAT16), а флеш — 2 МБ; FatFs считает свободными и кластеры за
+ * физической границей и выделяет их по возрастанию номера. Пока места хватает,
+ * до них не доходит, но старые data_N.txt занимают ту же физическую флеш:
+ * после пары смен заголовка новый data.txt упирается в границу задолго до
+ * CSV_MAX_BYTES, запись в несуществующий сектор не проходит, и архив молча
+ * встаёт. Поэтому место считаем по флеш, а не по тому.
+ *   free_clst    — свободных кластеров по FatFs (f_getfree);
+ *   n_fatent     — число записей FAT (кластеров + 2);
+ *   database     — первый сектор области данных (абсолютный, с LBA раздела);
+ *   csize        — секторов в кластере;
+ *   phys_sectors — сколько секторов есть на самом деле (FLASH_PHYS_SECTORS).
+ * Все кластеры за границей вычитаются из свободных: если какой-то из них уже
+ * занят (запись туда когда-то пыталась пройти), результат меньше настоящего —
+ * ошибка в безопасную сторону. */
+static inline uint32_t Storage_PhysFreeClusters(uint32_t free_clst, uint32_t n_fatent,
+                                                uint32_t database, uint32_t csize,
+                                                uint32_t phys_sectors)
+{
+    if (csize == 0U || n_fatent < 2U)
+        return 0;
+    uint32_t total = n_fatent - 2U;
+    uint32_t phys  = (phys_sectors > database) ? (phys_sectors - database) / csize : 0U;
+    if (phys > total)
+        phys = total;
+    uint32_t absent = total - phys;
+    return (free_clst > absent) ? free_clst - absent : 0U;
+}
+
+/* Запас физически свободных кластеров (S2). Обычные строки пишутся, пока его
+ * больше STORAGE_ROOM_RESERVE; в запасе остаётся место на строку-отметку о
+ * заполнении. Ниже STORAGE_ROOM_HARD не пишется ничего: дозапись строки
+ * (до 224 Б) может занять ещё кластер, а FatFs по пути на флеш выделил бы
+ * несуществующий. Кластер у нашего f_mkfs — 1 сектор (512 Б), так что запас
+ * — ~4 КБ, отметок в нём хватит на ~20 перезапусков. */
+#define STORAGE_ROOM_RESERVE  8U
+#define STORAGE_ROOM_HARD     2U
+
+/* Что делать с очередной строкой (S2):
+ *   STORAGE_ROOM_OK   — писать как обычно;
+ *   STORAGE_ROOM_MARK — архив заполнен, но отметки о том ещё нет: одна строка
+ *                       из запаса, и в ней write_fails уже вырос (см. main.c);
+ *   STORAGE_ROOM_FULL — не писать: ветка «архив заполнен».
+ * Заполнен — это data.txt дорос до max_bytes ИЛИ физически свободно меньше
+ * запаса. marked — отметка уже записана (после старта); phys_free — из
+ * Storage_PhysFreeClusters. Политики освобождения места здесь нет: стирать
+ * старые архивы или нет — решение владельца. */
+#define STORAGE_ROOM_OK    0U
+#define STORAGE_ROOM_MARK  1U
+#define STORAGE_ROOM_FULL  2U
+
+static inline uint8_t Storage_ArchiveRoom(uint32_t file_size, uint32_t max_bytes,
+                                          uint32_t phys_free, uint8_t marked)
+{
+    if (file_size < max_bytes && phys_free > STORAGE_ROOM_RESERVE)
+        return STORAGE_ROOM_OK;
+    if (!marked && phys_free >= STORAGE_ROOM_HARD)
+        return STORAGE_ROOM_MARK;
+    return STORAGE_ROOM_FULL;
 }
 
 /* Можно ли сейчас писать на флеш при таком питании. Каждая дозапись — это

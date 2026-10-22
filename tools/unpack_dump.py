@@ -11,6 +11,7 @@
     python tools/unpack_dump.py <вход.bin> <выход.csv> <win_bytes> <win_count> [хеш]
     python tools/unpack_dump.py --fnv <файл>
     python tools/unpack_dump.py --check <файл> <хеш>
+    python tools/unpack_dump.py --raw <кусок.bin> <образ.img> <смещение> <хеш>   (оба — hex)
 
 win_bytes = 0 означает непрерывный дамп. Хеш — dump_info.hash из дампера:
 если прочитанные по SWD байты с ним не сходятся (не тот адрес, обрыв чтения),
@@ -19,7 +20,12 @@ win_bytes = 0 означает непрерывный дамп. Хеш — dump_
 и отвечает только кодом возврата (0 — совпал). Сравнивать в bash вывод --fnv
 нельзя: на Windows print() пишет CRLF, Git Bash в $(...) срезает только LF,
 и строка с CR на конце никогда не равна хешу (R1).
+--raw кладёт кусок сырого образа флеш (dump_info.raw_*, см. dump_patch.py)
+в файл образа по его смещению, если хеш сошёлся; образ создаётся и
+дорастает по мере кусков. Нужен, когда том не монтируется (fs_ok = 0):
+архив тогда вытаскивается из образа на компьютере, а не на плате.
 """
+import os
 import sys
 
 
@@ -38,6 +44,22 @@ def main():
     if sys.argv[1] == "--check":
         got = fnv1a(open(sys.argv[2], "rb").read())
         sys.exit(0 if got == int(sys.argv[3], 0) else 1)
+    if sys.argv[1] == "--raw":
+        chunk = open(sys.argv[2], "rb").read()
+        # Шестнадцатеричные, как их печатает -r32 (без 0x; с 0x тоже можно):
+        # int(x, 0) не разобрал бы «00008000», а «12345678» прочёл бы десятичным.
+        img, off, want = sys.argv[3], int(sys.argv[4], 16), int(sys.argv[5], 16)
+        got = fnv1a(chunk)
+        if got != want:
+            sys.exit("   !! хеш куска (0x%08X) не совпал с хешем на плате (0x%08X):"
+                     " кусок не записан" % (got, want))
+        # r+b, а не w: остальные куски образа уже на месте.
+        mode = "r+b" if os.path.exists(img) else "wb"
+        with open(img, mode) as f:
+            f.seek(off)
+            f.write(chunk)
+        print("   кусок 0x%06X..0x%06X записан в %s" % (off, off + len(chunk), img))
+        return
     src, dst = sys.argv[1], sys.argv[2]
     win_bytes = int(sys.argv[3])
     win_count = int(sys.argv[4])

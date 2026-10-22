@@ -42,6 +42,14 @@ void MX_I2C1_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
+/* Освобождение шины I2C1, которую держит ведомый (B6). Вызывать при
+ * деинициализированной I2C1, перед MX_I2C1_Init. Выводы оставляет
+ * GPIO-выходами в единице — их перехватит MspInit. */
+#define I2C_BUS_FREE    0U   /* шина и так свободна */
+#define I2C_BUS_FREED   1U   /* освобождена тактами SCL */
+#define I2C_BUS_STUCK   2U   /* SDA так и осталась в нуле */
+uint8_t I2C1_BusRecover(void);
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus
