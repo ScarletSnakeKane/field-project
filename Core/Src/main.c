@@ -634,6 +634,21 @@ int main(void)
               }
           }
       }
+      else if (boot_power_ok && Storage_MayRestoreMbr(1, reads_ok, mbr, boot, FLASH_VIRT_SECTORS))
+      {
+          /* Том с архивом без MBR — прерванная правка байта типа ниже (R3).
+           * Архив цел, но без MBR FatFs и хост раздела не видят, и прибор
+           * навсегда остался бы с fs_ok = 0. MBR однозначно выводится из
+           * загрузочного сектора — восстанавливаем его, данные не трогаем.
+           * Флеш занята (флаг выше), питание проверено, как для формата. */
+          BYTE *fresh = work + 3 * FLASH_SECTOR_BYTES;
+          Storage_BuildMbr(boot, fresh);
+          if (disk_write(0, fresh, 0, 1) == RES_OK)
+          {
+              f_mount(NULL, USERPath, 0);
+              res = f_mount(&USERFatFS, USERPath, 1);
+          }
+      }
   }
 
   /* Раньше здесь стоял while(1) — отказ монтирования означал вечное зависание

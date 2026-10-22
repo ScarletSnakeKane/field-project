@@ -684,6 +684,98 @@ static void test_storage_policy(void)
     }
 }
 
+/* Загрузочные сектора и MBR, которые кладёт настоящий f_mkfs этого FatFs:
+ * собран на хосте с RAM-диском на 8192 сектора, параметры как в main.c
+ * (FM_FAT, кластер 512 Б) и как у старых прошивок (кластер 1 КБ, FAT12).
+ * Первые 64 байта сектора; остальное до сигнатуры — нули. Записи разделов
+ * взяты из того же прогона, а не посчитаны этим кодом. */
+static const unsigned char MKFS_BOOT16[64] = {
+    0xEB,0xFE,0x90,0x4D,0x53,0x44,0x4F,0x53,0x35,0x2E,0x30,0x00,0x02,0x01,0x01,0x00,
+    0x01,0x00,0x02,0xC1,0x1F,0xF8,0x20,0x00,0x3F,0x00,0xFF,0x00,0x3F,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x80,0x00,0x29,0x00,0x00,0x00,0x00,0x4E,0x4F,0x20,0x4E,0x41,
+    0x4D,0x45,0x20,0x20,0x20,0x20,0x46,0x41,0x54,0x20,0x20,0x20,0x20,0x20,0x00,0x00};
+static const unsigned char MKFS_PTE16[16] = {
+    0x00,0x01,0x01,0x00,0x04,0xFE,0x3F,0x00,0x3F,0x00,0x00,0x00,0xC1,0x1F,0x00,0x00};
+static const unsigned char MKFS_BOOT12[64] = {
+    0xEB,0xFE,0x90,0x4D,0x53,0x44,0x4F,0x53,0x35,0x2E,0x30,0x00,0x02,0x02,0x01,0x00,
+    0x01,0x00,0x02,0xC1,0x1F,0xF8,0x10,0x00,0x3F,0x00,0xFF,0x00,0x3F,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x80,0x00,0x29,0x00,0x00,0x00,0x00,0x4E,0x4F,0x20,0x4E,0x41,
+    0x4D,0x45,0x20,0x20,0x20,0x20,0x46,0x41,0x54,0x20,0x20,0x20,0x20,0x20,0x00,0x00};
+static const unsigned char MKFS_PTE12[16] = {
+    0x00,0x01,0x01,0x00,0x01,0xFE,0x3F,0x00,0x3F,0x00,0x00,0x00,0xC1,0x1F,0x00,0x00};
+
+static void mkfs_sector(unsigned char *sec, const unsigned char *first64)
+{
+    memset(sec, 0, 512);
+    memcpy(sec, first64, 64);
+    sec[510] = 0x55; sec[511] = 0xAA;
+}
+
+static void test_mbr_restore(void)
+{
+    unsigned char boot[512], mbr[512], built[512], want[512];
+
+    puts("Восстановление MBR");
+
+    mkfs_sector(boot, MKFS_BOOT16);
+    memset(mbr, 0xFF, sizeof(mbr));
+
+    /* Прерванная правка байта типа на томе с архивом: MBR стёрт, наш
+     * загрузочный сектор жив. Восстанавливать. */
+    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 8192), 1, "MBR стёрт, загрузочный наш — восстанавливаем");
+
+    /* Восстановленный MBR — байт в байт как от f_mkfs, кроме типа: 0x0E, как
+     * его оставляет прошивка для FAT16 (Android). */
+    Storage_BuildMbr(boot, built);
+    memset(want, 0, sizeof(want));
+    memcpy(want + 446, MKFS_PTE16, 16);
+    want[446 + 4] = 0x0E;
+    want[510] = 0x55; want[511] = 0xAA;
+    ok(memcmp(built, want, 512) == 0, "FAT16: MBR совпал с f_mkfs (тип 0x0E)");
+
+    /* Старый FAT12 (кластер 1 КБ) — тип 0x01, ровно как у f_mkfs: 0x0E для
+     * него был бы ложью. */
+    mkfs_sector(boot, MKFS_BOOT12);
+    Storage_BuildMbr(boot, built);
+    memset(want, 0, sizeof(want));
+    memcpy(want + 446, MKFS_PTE12, 16);
+    want[510] = 0x55; want[511] = 0xAA;
+    ok(memcmp(built, want, 512) == 0, "FAT12: MBR совпал с f_mkfs (тип 0x01)");
+
+    /* Граница FAT12/FAT16 — как у FatFs при монтировании: 4085 кластеров —
+     * ещё FAT12, 4086 — уже FAT16. Служебных секторов у FAT16-образа 65. */
+    mkfs_sector(boot, MKFS_BOOT16);
+    boot[19] = (unsigned char)((65 + 4085) & 0xFF); boot[20] = (unsigned char)((65 + 4085) >> 8);
+    Storage_BuildMbr(boot, built);
+    equ(built[446 + 4], 0x01, "4085 кластеров — FAT12");
+    boot[19] = (unsigned char)((65 + 4086) & 0xFF); boot[20] = (unsigned char)((65 + 4086) >> 8);
+    Storage_BuildMbr(boot, built);
+    equ(built[446 + 4], 0x0E, "4086 кластеров — FAT16");
+
+    /* Чего не трогаем. */
+    mkfs_sector(boot, MKFS_BOOT16);
+    equ(Storage_MayRestoreMbr(0, 1, mbr, boot, 8192), 0, "том смонтировался — MBR не трогаем");
+    equ(Storage_MayRestoreMbr(1, 0, mbr, boot, 8192), 0, "чтение сорвалось — не решаем");
+
+    mbr[0] = 0x00;
+    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 8192), 0, "в MBR что-то лежит — не наш случай");
+    memset(mbr, 0xFF, sizeof(mbr));
+
+    unsigned char alien[512];
+    memcpy(alien, boot, 512);
+    alien[3] = 'X';   /* чужой OEM */
+    equ(Storage_MayRestoreMbr(1, 1, mbr, alien, 8192), 0, "загрузочный сектор чужой — не трогаем");
+
+    /* Том не помещается на диск (BPB битый) — по догадке не пишем. */
+    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 8191), 0, "том с LBA 63 не влезает в диск — нет");
+    equ(Storage_MayRestoreMbr(1, 1, mbr, boot, 63 + 8129), 1, "том ровно до конца диска — да");
+    memcpy(alien, boot, 512);
+    alien[19] = 0; alien[20] = 0;   /* TotSec16 = 0 и TotSec32 = 0 */
+    equ(Storage_MayRestoreMbr(1, 1, mbr, alien, 8192), 0, "размер тома ноль — нет");
+    alien[32] = 0xC1; alien[33] = 0x1F;   /* размер в 32-битном поле */
+    equ(Storage_BootTotalSectors(alien), 8129, "размер берётся и из 32-битного поля BPB");
+}
+
 int main(void)
 {
     test_ds18b20();
@@ -694,6 +786,7 @@ int main(void)
     test_usb_policy();
     test_watchdog_policy();
     test_storage_policy();
+    test_mbr_restore();
 
     printf("\n%d проверок, %d провалов\n", checks, failures);
     return failures ? 1 : 0;

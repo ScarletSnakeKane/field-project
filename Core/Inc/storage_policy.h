@@ -107,6 +107,95 @@ static inline uint8_t Storage_MayRedoFormat(uint8_t no_fs, uint8_t reads_ok, uin
     return Storage_IsEmptyDir(root);
 }
 
+/* Тип раздела, который наша прошивка держит в MBR для FAT16: 0x0E (FAT16
+ * LBA) — его Android монтирует, а 0x04 от f_mkfs пропускает (см. main.c). */
+#define STORAGE_MBR_TYPE_FAT16_LBA  0x0EU
+#define STORAGE_MBR_TABLE           446U
+
+static inline uint32_t Storage_Ld16(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+}
+
+static inline uint32_t Storage_Ld32(const uint8_t *p)
+{
+    return Storage_Ld16(p) | (Storage_Ld16(p + 2) << 16);
+}
+
+/* Размер тома в секторах по BPB: 16-битное поле, а если оно ноль — 32-битное. */
+static inline uint32_t Storage_BootTotalSectors(const uint8_t *boot)
+{
+    uint32_t tot = Storage_Ld16(boot + 19);
+    return tot ? tot : Storage_Ld32(boot + 32);
+}
+
+/* Можно ли восстановить стёртый MBR по загрузочному сектору (решение
+ * владельца по остатку R3). Так выглядит прерванная правка байта типа
+ * раздела (main.c, RMW блока 0) на томе с архивом: MBR стёрт целиком, а
+ * загрузочный сектор раздела жив. Без MBR FatFs тома не видит, прибор
+ * навсегда остаётся с fs_ok = 0, а хост не видит раздела, хотя архив цел.
+ *
+ * MBR, который кладёт f_mkfs, однозначно выводится из загрузочного сектора
+ * (ff.c, «Create partition table»): один раздел с LBA 63, размер — из BPB,
+ * тип — по числу кластеров. Восстанавливаем только то, в чём уверены:
+ * MBR стёрт целиком (любой байт не 0xFF — там что-то другое, разбирать
+ * человеку), загрузочный сектор узнаётся как наш, а том помещается на диск.
+ *   disk_sectors — сколько секторов отдаёт драйвер (GET_SECTOR_COUNT). */
+static inline uint8_t Storage_MayRestoreMbr(uint8_t no_fs, uint8_t reads_ok,
+                                            const uint8_t *mbr, const uint8_t *boot,
+                                            uint32_t disk_sectors)
+{
+    if (!no_fs || !reads_ok)
+        return 0;
+    if (!Storage_IsErased(mbr, STORAGE_SECTOR_BYTES))
+        return 0;
+    if (Storage_OurRootDirSector(boot) == 0)
+        return 0;
+    uint32_t tot = Storage_BootTotalSectors(boot);
+    if (tot == 0 || tot > disk_sectors || STORAGE_BOOT_SECTOR > disk_sectors - tot)
+        return 0;
+    return 1;
+}
+
+/* MBR для тома, описанного загрузочным сектором boot, — байт в байт как
+ * f_mkfs (ff.c около 5727–5742), только тип FAT16 сразу 0x0E, как его
+ * оставляет наша прошивка. Вызывать после Storage_MayRestoreMbr. */
+static inline void Storage_BuildMbr(const uint8_t *boot, uint8_t *mbr)
+{
+    uint32_t tot   = Storage_BootTotalSectors(boot);
+    uint32_t spc   = boot[13];
+    uint32_t rsvd  = Storage_Ld16(boot + 14);
+    uint32_t nfats = boot[16];
+    uint32_t rootn = Storage_Ld16(boot + 17);
+    uint32_t fatsz = Storage_Ld16(boot + 22);
+    uint32_t meta  = rsvd + nfats * fatsz + (rootn * 32U + STORAGE_SECTOR_BYTES - 1U) / STORAGE_SECTOR_BYTES;
+    uint32_t nclst = (spc && tot > meta) ? (tot - meta) / spc : 0;
+    uint8_t  sys;
+
+    /* Та же граница FAT12/FAT16, по которой FatFs различает тип при
+     * монтировании (MAX_FAT12 = 0xFF5). */
+    if (tot >= 0x10000UL)
+        sys = 0x06;
+    else
+        sys = (nclst > 0xFF5U) ? STORAGE_MBR_TYPE_FAT16_LBA : 0x01;
+
+    memset(mbr, 0, STORAGE_SECTOR_BYTES);
+    uint8_t *pte = mbr + STORAGE_MBR_TABLE;
+    uint32_t n = (STORAGE_BOOT_SECTOR + tot) / (63U * 255U);
+    pte[0] = 0;                          /* не загрузочный */
+    pte[1] = 1;  pte[2] = 1;  pte[3] = 0; /* начало CHS */
+    pte[4] = sys;
+    pte[5] = 254;                        /* конец CHS — как у f_mkfs */
+    pte[6] = (uint8_t)(n >> 2 | 63);
+    pte[7] = (uint8_t)n;
+    pte[8]  = (uint8_t)STORAGE_BOOT_SECTOR;
+    pte[9]  = 0; pte[10] = 0; pte[11] = 0;
+    pte[12] = (uint8_t)tot;         pte[13] = (uint8_t)(tot >> 8);
+    pte[14] = (uint8_t)(tot >> 16); pte[15] = (uint8_t)(tot >> 24);
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+}
+
 /* Можно ли MSC (из прерывания OTG) читать флеш прямо сейчас. Не готова —
  * значит не инициализирована или спит, и будить её из прерывания нельзя:
  * задержки там не идут. Занята — основной поток посреди операции FatFs, и
