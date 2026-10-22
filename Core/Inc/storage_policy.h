@@ -92,4 +92,14 @@ static inline uint8_t Storage_MayWrite(uint8_t bat_valid, uint8_t bat_low, float
     return 1;
 }
 
+/* Замер не записался — оставить ли его в очереди до следующего цикла (T6).
+ * Да, если журнал не был открыт (на флеш ничего не ушло) или после отказа
+ * он всё ещё открыт (слот не записан или испорчен — номер пропущен, дубля
+ * не будет). Нет, если отказ закрыл журнал: не прочиталась сверка, и запись,
+ * возможно, уже лежит на флеш — повтор дал бы дубль строки. */
+static inline uint8_t Storage_RequeueFailed(uint8_t was_open, uint8_t still_mounted)
+{
+    return (!was_open || still_mounted) ? 1U : 0U;
+}
+
 #endif

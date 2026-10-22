@@ -24,6 +24,7 @@ static volatile uint8_t op_depth     = 0;
 static volatile uint8_t probed_ok    = 0;   /* Probe ответил живым ID */
 static volatile uint8_t in_dpd       = 1;   /* после сброса МК чип может спать */
 static volatile uint8_t host_session = 0;   /* был ли хост с момента прошлой проверки */
+static uint8_t          jedec_mfr    = 0;   /* производитель по RDID; 0 — ещё не читали */
 
 #define OP_BEGIN()  (op_depth++)
 #define OP_END()    (op_depth--)
@@ -90,18 +91,61 @@ static uint8_t SPI_Flash_WriteEnable(void)
     return (st == HAL_OK) ? 1U : 0U;
 }
 
-static void SPI_Flash_GlobalUnprotect(void)
+/* Прочитать len байт ответа на однобайтовую команду. */
+static uint8_t SPI_Flash_ReadReg(uint8_t cmd, uint8_t *buf, uint32_t len)
 {
-    /* WREN */
-    SPI_Flash_WriteEnable();
+    FLASH_CS_LOW();
+    HAL_StatusTypeDef st = HAL_SPI_Transmit(&hspi1, &cmd, 1, FLASH_SPI_TIMEOUT_MS);
+    if (st == HAL_OK)
+        st = HAL_SPI_Receive(&hspi1, buf, len, FLASH_SPI_TIMEOUT_MS);
+    FLASH_CS_HIGH();
+    return (st == HAL_OK) ? 1U : 0U;
+}
+
+/* Раньше результат не проверялся вовсе: сорванный WREN или 0x98 оставлял
+ * блоки запертыми, и запись молча не шла до перезагрузки МК (T2). */
+static uint8_t SPI_Flash_GlobalUnprotect(void)
+{
+    /* WREN, поданный занятому чипу, игнорируется — сначала дождаться. */
+    uint8_t ok = SPI_Flash_WaitBusy() && SPI_Flash_WriteEnable();
 
     /* Global Block Protection Unlock */
-    uint8_t cmd = FLASH_CMD_GBL_UNPROT;
-    FLASH_CS_LOW();
-    HAL_SPI_Transmit(&hspi1, &cmd, 1, FLASH_SPI_TIMEOUT_MS);
-    FLASH_CS_HIGH();
+    if (ok)
+    {
+        uint8_t cmd = FLASH_CMD_GBL_UNPROT;
+        FLASH_CS_LOW();
+        ok = (HAL_SPI_Transmit(&hspi1, &cmd, 1, FLASH_SPI_TIMEOUT_MS) == HAL_OK);
+        FLASH_CS_HIGH();
+    }
+    if (ok)
+        ok = SPI_Flash_WaitBusy();
 
-    SPI_Flash_WaitBusy();
+    /* Проверка по регистру защиты — только у SST26: у совместимых чипов
+     * команды 0x72 может не быть, и сверка дала бы ложный отказ. Им
+     * остаётся сверка каждой записи чтением в журнале. */
+    if (ok && jedec_mfr == 0U)
+    {
+        uint8_t id[3] = {0};
+        if (SPI_Flash_ReadReg(FLASH_CMD_RDID, id, sizeof(id)) && id[0] != 0x00 && id[0] != 0xFF)
+            jedec_mfr = id[0];
+    }
+    if (ok && jedec_mfr == FLASH_MFR_SST)
+    {
+        uint8_t bpr[FLASH_BPR_LEN];
+        ok = SPI_Flash_ReadReg(FLASH_CMD_RBPR, bpr, sizeof(bpr));
+        for (uint32_t i = 0; ok && i < sizeof(bpr); i++)
+            if (bpr[i] != 0U)
+                ok = 0;
+    }
+    return ok;
+}
+
+uint8_t SPI_Flash_Unlock(void)
+{
+    OP_BEGIN();
+    uint8_t ok = SPI_Flash_GlobalUnprotect();
+    OP_END();
+    return ok;
 }
 
 void SPI_Flash_DeepPowerDown(void)
@@ -145,8 +189,10 @@ void SPI_Flash_Init(void)
      * SPI_Flash_WaitBusy() ниже будет впустую ждать до самого таймаута. */
     SPI_Flash_ReleasePowerDown();
 
-    /* Снять защиту блоков, иначе запись/стирание будут игнорироваться */
-    SPI_Flash_GlobalUnprotect();
+    /* Снять защиту блоков, иначе запись/стирание будут игнорироваться.
+     * Неудача здесь не фатальна: журнал снимает защиту перед каждой записью
+     * (SPI_Flash_Unlock) и откажет там, если она так и не снялась. */
+    (void)SPI_Flash_GlobalUnprotect();
     OP_END();
 }
 

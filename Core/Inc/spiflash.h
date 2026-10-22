@@ -35,7 +35,7 @@
 /* Таймауты. Устройство стоит в поле без присмотра — любое ожидание должно
  * быть конечным, иначе единственный сбой связи вешает прошивку навсегда. */
 #define FLASH_SPI_TIMEOUT_MS  100U       // отдельная SPI-транзакция
-#define FLASH_BUSY_TIMEOUT_MS 500U       // ожидание конца записи/стирания (стирание сектора ~25-50 мс)
+#define FLASH_BUSY_TIMEOUT_MS 500U       // ожидание конца записи/стирания (сектор SST26 — до 25 мс; запас на совместимые)
 
 /* Команды SST26VF016B */
 #define FLASH_CMD_READ        0x03       // Read Data
@@ -47,8 +47,18 @@
 #define FLASH_CMD_RDID        0x9F       // Read JEDEC ID
 #define FLASH_CMD_DPD         0xB9       // Deep Power-Down
 #define FLASH_CMD_RDPD        0xAB       // Release from Deep Power-Down
+#define FLASH_CMD_RBPR        0x72       // Read Block-Protection Register (SST26)
+#define FLASH_BPR_LEN         6U         // байт BPR у SST26VF016B
+#define FLASH_MFR_SST         0xBFU      // JEDEC: SST/Microchip
 
 void SPI_Flash_Init(void);
+/* Снять защиту блоков (WREN + 0x98) и проверить: у SST26 — чтением регистра
+ * защиты (все биты должны быть 0), у совместимых без него — по успеху
+ * команд. SST26 после собственного сброса по питанию (просадка, которую МК
+ * пережил) запирает все блоки, и программирование со стиранием молча не
+ * делают ничего; поэтому журнал зовёт это перед каждой серией записи (T2).
+ * 1 — защита снята. */
+uint8_t SPI_Flash_Unlock(void);
 /* Отвечает ли микросхема вообще. Возвращает 0, если JEDEC ID вычитать не вышло:
  * на неподключённой или мёртвой шине ответ вырождается в сплошные 0x00 или 0xFF. */
 uint8_t SPI_Flash_Probe(void);

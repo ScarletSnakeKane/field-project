@@ -214,24 +214,26 @@ static void Watchdog_Kick(void)
 }
 
 /* Журнал работает с флеш через драйвер, а в долгих местах (сканирование
- * при старте, стирание сектора до ~400 мс, импорт старого тома) пинает
- * сторожа сам. */
+ * при старте, стирание сектора — у SST26 до 25 мс, импорт старого тома)
+ * пинает сторожа сам. Защиту блоков он снимает перед каждой записью (T2). */
 static const LogFlashOps log_ops = {
-  SPI_Flash_Read, SPI_Flash_Write, SPI_Flash_EraseSector, Watchdog_Kick
+  SPI_Flash_Read, SPI_Flash_Write, SPI_Flash_EraseSector, Watchdog_Kick, SPI_Flash_Unlock
 };
 
 /* Открыть журнал: найти голову и хвост, а на первом старте после старой
  * прошивки — перенести старый архив (импорт пишет, поэтому только при
  * may_write). Сорванное чтение — до трёх попыток с повторной инициализацией
  * флеш: одно искажённое чтение после просадки не должно решать судьбу
- * архива. Возвращает 1, если журнал открыт. */
+ * архива. Инициализация (выход из DPD, снятие защиты) — перед каждой
+ * попыткой, включая первую: из цикла сюда попадают только после отказа, а
+ * флеш могла пережить свой сброс по питанию и стоять запертой (T2).
+ * Возвращает 1, если журнал открыт. */
 static uint8_t Archive_Open(uint8_t may_write)
 {
   uint8_t r = LOG_OPEN_EIO;
   for (uint8_t attempt = 0; attempt < 3U && r == LOG_OPEN_EIO; attempt++)
   {
-      if (attempt > 0U)
-          SPI_Flash_Init();
+      SPI_Flash_Init();
       r = LogArchive_Open(&log_ring, &log_ops, LOG_FLASH_SECTORS, may_write, &log_old);
       Watchdog_Kick();
   }
@@ -937,9 +939,17 @@ int main(void)
 	      }
 
 	      /* Очередь не ушла — новый замер встаёт за ней, чтобы не нарушить
-	       * порядок; иначе пишется сразу. */
+	       * порядок; иначе пишется сразу. Не записался — тоже в очередь,
+	       * следующий цикл переоткроет журнал и допишет (T6); кроме случая,
+	       * когда не прочиталась сверка: что легло в слот, неизвестно. */
+	      uint8_t was_open = fs_ok;
 	      if (log_pending_n == 0U)
-	          (void)Archive_Append(&rec);
+	      {
+	          if (!Archive_Append(&rec) &&
+	              Storage_RequeueFailed(was_open, log_ring.mounted) &&
+	              log_pending_n < LOG_PENDING_MAX)
+	              log_pending[log_pending_n++] = rec;
+	      }
 	      else if (log_pending_n < LOG_PENDING_MAX)
 	          log_pending[log_pending_n++] = rec;
 	      else
