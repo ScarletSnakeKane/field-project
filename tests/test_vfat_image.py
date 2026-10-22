@@ -190,6 +190,7 @@ BENCH = r"""
 #include <stdio.h>
 #define LOG_RING_IMPLEMENTATION
 #include "log_ring.h"
+#define VFAT_DEVICE_UID(w) ((w)[0] = 0x00280041U, (w)[1] = 0x30335111U, (w)[2] = 0x37383233U)
 #define VFAT_IMPLEMENTATION
 #include "vfat.h"
 void semi_exit(void);

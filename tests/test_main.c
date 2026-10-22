@@ -2402,6 +2402,9 @@ static void test_log_import(void)
 static int vf_break;
 #define VFAT_CHECK_LINE vf_check_line
 static int vf_check_line(const LogRecord *r, char *out);
+/* UID МК для серийного номера тома; тест меняет его, как будто другой прибор. */
+static uint32_t vf_uid[3] = { 0x00280041U, 0x30335111U, 0x37383233U };
+#define VFAT_DEVICE_UID(w) ((w)[0] = vf_uid[0], (w)[1] = vf_uid[1], (w)[2] = vf_uid[2])
 #define VFAT_IMPLEMENTATION
 #include "vfat.h"
 
@@ -2793,7 +2796,21 @@ static void test_vfat_volume(void)
         equ(date, VFat_FatDate(LogRecord_Digits(m.ts, 4), LogRecord_Digits(m.ts + 5, 2),
                                LogRecord_Digits(m.ts + 8, 2)), "дата файла — метка последнего замера");
     }
+    /* Серийный номер тома (V3, П5б+): от журнала не зависит — после новых
+     * замеров тот же, и он же лежит в загрузочном секторе. Другой прибор
+     * (UID) — другой номер. */
+    (void)VFat_Build(&vf_vol, &r, "test");
+    uint32_t ser = vf_vol.serial;
+    (void)VFat_Read(&vf_vol, VFAT_PART_LBA, vf_img);
+    equ(vf_le32(vf_img + 39), ser, "серийный номер — в загрузочном секторе");
     vf_append(&r, 1001, 110);   /* у последней, id 1110, time_ok = 0 */
+    (void)VFat_Build(&vf_vol, &r, "test");
+    equ(vf_vol.serial, ser, "серийный номер тома не меняется с новыми замерами");
+    ok(ser != 0U, "серийный номер не нулевой");
+    vf_uid[2] ^= 0x100U;
+    (void)VFat_Build(&vf_vol, &r, "test");
+    ok(vf_vol.serial != ser, "другой UID МК — другой серийный номер");
+    vf_uid[2] ^= 0x100U;
     (void)VFat_Build(&vf_vol, &r, "test");
     (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_ROOT, vf_img);
     equ(vf_le16(vf_img + 32 + 24), VFat_FatDate(2026U, 1U, 1U), "часам не верим — дата фиксированная");

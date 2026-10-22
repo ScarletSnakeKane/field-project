@@ -323,6 +323,35 @@ int VFat_FormatMeas(const LogRecord *r, char *out)
 #define VFAT_CHECK_LINE VFat_FormatMeasSlow
 #endif
 
+/* Уникальный ID МК (96 бит) в uint32_t w[3] — из него серийный номер тома.
+ * Задаёт тот, кто включает реализацию: прошивка — HAL_GetUIDw0..2, тест —
+ * подменой. Молча подставлять нули нельзя: у всех приборов был бы один
+ * номер. */
+#ifndef VFAT_DEVICE_UID
+#error "VFAT_DEVICE_UID(w): задать до #include \"vfat.h\" с VFAT_IMPLEMENTATION"
+#endif
+
+/* Серийный номер тома — постоянный для прибора, от содержимого журнала не
+ * зависит. Android делает из него fsUuid: путь /mnt/media_rw/XXXX-XXXX и
+ * URI доступа к папке (SAF). Менялся бы с каждым замером — приложения
+ * теряли бы сохранённый доступ при каждом подключении (V3, П5б+).
+ * Устаревших данных из кэша хоста постоянный номер не даст: том
+ * пересобирается только в Usb_Start, а ей всегда предшествует Usb_Stop —
+ * программное отключение от шины. Хост видит отсоединение, снимает том и
+ * при следующем подключении монтирует его заново, не перенося кэш
+ * (Windows, Linux и Android поступают так с любым номером). FNV-1a по 12
+ * байтам UID; 0 — «нет номера» у части утилит, его не отдаём. */
+static uint32_t VFat_Serial(const uint32_t uid[3])
+{
+    uint32_t h = 2166136261UL;
+    for (uint32_t i = 0; i < 12U; i++)
+    {
+        h ^= (uid[i / 4U] >> (8U * (i % 4U))) & 0xFFU;
+        h *= 16777619UL;
+    }
+    return h ? h : 0x46530001UL;
+}
+
 /* Строка записи для файла which; 0 — запись не из этого файла. */
 static int VFat_Line(const VFat *v, uint32_t which, const LogRecord *rec, char *line,
                      const uint8_t **text)
@@ -558,7 +587,11 @@ uint8_t VFat_Build(VFat *v, const LogRing *r, const char *fw)
         v->present[VFAT_FILE_DATA] = 1;
         v->present[VFAT_FILE_OLD] = (v->size[VFAT_FILE_OLD] > 0U);
     }
-    v->serial = 0x46530000UL ^ (LogRing_FirstSeq(r) * 2654435761UL) ^ v->n;
+    {
+        uint32_t uid[3];
+        VFAT_DEVICE_UID(uid);
+        v->serial = VFat_Serial(uid);
+    }
     VFat_Layout(v);
     return v->state;
 }

@@ -34,6 +34,8 @@ extern char USERPath[];
 #include <string.h>
 /* Хост видит не флеш, а виртуальный том, собранный из журнала (П5б).
  * Реализация vfat.h включена здесь — в прошивке ровно один раз. */
+#define VFAT_DEVICE_UID(w) \
+  ((w)[0] = HAL_GetUIDw0(), (w)[1] = HAL_GetUIDw1(), (w)[2] = HAL_GetUIDw2())
 #define VFAT_IMPLEMENTATION
 #include "vfat.h"
 
