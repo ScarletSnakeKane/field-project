@@ -32,6 +32,7 @@
 #include "aht20.h"
 #include "spiflash.h"
 #include "storage_policy.h"
+#include "log_ring.h"
 #include "time_service.h"
 #include "soil_sensor.h"
 #include "soil_curve.h"
@@ -94,28 +95,16 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
  * ~0.1–0.3 мс раз в 15 с, доли микроампера среднего (расчёт — в отчёте П4). */
 #define WDG_KICK_SEC       15U
 
-/* Потолок размера архива. Тому заявлено 4 МБ ради FAT16 (см. spiflash.h), но
- * физически есть только 2 МБ, из которых на служебные структуры уходит ~50 КБ.
- * Предел взят с запасом ниже физической границы: перешагнув её, запись уходила
- * бы в несуществующие сектора. Достигнув предела, устройство перестаёт писать
- * и продолжает считать неудачи — данные не теряются молча. */
-#define CSV_MAX_BYTES   1800000UL
+/* Замеры, записанные во время USB-сессии (A3): флеш в это время отдаётся
+ * хосту, и журнал её не трогает — записи ждут в RAM конца сессии. Сессия
+ * может длиться сутки: 48 записей — двое суток часовых замеров, 3 КБ RAM
+ * (буфер work[4096] прежнего FatFs-пути освобождён). */
+#define LOG_PENDING_MAX   48U
 
-/* Смещение байта типа раздела в MBR: таблица разделов с 446, поле System +4. */
-#define MBR_PART_TYPE_OFS   450U
-
-/* Содержимое остаётся CSV, но расширение .txt: на Android с .csv обычно не
- * связано ни одно приложение, и файл видно, а открыть нечем. Текстовую
- * смотрелку телефон имеет всегда, а на компьютере .txt открывается и
- * блокнотом, и Excel через мастер импорта. */
-#define DATA_FILE       "data.txt"
-#define DATA_FILE_OLD   "data.csv"   /* архив старых прошивок: уходит в data_N.txt */
-
-/* Набор колонок CSV. Держим одной строкой, чтобы при старте сверить с тем, что
- * уже лежит в файле: состав колонок меняется от версии к версии, а архив теперь
- * переживает перезагрузку — иначе строки разного формата смешались бы в одном файле.
- * Архив с другим заголовком не стирается, а уходит в data_N.txt (A11/C5). */
-/* Сначала то, ради чего прибор существует, затем состояние питания, затем
+/* Набор колонок CSV — LOG_CSV_HEADER в log_record.h, строка — его же
+ * LogRecord_FormatCsv: архив теперь — двоичный журнал (log_ring.h), а CSV
+ * из него собирается при чтении.
+ * Сначала то, ради чего прибор существует, затем состояние питания, затем
  * признаки достоверности, диагностика и в конце сырые отсчёты. Отладочные
  * колонки времени цикла и внутренних кодов AHT20 сняты: они своё отработали.
  * Оставшиеся нужны и в поле: по ним видно, ПОЧЕМУ значение отсутствует или
@@ -132,9 +121,13 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
  *   i2c_rec       — шину I2C пришлось освобождать (B6): 1 тактами, 2 снятием
  *                   питания, 3 не освободилась;
  *   sens_off      — карантин питания датчиков: сколько циклов ещё без питания;
- *   write_fails   — сколько строк за всю жизнь не удалось записать; вырос
- *                   без пропуска строки — это отметка «архив заполнен» (S2):
- *                   дальше строк не будет, пока не освободят место;
+ *   write_fails   — сколько раз за всю жизнь запись строки не удалась:
+ *                   отказ флеш или переполнение очереди. При отказе флеш
+ *                   строка ждёт в очереди следующего цикла (T6) и обычно
+ *                   потом ложится — счётчик считает попытки, а не потери;
+ *                   пропадает она при переполнении очереди и при отказе с
+ *                   непрочитанной сверкой (повтор дал бы дубль). Заполнения архива больше нет: журнал
+ *                   кольцевой, и старейшие записи уходят сами (G1);
  *   lowpower_skips — сколько строк пропущено из-за низкого питания (П1, C3);
  *   reset_cause   — почему стартовали: биты флагов сброса и код сбоя
  *                   (Policy_ResetCause);
@@ -143,11 +136,7 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
  *   soil_raw, bat_raw — отсчёты АЦП почвы и делителя банки (0..4095): по ним
  *                   и vdd значения можно пересчитать заново, если уплывёт
  *                   калибровка. */
-#define CSV_HEADER "timestamp,air_temp,air_hum,soil_temp,soil_hum," \
-                   "bat_pct,vbat,vdd,soil_valid,lse_ok,time_ok," \
-                   "aht_init_st,aht_read_st,ds_err,air_xchk,i2c_rec,sens_off," \
-                   "write_fails,lowpower_skips,reset_cause,boot_count," \
-                   "soil_raw,bat_raw"
+#define CSV_HEADER LOG_CSV_HEADER
 
 /* Опора и канал АЦП — как в soil_sensor.c и battery.c: оттуда отсчёты наружу
  * не отдаются, а модули не наши. Почва — тот же отсчёт, обращённый из
@@ -166,13 +155,11 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-FRESULT res;
-static BYTE work[4096];
-FIL file;
 static uint8_t lse_ok = 0;   /* запустился ли LSE-кварц (иначе метки времени врут) */
 static uint8_t time_ok = 0;  /* можно ли верить часам (A6, Policy_TimeTrusted) */
 static volatile uint8_t woke_by_button = 0;  /* выставляется в EXTI-колбэке кнопки */
-static uint8_t fs_ok = 0;    /* смонтирована ли файловая система */
+/* Открыт ли журнал. Имя прежнее (было «смонтирована ФС»): его знает дампер. */
+static uint8_t fs_ok = 0;
 static uint32_t write_fails = 0;  /* накопленное число неудачных записей строки */
 static Policy_Button btn_policy;  /* удержание KEY через все циклы сна (A1) */
 static uint16_t reset_cause = 0;  /* почему стартовали — Policy_ResetCause */
@@ -181,6 +168,10 @@ static uint8_t  i2c_rec     = 0;  /* как освобождали шину в �
 static Policy_Quarantine sens_quarantine;  /* карантин питания датчиков */
 static Policy_Usb    usb_policy;  /* VBUS без хоста через все циклы сна (A9) */
 static volatile uint8_t woke_by_vbus = 0;    /* фронт VBUS: вставили кабель */
+static LogRing      log_ring;      /* журнал замеров на флеш (log_ring.h) */
+static LogOldVolume log_old;       /* разбор старого тома для импорта — только при старте */
+static LogRecord    log_pending[LOG_PENDING_MAX];   /* очередь USB-сессии (A3) */
+static uint8_t      log_pending_n = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -224,42 +215,92 @@ static void Watchdog_Kick(void)
   IWDG->KR = 0x0000AAAAU;
 }
 
-/* Занято ли имя на томе — для Storage_PickOldArchiveName. Ошибка тома —
- * не «свободно» и не «занято»: перебор прекращается, файл остаётся на месте. */
-static uint8_t Archive_NameTaken(const char *name, void *ctx)
-{
-  FILINFO fi;
-  (void)ctx;
-  FRESULT r = f_stat(name, &fi);
-  Watchdog_Kick();
-  return (r == FR_NO_FILE) ? STORAGE_NAME_FREE
-       : (r == FR_OK)      ? STORAGE_NAME_TAKEN : STORAGE_NAME_ERROR;
-}
+/* Журнал работает с флеш через драйвер, а в долгих местах (сканирование
+ * при старте, стирание сектора — у SST26 до 25 мс, импорт старого тома)
+ * пинает сторожа сам. Защиту блоков он снимает перед каждой записью (T2). */
+static const LogFlashOps log_ops = {
+  SPI_Flash_Read, SPI_Flash_Write, SPI_Flash_EraseSector, Watchdog_Kick, SPI_Flash_Unlock
+};
 
-/* Убрать файл архива с дороги, не удаляя: data_N.txt с первым свободным N.
- * Возвращает 1, если переименован. */
-static uint8_t Archive_RenameAway(const char *path)
+/* Открыть журнал: найти голову и хвост, а на первом старте после старой
+ * прошивки — перенести старый архив (импорт пишет, поэтому только при
+ * may_write). Сорванное чтение — до трёх попыток с повторной инициализацией
+ * флеш: одно искажённое чтение после просадки не должно решать судьбу
+ * архива. Инициализация (выход из DPD, снятие защиты) — перед каждой
+ * попыткой, включая первую: из цикла сюда попадают только после отказа, а
+ * флеш могла пережить свой сброс по питанию и стоять запертой (T2).
+ * Возвращает 1, если журнал открыт. */
+static uint8_t Archive_Open(uint8_t may_write)
 {
-  char old_name[13];
-  if (Storage_PickOldArchiveName(Archive_NameTaken, NULL, old_name) == 0U)
-      return 0;
-  return (f_rename(path, old_name) == FR_OK) ? 1U : 0U;
-}
-
-/* Открыть data.txt на дозапись. Нет файла — создаётся; пуст — сначала
- * заголовок. Так файл, удалённый владельцем с компьютера по USB (по
- * решению владельца — единственный способ стереть архив; пока MSC отдаёт
- * том только для чтения, путь не работает — см. отчёт П4), начинается
- * заново с заголовком, а не со строки данных без имён колонок. */
-static FRESULT Archive_OpenForAppend(FIL *f)
-{
-  FRESULT r = f_open(f, DATA_FILE, FA_OPEN_APPEND | FA_WRITE);
-  if (r == FR_OK && f_size(f) == 0U && f_puts(CSV_HEADER "\n", f) < 0)
+  uint8_t r = LOG_OPEN_EIO;
+  for (uint8_t attempt = 0; attempt < 3U && r == LOG_OPEN_EIO; attempt++)
   {
-      f_close(f);
-      return FR_DISK_ERR;
+      SPI_Flash_Init();
+      r = LogArchive_Open(&log_ring, &log_ops, LOG_FLASH_SECTORS, may_write, &log_old);
+      Watchdog_Kick();
   }
-  return r;
+  return (r == LOG_OPEN_OK) ? 1U : 0U;
+}
+
+/* Метка последнего замера в архиве — для Policy_TimeTrusted (A6). Сразу
+ * после импорта замеров в журнале ещё нет: тогда метка берётся из хвоста
+ * перенесённого текста, как раньше из хвоста data.txt. Возвращает 1, если
+ * архив прочитан (метки может и не быть), 0 — сбой чтения. */
+static uint8_t Archive_LastTimestamp(char *out)
+{
+  LogRecord rec;
+  uint32_t  idx;
+  out[0] = '\0';
+  uint8_t st = LogRing_Newest(&log_ring, &rec, &idx);
+  if (st != LOG_READ_OK)
+      return (st == LOG_READ_NONE) ? 1U : 0U;   /* сбой чтения — архив не прочитан */
+  if (LogRecord_Type(&rec) == LOG_TYPE_IMPORT_END &&
+      (idx == 0U || LogRing_Read(&log_ring, --idx, &rec) != LOG_READ_OK))
+      return 1;
+  if (LogRecord_Type(&rec) == LOG_TYPE_MEAS)
+  {
+      LogMeas m;
+      LogRecord_UnpackMeas(&rec, &m);
+      if (Storage_IsTimestamp(m.ts))
+      {
+          memcpy(out, m.ts, STORAGE_TS_LEN);
+          out[STORAGE_TS_LEN] = '\0';
+      }
+      return 1;
+  }
+  /* Хвост текста: до четырёх последних записей TEXT (~200 байт) — хватает
+   * на последнюю строку целиком. */
+  char     tail[4U * LOG_TEXT_MAX];
+  uint32_t n = 0;
+  uint8_t  from_start = 0;
+  for (uint32_t k = 0; k < 4U; k++)
+  {
+      const uint8_t *t;
+      uint32_t len = LogRecord_Text(&rec, &t, NULL);
+      if (len == 0U)
+      {
+          from_start = (LogRecord_Type(&rec) == LOG_TYPE_IMPORT_FILE);
+          break;
+      }
+      memmove(tail + len, tail, n);
+      memcpy(tail, t, len);
+      n += len;
+      if (idx == 0U || LogRing_Read(&log_ring, --idx, &rec) != LOG_READ_OK)
+          break;
+  }
+  (void)Storage_LastTimestamp(tail, n, from_start, out);
+  return 1;
+}
+
+/* Дописать запись в журнал. Отказ — write_fails и переоткрытие журнала в
+ * следующем цикле: состояние в RAM могло разойтись с флеш. */
+static uint8_t Archive_Append(LogRecord *rec)
+{
+  if (fs_ok && LogRing_Append(&log_ring, rec))
+      return 1;
+  write_fails++;
+  fs_ok = 0;
+  return 0;
 }
 
 /* USB поднимается только из цикла удержания, когда VBUS уже есть, и только
@@ -643,223 +684,40 @@ int main(void)
   // новая прошивка должна переставить его на своё время сборки.
   uint8_t time_sync = Time_SyncToBuildIfNeeded();
 
-  /* Флеш занята основным потоком с этого места и до конца первой дозаписи
-   * в цикле (первый проход идёт без сна, так что это пара секунд). USB до
-   * этого не поднимается вовсе (A3); флаг — вторая линия обороны на случай,
-   * если порядок когда-нибудь снова поменяют: хост не должен читать том,
-   * пока его монтируют, сверяют заголовок и пишут первую строку. Флаг
-   * снимает блок дозаписи. */
+  /* Флеш занята основным потоком с этого места и до конца первой записи
+   * в цикле (первый проход идёт без сна, так что это пара секунд, а при
+   * импорте старого архива — до минуты). USB до этого не поднимается вовсе
+   * (A3); флаг — вторая линия обороны на случай, если порядок когда-нибудь
+   * снова поменяют. Флаг снимает блок записи. */
   SPI_Flash_SetBusy(1);
 
   // 1) Инициализация SPI флеш
   SPI_Flash_Init();
 
-  // 2) Монтируем диск. Форматируем ТОЛЬКО если файловой системы на флеш нет:
-  //    безусловный f_mkfs стирал накопленные данные при каждом старте, то есть
-  //    любой сброс или севшая и заменённая батарея в поле обнуляли весь архив.
-  //    До трёх попыток с повторной инициализацией флеш: одно сорванное чтение
-  //    после просадки питания не должно решать судьбу тома.
-  for (uint8_t attempt = 0; attempt < 3; attempt++)
-  {
-      if (attempt > 0)
-      {
-          f_mount(NULL, USERPath, 0);
-          SPI_Flash_Init();
-      }
-      res = f_mount(&USERFatFS, USERPath, 1);
-      if (res == FR_OK)
-          break;
-  }
-  Watchdog_Kick();
-
-  /* Раньше здесь всё, что не FAT16, принудительно переформатировалось — ради
-   * Android, который FAT12 не монтирует. Это стирало рабочий архив любой
-   * старой прошивки. Теперь существующий FAT12 монтируется и пишется как
-   * есть; Android его не увидит, Windows и Linux читают. Перевести такой
-   * прибор на FAT16 можно только сознательно, сняв архив и стерев флеш. */
-
-  /* Питание для форматирования и правки MBR — по тому же правилу, что и для
-   * дозаписи: обе операции стирают 4-КБ блоки со служебными структурами. */
+  /* 2) Журнал. Файловой системы на флеш больше нет: архив — кольцевой
+   *    журнал (log_ring.h), он не форматируется и не заполняется. На первом
+   *    старте после прошивки с FAT-томом старый архив (data.txt, data_N.txt)
+   *    переносится в журнал как есть — это запись, поэтому только при
+   *    достаточном питании (то же правило, что для замеров). Без питания
+   *    импорт ждёт: журнал не открыт, цикл пробует снова каждый раз. */
   Battery_Data bat_boot;
   Battery_Read(&bat_boot);
   uint8_t boot_power_ok = Storage_MayWrite(bat_boot.valid, bat_boot.low, bat_boot.vdd);
-
-  if (res == FR_NO_FILESYSTEM)
-  {
-      /* «Нет ФС» по мнению FatFs — ещё не повод стирать: так же выглядит
-       * одно искажённое чтение или прерванная перезапись блока 0. Форматируем
-       * только чистую флеш — правило и его обоснование в storage_policy.h. */
-      BYTE *mbr  = work;
-      BYTE *boot = work + FLASH_SECTOR_BYTES;
-      BYTE *root = work + 2 * FLASH_SECTOR_BYTES;
-      uint8_t reads_ok =
-          (disk_read(0, mbr, 0, 1) == RES_OK) &&
-          (disk_read(0, boot, STORAGE_BOOT_SECTOR, 1) == RES_OK);
-
-      uint8_t may_format = Storage_MayFormat(1, reads_ok, mbr, boot);
-
-      /* Не чистая — но, может быть, это наш же формат, сорванный между
-       * загрузочным сектором и MBR (R3). Без этой проверки такой прибор
-       * больше никогда не форматировался бы и молча не писал ничего. */
-      if (!may_format && reads_ok)
-      {
-          uint32_t root_lba = Storage_OurRootDirSector(boot);
-          uint8_t  root_ok  = (root_lba != 0) &&
-                              (disk_read(0, root, root_lba, 1) == RES_OK);
-          may_format = Storage_MayRedoFormat(1, reads_ok, root_ok, mbr, boot, root);
-      }
-
-      if (boot_power_ok && may_format)
-      {
-          /* Решение «форматировать» принято по содержимому флеш один раз;
-           * повторы его не пересматривают — после первой попытки загрузочный
-           * сектор уже записан. Повтор нужен потому, что f_mkfs теперь может
-           * вернуть FR_DISK_ERR по несошедшейся сверке блока, а без него
-           * одна такая сверка оставляла прибор без тома до следующего старта.
-           * Перед повтором питание проверяется заново: если сбой был от
-           * просадки, долбить флеш дальше нельзя. */
-          for (uint8_t attempt = 0; attempt < 3; attempt++)
-          {
-              if (attempt > 0)
-              {
-                  Battery_Read(&bat_boot);
-                  boot_power_ok = Storage_MayWrite(bat_boot.valid, bat_boot.low, bat_boot.vdd);
-                  if (!boot_power_ok)
-                      break;
-                  SPI_Flash_Init();
-              }
-              /* Размер кластера задан явно — 512 байт, минимум. Автовыбор для тома 4 МБ
-               * взял бы 1 КБ, кластеров получилось бы около 4050 при пороге FAT16 в 4085,
-               * и том снова вышел бы FAT12 — тот самый, который Android не монтирует. */
-              Watchdog_Kick();
-              res = f_mkfs(USERPath, FM_FAT, FLASH_SECTOR_BYTES, work, sizeof(work));
-              if (res == FR_OK)
-              {
-                  res = f_mount(&USERFatFS, USERPath, 1);
-                  break;
-              }
-          }
-      }
-      else if (boot_power_ok && Storage_MayRestoreMbr(1, reads_ok, mbr, boot, FLASH_VIRT_SECTORS))
-      {
-          /* Том с архивом без MBR — прерванная правка байта типа ниже (R3).
-           * Архив цел, но без MBR FatFs и хост раздела не видят, и прибор
-           * навсегда остался бы с fs_ok = 0. MBR однозначно выводится из
-           * загрузочного сектора — восстанавливаем его, данные не трогаем.
-           * Флеш занята (флаг выше), питание проверено, как для формата. */
-          BYTE *fresh = work + 3 * FLASH_SECTOR_BYTES;
-          Storage_BuildMbr(boot, fresh);
-          if (disk_write(0, fresh, 0, 1) == RES_OK)
-          {
-              f_mount(NULL, USERPath, 0);
-              res = f_mount(&USERFatFS, USERPath, 1);
-          }
-      }
-  }
-
-  /* Раньше здесь стоял while(1) — отказ монтирования означал вечное зависание
-   * в активном режиме, то есть посаженную за пару дней батарею и полную тишину
-   * в данных. Теперь это не фатально: помечаем ФС как неисправную и пробуем
-   * перемонтировать раз в цикл, засыпая между попытками. Нечистая флеш без
-   * распознаваемой ФС так и остаётся с fs_ok = 0: архив на ней не трогаем.
-   * Сорванный в этой загрузке формат доделается на следующем старте —
-   * его узнаёт Storage_MayRedoFormat. */
-  fs_ok = (res == FR_OK) ? 1U : 0U;
-
-  /* Android считает раздел пригодным для монтирования, только если байт типа
-   * в таблице MBR входит в его короткий список: 0x0B, 0x0C, 0x0E (FAT) или
-   * 0x83 (Linux). FatFs для тома меньше 65536 секторов проставляет 0x04 —
-   * совершенно законный FAT16, который Windows читает без единого вопроса,
-   * а vold молча пропускает и показывает «Unsupported USB drive».
-   * Переписываем тип на 0x0E (FAT16 LBA). Правка затрагивает один байт в MBR,
-   * данные и файловую систему не трогает и повторное выполнение безвредно.
-   * Только для FAT16: у оставленного как есть FAT12 тип 0x01, и 0x0E был бы
-   * для него ложью. */
-  if (fs_ok && boot_power_ok && USERFatFS.fs_type == FS_FAT16 &&
-      disk_read(0, work, 0, 1) == RES_OK)
-  {
-      if (work[MBR_PART_TYPE_OFS] != 0x0E)
-      {
-          work[MBR_PART_TYPE_OFS] = 0x0E;
-          disk_write(0, work, 0, 1);
-      }
-  }
+  fs_ok = Archive_Open(boot_power_ok);
 
   /* Можно ли верить часам (A6). Календарь живёт в backup-домене, а тот на
    * этой плате сидит на VDD: замена банки возвращает часы на время сборки.
    * Отличить это от свежей прошивки помогает только архив — правило в
    * Policy_TimeTrusted; итог — в time_ok каждой строки и в DR3 до следующего
-   * сброса. Хвоста в 192 байта хватает на последнюю строку целиком. */
+   * сброса. Пустой журнал прочитан — противоречить нечему. */
   {
       char last_ts[STORAGE_TS_LEN + 1] = "";
       char build_ts[STORAGE_TS_LEN + 1];
-      uint8_t archive_read = 0;
-      if (fs_ok)
-      {
-          FIL tf;
-          FRESULT tr = f_open(&tf, DATA_FILE, FA_READ);
-          if (tr == FR_NO_FILE)
-              archive_read = 1;   /* архива нет — противоречить нечему */
-          else if (tr == FR_OK)
-          {
-              char tail[192];
-              UINT br = 0;
-              FSIZE_t sz   = f_size(&tf);
-              FSIZE_t from = (sz > sizeof(tail)) ? sz - sizeof(tail) : 0;
-              if (f_lseek(&tf, from) == FR_OK && f_read(&tf, tail, sizeof(tail), &br) == FR_OK)
-              {
-                  archive_read = 1;
-                  (void)Storage_LastTimestamp(tail, (uint32_t)br, from == 0, last_ts);
-              }
-              f_close(&tf);
-          }
-      }
+      uint8_t archive_read = fs_ok && Archive_LastTimestamp(last_ts);
       Time_BuildTimestamp(build_ts, sizeof(build_ts));
       time_ok = Policy_TimeTrusted(time_sync, Time_GetTrusted(), archive_read, last_ts, build_ts);
       Time_SetTrusted(time_ok);
   }
-
-  // 2b) Архив начинается заново в двух случаях:
-  //     — владелец удалил data.txt с компьютера по USB — это единственный
-  //       способ стереть архив (сейчас MSC только для чтения — путь
-  //       заработает, когда включат запись, см. отчёт П4); прошивка сама
-  //       архив не удаляет никогда;
-  //     — заголовок в файле не совпал с текущим (залита версия с другим составом
-  //       колонок) — иначе строки разного формата смешались бы в одном файле.
-  //     Старый файл при этом не удаляется, а переименовывается в data_N.txt
-  //     (A11/C5): раньше f_unlink уносил весь архив при любой перепрошивке
-  //     с новой колонкой и при одном сорванном чтении первой строки.
-  //     Все операции ниже — под флагом занятости флеш (выставлен выше) и
-  //     только при достаточном питании, как и форматирование.
-  if (fs_ok && boot_power_ok)
-  {
-      FIL hf;
-      uint8_t action = STORAGE_HDR_KEEP;
-      if (f_open(&hf, DATA_FILE, FA_READ) == FR_OK)
-      {
-          char hdr[sizeof(CSV_HEADER) + 8];
-          uint8_t read_ok = (f_gets(hdr, sizeof(hdr), &hf) != NULL);
-          action = Storage_HeaderAction(read_ok, hdr, CSV_HEADER);
-          f_close(&hf);
-      }
-
-      /* Не нашлось свободного имени или переименование не прошло — файл
-       * остаётся на месте и дописывается строками нового формата: смешанные
-       * форматы лучше потерянного архива. */
-      if (action == STORAGE_HDR_RENAME)
-          (void)Archive_RenameAway(DATA_FILE);
-
-      /* Файл переименован из .csv в .txt ещё старой прошивкой. Раньше старый
-       * data.csv здесь удалялся — но это тоже архив, просто давний: теперь
-       * он уходит под тем же правилом в data_N.txt. Нет файла — нет и дела. */
-      FILINFO fi;
-      if (f_stat(DATA_FILE_OLD, &fi) == FR_OK)
-          (void)Archive_RenameAway(DATA_FILE_OLD);
-  }
-
-  // 3) Новый data.txt с заголовком создаёт первая же дозапись в цикле
-  //    (Archive_OpenForAppend) — она же восстанавливает заголовок, если файл
-  //    удалили с компьютера по USB посреди работы.
 
   /* Датчики поднимает и гасит сам цикл, здесь они не нужны. Явно обесточиваем
    * их перед первым сном: MX_GPIO_Init() оставляет питание включённым, и без
@@ -1003,129 +861,55 @@ int main(void)
 	  char ts[32];
 	  Time_GetTimestamp(ts, sizeof(ts));
 
-	  /* На просевшем питании не пишем вовсе: каждая дозапись стирает и
-	   * перепрограммирует 4-КБ блоки каталога и FAT, и сбой посреди них теряет
-	   * весь data.txt. Правило — в storage_policy.h. Пропуски считаем отдельно
-	   * от write_fails: это не отказ тома; в CSV — колонка lowpower_skips. */
+	  /* На просевшем питании не пишем вовсе: стирание сектора — пик тока, и
+	   * программирование вне паспорта по VDD «проходит» без ошибок шины.
+	   * Правило — в storage_policy.h. Пропуски считаем отдельно от
+	   * write_fails: это не отказ флеш; в CSV — колонка lowpower_skips. */
 	  static volatile uint32_t lowpower_skips = 0;
 	  uint8_t power_ok = Storage_MayWrite(bat.valid, bat.low, bat.vdd);
 
-	  /* Флеш наша до конца блока: MSC в это время отвечает хосту «не готов». */
-	  SPI_Flash_SetBusy(1);
+	  /* Замер — в двоичную запись журнала; строка CSV из неё собирается при
+	   * чтении (LogRecord_FormatCsv) — тем же форматом, что раньше. Счётчики
+	   * — на момент замера, как и прежде в строке. */
+	  LogMeas meas;
+	  memcpy(meas.ts, ts, sizeof(meas.ts) - 1U);
+	  meas.ts[sizeof(meas.ts) - 1U] = '\0';
+	  meas.air_temp       = aht.temperature;
+	  meas.air_hum        = aht.humidity;
+	  meas.soil_temp      = soil_temp;
+	  meas.soil_hum       = soil_hum;
+	  meas.bat_valid      = bat.valid;
+	  meas.bat_low        = bat.low;
+	  meas.bat_percent    = bat.percent;
+	  meas.bat_volts      = bat.volts;
+	  meas.vdd            = bat.vdd;
+	  meas.lse_ok         = lse_ok;
+	  meas.time_ok        = time_ok;
+	  meas.aht_init_st    = (int)aht_init_st;
+	  meas.aht_read_st    = (int)aht_read_st;
+	  meas.ds_err         = ds_err;
+	  meas.air_xchk       = air_xchk;
+	  meas.i2c_rec        = i2c_rec;
+	  meas.sens_off       = sens_off;
+	  meas.write_fails    = write_fails;
+	  meas.lowpower_skips = lowpower_skips;
+	  meas.reset_cause    = reset_cause;
+	  meas.boot_count     = boot_count;
+	  meas.soil_raw       = soil_raw;
+	  meas.bat_raw        = bat_raw;
+	  LogRecord rec;
+	  LogRecord_PackMeas(&rec, &meas);
 
-	  /* Пока шла USB-сессия, хост читал флеш в обход FatFs. Сам том он не
-	   * меняет (только чтение), но кэш FatFs — окно сектора и FSINFO — мог
-	   * разойтись с флеш после сбоев прошлых циклов; перемонтирование дёшево
-	   * и гарантирует, что дозапись начнётся с того, что лежит на флеш. */
-	  if (SPI_Flash_TakeHostSession() && fs_ok)
+	  if (usb_started)
 	  {
-	      f_mount(NULL, USERPath, 0);
-	      fs_ok = 0;
-	  }
-
-	  /* Если ФС не смонтирована (сбой при старте или отвалилась позже) — пробуем
-	   * поднять её заново, но не чаще одного раза за цикл. Между попытками
-	   * устройство спит, поэтому даже неустранимая поломка не сажает батарею. */
-	  if (!fs_ok)
-	      fs_ok = (f_mount(&USERFatFS, USERPath, 1) == FR_OK) ? 1U : 0U;
-
-	  FIL file;
-	  res = !power_ok ? FR_DENIED
-	      : fs_ok     ? Archive_OpenForAppend(&file)
-	                  : FR_NOT_READY;
-
-	  /* Архив заполнен — закрываем файл и не пишем: следующая строка ушла бы
-	   * за физическую границу флеш. Заполнен — это не только data.txt до
-	   * CSV_MAX_BYTES: старые data_N.txt занимают ту же физическую флеш, и
-	   * место считается по ней (S2, правило — Storage_ArchiveRoom). Раньше по
-	   * ним никто не считал: дозапись уходила в несуществующий сектор, том
-	   * перемонтировался каждый цикл, и архив вставал без единого следа.
-	   * Теперь первая строка после заполнения пишется из запаса как отметка
-	   * — в ней write_fails уже вырос, хотя строка на месте и без пропуска по
-	   * времени, — а дальше write_fails растёт без строк. Отметка — одна на
-	   * старт: перезапуск пишет ещё одну, пока цел запас. */
-	  static uint8_t archive_marked = 0;
-	  if (res == FR_OK)
-	  {
-	      DWORD   fre_clst = 0;
-	      FATFS  *vol      = NULL;
-	      FRESULT gf_res   = f_getfree(USERPath, &fre_clst, &vol);
-	      uint8_t room     = STORAGE_ROOM_FULL;
-	      if (gf_res == FR_OK)
-	          room = Storage_ArchiveRoom(f_size(&file), CSV_MAX_BYTES,
-	                                     Storage_PhysFreeClusters(fre_clst, vol->n_fatent,
-	                                                              vol->database, vol->csize,
-	                                                              FLASH_PHYS_SECTORS),
-	                                     archive_marked);
-	      if (gf_res != FR_OK)
-	      {
-	          f_close(&file);
-	          res = gf_res;   /* том не ответил — обычный отказ с перемонтированием */
-	      }
-	      else if (room == STORAGE_ROOM_FULL)
-	      {
-	          f_close(&file);
-	          res = FR_DENIED;
-	      }
-	      else if (room == STORAGE_ROOM_MARK)
-	      {
+	      /* Идёт USB-сессия (замер пришёлся на время, когда хост держит
+	       * плату, C8): флеш отдаётся хосту, журнал её не трогает (A3).
+	       * Запись ждёт в RAM и уйдёт на флеш в первом цикле после сессии.
+	       * Очередь полна — замер теряется, и это видно по write_fails. */
+	      if (log_pending_n < LOG_PENDING_MAX)
+	          log_pending[log_pending_n++] = rec;
+	      else
 	          write_fails++;
-	          archive_marked = 1;
-	      }
-	  }
-
-	  if (res == FR_OK)
-	  {
-	      char line[224];   /* строка ~130 символов; запас — на nan и длинные счётчики */
-	      /* Перевод строки задаём одним "\n": FatFs собран с _USE_STRFUNC = 2,
-	       * и f_puts сам разворачивает \n в \r\n. Со старым "\r\n" в формате на
-	       * диск уходило "\r\r\n" — лишний байт в каждой строке и мусорный
-	       * символ в конце последнего поля при разборе строгим парсером. */
-	      snprintf(line, sizeof(line),
-	               "%s,%.2f,%.2f,%.2f,%.2f,%.0f,%.2f,%.3f,%u,%u,%u,%d,%d,%u,%u,%u,%lu,"
-	               "%lu,%lu,%u,%lu,%.0f,%.0f\n",
-	               ts,
-	               aht.temperature,
-	               aht.humidity,
-	               soil_temp,
-	               soil_hum,
-	               /* Отказ замера батареи — nan в обеих колонках, как у остальных
-	                * датчиков. Раньше здесь печаталось "0,0.00" — «батарея пуста»,
-	                * и прогноз ресурса строился на ложной точке. Процент выводится
-	                * через %.0f ради того же nan; для целых 0..100 вывод прежний. */
-	               bat.valid ? (double)bat.percent : (double)NAN,
-	               bat.valid ? (double)bat.volts   : (double)NAN,
-	               (double)bat.vdd,
-	               /* soil_valid: ниже дропаута LDO опора АЦП уплывает вместе с банкой,
-	                * поэтому влажность почвы с этого момента недостоверна. */
-	               (unsigned)(bat.valid && !bat.low),
-	               (unsigned)lse_ok,
-	               (unsigned)time_ok,
-	               (int)aht_init_st,
-	               (int)aht_read_st,
-	               (unsigned)ds_err,
-	               (unsigned)air_xchk,
-	               (unsigned)i2c_rec,
-	               (unsigned long)sens_off,
-	               (unsigned long)write_fails,
-	               (unsigned long)lowpower_skips,
-	               (unsigned)reset_cause,
-	               (unsigned long)boot_count,
-	               (double)soil_raw,
-	               (double)bat_raw);
-
-	      int      puts_res  = f_puts(line, &file);
-	      FRESULT  close_res = f_close(&file);
-
-	      /* Раньше результат записи игнорировался: заполнившийся том или сбой SPI
-	       * молча съедали строку, и в данных это выглядело просто как её отсутствие.
-	       * Считаем отказы и требуем перемонтирования на следующем цикле — том мог
-	       * отвалиться, и переподключение это чинит. */
-	      if (puts_res < 0 || close_res != FR_OK)
-	      {
-	          write_fails++;
-	          fs_ok = 0;
-	      }
 	  }
 	  else if (!power_ok)
 	  {
@@ -1133,14 +917,59 @@ int main(void)
 	  }
 	  else
 	  {
-	      write_fails++;
-	      /* Заполненный архив — не поломка тома, перемонтирование тут не поможет
-	       * и только зря потратит энергию на каждом цикле. */
-	      if (res != FR_DENIED)
-	          fs_ok = 0;   /* не открылось — пробуем перемонтировать в следующем цикле */
+	      /* Флеш наша до конца блока: MSC в это время отвечает хосту «не готов». */
+	      SPI_Flash_SetBusy(1);
+
+	      /* Журнал не открыт (сбой при старте, отказ записи, импорт ждал
+	       * питания) — пробуем снова, но не чаще раза за цикл. Между
+	       * попытками устройство спит, поэтому даже неустранимая поломка не
+	       * сажает батарею. */
+	      if (!fs_ok)
+	          fs_ok = Archive_Open(1);
+
+	      /* Сначала то, что ждало в очереди, — по порядку. Неудача (журнал не
+	       * открылся, отказ флеш) оставляет хвост очереди на следующий цикл;
+	       * запись с непрочитанной сверкой не повторяется — то же правило,
+	       * что для нового замера (T6). */
+	      uint8_t done = 0;
+	      while (done < log_pending_n)
+	      {
+	          uint8_t q_open = fs_ok;
+	          if (Archive_Append(&log_pending[done]))
+	          {
+	              done++;
+	              continue;
+	          }
+	          if (!Storage_RequeueFailed(q_open, log_ring.mounted))
+	              done++;
+	          break;
+	      }
+	      if (done > 0U)
+	      {
+	          memmove(&log_pending[0], &log_pending[done],
+	                  (uint32_t)(log_pending_n - done) * sizeof(LogRecord));
+	          log_pending_n = (uint8_t)(log_pending_n - done);
+	      }
+
+	      /* Очередь не ушла — новый замер встаёт за ней, чтобы не нарушить
+	       * порядок; иначе пишется сразу. Не записался — тоже в очередь,
+	       * следующий цикл переоткроет журнал и допишет (T6); кроме случая,
+	       * когда не прочиталась сверка: что легло в слот, неизвестно. */
+	      uint8_t was_open = fs_ok;
+	      if (log_pending_n == 0U)
+	      {
+	          if (!Archive_Append(&rec) &&
+	              Storage_RequeueFailed(was_open, log_ring.mounted) &&
+	              log_pending_n < LOG_PENDING_MAX)
+	              log_pending[log_pending_n++] = rec;
+	      }
+	      else if (log_pending_n < LOG_PENDING_MAX)
+	          log_pending[log_pending_n++] = rec;
+	      else
+	          write_fails++;
 	  }
 
-	  /* Здесь же снимается и флаг, выставленный при старте (см. блок монтирования). */
+	  /* Здесь же снимается и флаг, выставленный при старте (см. блок журнала). */
 	  SPI_Flash_SetBusy(0);
 
 	  /* --- выключаем датчики перед сном (HIGH) --- */
