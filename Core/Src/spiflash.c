@@ -48,8 +48,17 @@ static uint8_t SPI_Flash_WaitBusy(void)
     uint8_t cmd = FLASH_CMD_RDSR;
     uint8_t status;
     uint32_t polls = (FLASH_BUSY_TIMEOUT_MS * 1000U) / FLASH_POLL_US;
+    /* Срок — по счётчику тактов (S5). Один опрос — это не 20 мкс, а две
+     * HAL-транзакции плюс пауза, 60–100 мкс, и по одному счёту опросов
+     * мёртвая флеш (MISO в 1, BUSY висит) держала WaitBusy 1.5–2.5 с вместо
+     * заявленных 0.5 — на старте до шести таких подряд без пинка сторожа.
+     * DWT->CYCCNT запущен в main до всего остального и идёт и в прерывании,
+     * где SysTick стоит. Счёт опросов остаётся верхней границей — на случай,
+     * если счётчик тактов кто-то остановит. */
+    uint32_t t0    = DWT->CYCCNT;
+    uint32_t limit = (SystemCoreClock / 1000U) * FLASH_BUSY_TIMEOUT_MS;
 
-    while (polls-- > 0U)
+    while (polls-- > 0U && (DWT->CYCCNT - t0) < limit)
     {
         status = 0xFF;
         FLASH_CS_LOW();
