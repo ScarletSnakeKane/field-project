@@ -33,6 +33,7 @@
 #include "spiflash.h"
 #include "storage_policy.h"
 #include "log_ring.h"
+#include "vfat.h"
 #include "time_service.h"
 #include "soil_sensor.h"
 #include "soil_curve.h"
@@ -172,6 +173,7 @@ static LogRing      log_ring;      /* журнал замеров на флеш 
 static LogOldVolume log_old;       /* разбор старого тома для импорта — только при старте */
 static LogRecord    log_pending[LOG_PENDING_MAX];   /* очередь USB-сессии (A3) */
 static uint8_t      log_pending_n = 0;
+extern VFat         usb_vfat;      /* том для хоста (usbd_storage_if.c, vfat.h) */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -358,6 +360,19 @@ static void Clock_UsbOff(void)
 
 static void Usb_Start(void)
 {
+  /* Том для хоста собирается из журнала до подъёма стека (П5б): хост
+   * увидит диск, только когда размеры файлов и индекс готовы, и до конца
+   * сессии они верны — журнал в это время не пишется (A3). Проход журнала
+   * — до ~15 с на полном журнале (32 тыс. записей; расчёт — в отчёте П5б),
+   * сторож пинается изнутри. Журнал не открыт (сбой при старте, импорт
+   * ждёт питания) — пробуем открыть только чтением: том без data.txt с
+   * причиной в info.txt лучше, чем без попытки. Пишет журнал по-прежнему
+   * только цикл замера. */
+  if (!fs_ok)
+      fs_ok = Archive_Open(0);
+  (void)VFat_Build(&usb_vfat, fs_ok ? &log_ring : NULL, "build " __DATE__ " " __TIME__);
+  Watchdog_Kick();
+
   Clock_UsbOn();
   MX_USB_DEVICE_Init();
   usb_started = 1;
@@ -419,7 +434,12 @@ static uint8_t SleepUntilNextSample(void)
       /* Поднимаем стек, только пока у хоста есть шанс: VBUS, признанный
        * зарядкой, USB не поднимает (Policy_UsbKeepsAwake вернул 0). */
       if (usb_awake && !usb_started)
+      {
           Usb_Start();
+          /* Сборка тома не в счёт ожидания перечисления (USB_ENUM_MAX_MS):
+           * хост и не видел устройства, пока она шла. */
+          t_prev = HAL_GetTick();
+      }
 
       if (Policy_MeasureDue(now - t_awake, RTC_WAKEUP_INTERVAL_SEC * 1000UL))
           return 0;

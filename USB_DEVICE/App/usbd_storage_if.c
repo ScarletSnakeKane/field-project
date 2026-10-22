@@ -32,10 +32,13 @@ extern char USERPath[];
 #include "spiflash.h"   // наш драйвер SPI Flash
 #include "storage_policy.h"
 #include <string.h>
+/* Хост видит не флеш, а виртуальный том, собранный из журнала (П5б).
+ * Реализация vfat.h включена здесь — в прошивке ровно один раз. */
+#define VFAT_IMPLEMENTATION
+#include "vfat.h"
 
-/* Размеры тома живут в spiflash.h: заявленный объём больше физического. */
-#define SECTOR_SIZE     FLASH_SECTOR_BYTES
-#define SECTOR_COUNT    FLASH_VIRT_SECTORS
+#define SECTOR_SIZE     VFAT_SECTOR
+#define SECTOR_COUNT    VFAT_DISK_SECTORS
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -143,7 +146,8 @@ const int8_t STORAGE_Inquirydata_FS[] = {/* 36 */
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* USER CODE BEGIN EXPORTED_VARIABLES */
-
+/* Собирает main.c (Usb_Start) до подъёма стека, читает только Read ниже. */
+VFat usb_vfat;
 /* USER CODE END EXPORTED_VARIABLES */
 
 /**
@@ -251,10 +255,11 @@ int8_t STORAGE_IsWriteProtected_FS(uint8_t lun)
   /* USER CODE BEGIN 5 */
   UNUSED(lun);
 
-  /* Том намеренно только для чтения: архив нельзя испортить с хоста.
-   * Признак «защищён от записи» возвращён на место — причина отказа Android
-   * оказалась в другом (FAT12, см. FLASH_VIRT_SECTORS в spiflash.h), а
-   * незащищённый том Windows пытается «чинить» при каждом подключении. */
+  /* Том намеренно только для чтения: архив нельзя испортить с хоста (G3).
+   * Класс MSC по этому ответу ставит бит WP в MODE SENSE и отвечает на
+   * WRITE10 «защищён от записи», не вызывая Write. Android FAT16 принимает
+   * (FAT12 — нет, поэтому том 16 МБ, см. vfat.h), а незащищённый том Windows
+   * пытается «чинить» при каждом подключении. */
   return (USBD_FAIL);
   /* USER CODE END 5 */
 }
@@ -281,24 +286,16 @@ int8_t STORAGE_Read_FS(uint8_t lun, uint8_t *buf, uint32_t blk_addr, uint16_t bl
   if (!Storage_MscMayAccess(SPI_Flash_IsReady(), SPI_Flash_IsBusy()))
     return USBD_FAIL;
 
-  /* Заявленный тому объём вдвое больше физического (см. spiflash.h).
-   * Несуществующие сектора отдаём хосту нулями — читать по завёрнутому адресу
-   * нельзя, флеш вернула бы содержимое начала кристалла. */
-  if (blk_addr >= FLASH_PHYS_SECTORS)
-  {
-      memset(buf, 0, blk_len * SECTOR_SIZE);
-      return USBD_OK;
-  }
-
-  uint16_t phys = blk_len;
-  if ((blk_addr + blk_len) > FLASH_PHYS_SECTORS)
-  {
-      phys = (uint16_t)(FLASH_PHYS_SECTORS - blk_addr);
-      memset(buf + (phys * SECTOR_SIZE), 0, (blk_len - phys) * SECTOR_SIZE);
-  }
-
-  if (!SPI_Flash_Read(blk_addr * SECTOR_SIZE, buf, phys * SECTOR_SIZE))
-    return USBD_FAIL;
+  /* Сектор собирается из журнала (vfat.h): служебные — арифметикой, файлы
+   * — форматированием записей. Класс MSC просит по одному сектору
+   * (MSC_MEDIA_PACKET 512). Прерывание держится: подряд (копирование) —
+   * ~2 мс на сектор, в худшем случае (произвольное чтение конца сектора
+   * журнала) — ~30 мс; оценка — в отчёте П5б. Отказ флеш или расхождение
+   * журнала с индексом — ошибка чтения, хост повторит; сдвинутых байт он
+   * не получит. */
+  for (uint16_t k = 0; k < blk_len; k++)
+    if (!VFat_Read(&usb_vfat, blk_addr + k, buf + (uint32_t)k * SECTOR_SIZE))
+      return USBD_FAIL;
 
   return USBD_OK;
   /* USER CODE END 6 */
