@@ -314,6 +314,50 @@ static void test_sleep_policy(void)
     equ(Policy_ButtonKeepsAwake(&z, 1, 0, 0), 0, "нулевой потолок не заставляет ждать");
 }
 
+static void test_usb_policy(void)
+{
+    const uint32_t ENUM = 10000U;   /* USB_ENUM_MAX_MS в прошивке */
+    Policy_Usb u = {0};
+
+    puts("Уход в сон: USB");
+
+    equ(Policy_UsbKeepsAwake(&u, 0, 0, 0, 0, ENUM), 0, "VBUS нет — USB не держит");
+
+    /* Хост перечислил — держим сколько угодно: плата питается от него, а
+     * уход в STOP оборвал бы чтение. */
+    equ(Policy_UsbKeepsAwake(&u, 1, 1, 1, 0, ENUM), 1, "хост перечислил — не спим");
+    equ(Policy_UsbKeepsAwake(&u, 1, 1, 0, ENUM * 100, ENUM), 1, "сессия длинная — всё равно не спим");
+
+    /* VBUS без хоста (A9): зарядка, пауэрбанк, влага на делителе. Ждём
+     * перечисления не дольше потолка и уходим спать. */
+    Policy_Usb c = {0};
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 1, 0, ENUM), 1, "VBUS появился — ждём хоста");
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, ENUM - 1, ENUM), 1, "хоста ещё нет, потолок не достигнут");
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 1, ENUM), 0, "хоста нет 10 с — это зарядка, спим");
+
+    /* Следующие пробуждения с тем же VBUS — сразу спать, без новых 10 с:
+     * на ложном VBUS каждое такое ожидание стоило бы батарее. */
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 0, ENUM), 0, "зарядка и в следующем цикле — спим сразу");
+
+    /* Вставили кабель заново (фронт VBUS) — у нового хоста свой шанс. */
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 1, 0, ENUM), 1, "фронт VBUS — снова ждём хоста");
+    Policy_UsbKeepsAwake(&c, 1, 0, 0, ENUM, ENUM);
+    equ(Policy_UsbKeepsAwake(&c, 0, 0, 0, 0, ENUM), 0, "кабель вынули — спим");
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 0, ENUM), 1, "VBUS пропадал — прошлая неудача не в счёт");
+
+    /* Хост ушёл в сон (SUSPENDED, не CONFIGURED) — отсчёт идёт заново. */
+    Policy_Usb h = {0};
+    Policy_UsbKeepsAwake(&h, 1, 0, 1, 0, ENUM);
+    Policy_UsbKeepsAwake(&h, 1, 0, 0, ENUM - 2, ENUM);   /* перечислился в последний миг */
+    Policy_UsbKeepsAwake(&h, 1, 1, 0, 1, ENUM);
+    equ(Policy_UsbKeepsAwake(&h, 1, 0, 0, ENUM - 1, ENUM), 1, "хост уснул — ещё ждём");
+    equ(Policy_UsbKeepsAwake(&h, 1, 0, 0, 1, ENUM), 0, "хост спит дольше потолка — спим и мы");
+
+    /* Замер по расписанию, пока плата держится на шине (C8). */
+    equ(Policy_MeasureDue(3599999U, 3600000U), 0, "интервал не прошёл — замера нет");
+    equ(Policy_MeasureDue(3600000U, 3600000U), 1, "прошёл интервал — замер, не засыпая");
+}
+
 /* ----------------------------------------------------------------- AHT20 */
 
 /* Кадры AHT20: статус, пять байт данных, CRC-8 (полином 0x31, начало 0xFF).
@@ -597,6 +641,7 @@ int main(void)
     test_soil();
     test_aht20();
     test_sleep_policy();
+    test_usb_policy();
     test_storage_policy();
 
     printf("\n%d проверок, %d провалов\n", checks, failures);

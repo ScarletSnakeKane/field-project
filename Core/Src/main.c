@@ -61,6 +61,12 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 #define BTN_HOLD_POLL_MS   100U
 #define BTN_HOLD_MAX_MS    300000U   /* 5 минут */
 
+/* Сколько ждать, пока хост перечислит плату, прежде чем счесть VBUS зарядкой
+ * (A9). Windows и Linux укладываются в 1–3 с от подачи подтяжки D+, Android —
+ * до ~5 с; 10 с — с запасом. Цена на ложном VBUS — 10 с бодрствования в час,
+ * ~30 мкА среднего, против ~10 мА непрерывно раньше. */
+#define USB_ENUM_MAX_MS    10000U
+
 /* Потолок размера архива. Тому заявлено 4 МБ ради FAT16 (см. spiflash.h), но
  * физически есть только 2 МБ, из которых на служебные структуры уходит ~50 КБ.
  * Предел взят с запасом ниже физической границы: перешагнув её, запись уходила
@@ -112,6 +118,8 @@ static volatile uint8_t woke_by_button = 0;  /* выставляется в EXTI
 static uint8_t fs_ok = 0;    /* смонтирована ли файловая система */
 static uint32_t write_fails = 0;  /* накопленное число неудачных записей строки */
 static Policy_Button btn_policy;  /* удержание KEY через все циклы сна (A1) */
+static Policy_Usb    usb_policy;  /* VBUS без хоста через все циклы сна (A9) */
+static volatile uint8_t woke_by_vbus = 0;    /* фронт VBUS: вставили кабель */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -153,31 +161,49 @@ static void Usb_Stop(void)
   usb_started = 0;
 }
 
-static void SleepUntilNextSample(void)
+/* Возвращает 1, если плата уснула и проснулась, и 0, если сна не было:
+ * плата держится на шине, а подошло время очередного замера (C8). Во втором
+ * случае USB остаётся поднятым, флеш и шины — как были. */
+static uint8_t SleepUntilNextSample(void)
 {
-  /* --- Не уходим в сон, пока удерживают кнопку или подключён USB ---
+  /* --- Не уходим в сон, пока удерживают кнопку или хост держит USB ---
    * Уход в STOP рвёт USB-сессию и портит файл на стороне хоста, поэтому оба
    * признака означают одно: устройство обязано остаться на шине. Кнопка —
-   * ручной способ, VBUS — то же самое автоматически, без нажатий.
+   * ручной способ, USB — то же самое автоматически, без нажатий.
    * Датчики к этому моменту уже обесточены, лишнего тока не тратим.
-   * Правило кнопки — в power_policy.c: её потолок считается через все
-   * циклы (btn_policy живёт вне этой функции), иначе залипшая KEY держала бы
-   * плату по 5 минут каждый час. */
-  uint32_t t_prev = HAL_GetTick();
+   * Правила — в power_policy.c: потолок кнопки считается через все циклы
+   * (btn_policy живёт вне этой функции), иначе залипшая KEY держала бы
+   * плату по 5 минут каждый час; VBUS без хоста держит не дольше
+   * USB_ENUM_MAX_MS — иначе USB-зарядка или влага на делителе не давали бы
+   * спать вовсе. */
+  uint32_t t_prev  = HAL_GetTick();
+  uint32_t t_awake = t_prev;   /* замер только что был — отсчёт интервала отсюда */
+  uint8_t  vbus_edge = woke_by_vbus;
+  woke_by_vbus = 0;
   while (1)
   {
       uint8_t btn_held    = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET);
       uint8_t usb_present = (HAL_GPIO_ReadPin(VBUS_GPIO_Port, VBUS_Pin) == GPIO_PIN_SET);
+      uint8_t usb_config  = usb_started && (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED);
 
       uint32_t now = HAL_GetTick();
       uint8_t btn_awake = Policy_ButtonKeepsAwake(&btn_policy, btn_held, now - t_prev, BTN_HOLD_MAX_MS);
+      uint8_t usb_awake = Policy_UsbKeepsAwake(&usb_policy, usb_present, usb_config,
+                                               vbus_edge, now - t_prev, USB_ENUM_MAX_MS);
       t_prev = now;
+      vbus_edge = woke_by_vbus;   /* фронт за время ожидания — новый шанс хосту */
+      woke_by_vbus = 0;
 
-      if (!btn_awake && !usb_present)
+      if (!btn_awake && !usb_awake)
           break;
 
-      if (usb_present && !usb_started)
+      /* Поднимаем стек, только пока у хоста есть шанс: VBUS, признанный
+       * зарядкой, USB не поднимает (Policy_UsbKeepsAwake вернул 0). */
+      if (usb_awake && !usb_started)
           Usb_Start();
+
+      if (Policy_MeasureDue(now - t_awake, RTC_WAKEUP_INTERVAL_SEC * 1000UL))
+          return 0;
 
       /* Ждём во сне ядра (WFI), а не в занятом цикле HAL_Delay: SysTick будит
        * каждую миллисекунду, а между тиками ядро не жжёт ток впустую. */
@@ -285,6 +311,7 @@ static void SleepUntilNextSample(void)
   /* USB здесь не поднимаем: его стартует цикл удержания после записи, если
    * есть VBUS (A3). Кабель, вставленный во время замера, просто подождёт
    * до конца записи — EXTI по VBUS к тому времени уже разбудил плату. */
+  return 1;
 }
 
 /* USER CODE END 0 */
@@ -777,9 +804,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     {
         woke_by_button = 1;
     }
-    /* Для VBUS (PA9) флаг не нужен: само прерывание поднимает МК из STOP,
-     * а дальше решение принимается по фактическому уровню на выводе —
-     * пока кабель воткнут, цикл сна просто не начинается. */
+    else if (GPIO_Pin == VBUS_Pin)
+    {
+        /* Кабель вставили: даже если прошлый VBUS признан зарядкой, у этого
+         * хоста свой шанс перечислить плату (Policy_UsbKeepsAwake). */
+        woke_by_vbus = 1;
+    }
 }
 
 /* USER CODE END 4 */
