@@ -1,44 +1,169 @@
 #!/usr/bin/env bash
-# Снять архив data.txt с платы через ST-Link, не подключая её по USB.
+# Снять архив с платы.
 #
-# Наружу плата отдаёт данные только как USB-накопитель, то есть нужен воткнутый
-# в компьютер кабель. Когда его нет и есть только ST-Link, архив забирается так:
-# сохранить main.c -> вставить дампер -> собрать -> прошить -> вычитать ОЗУ ->
-# вернуть main.c -> собрать -> прошить обратно рабочую версию.
-# Архив на флеш при этом только читается.
+# Архив на флеш — кольцевой журнал (Core/Inc/log_ring.h). По USB плата
+# отдаёт его как диск FIELDSENSOR только для чтения: data.txt (CSV целиком,
+# от старой строки к новой), info.txt и, пока жив текст старого архива,
+# data_old.txt. Это самый надёжный путь, и он идёт по умолчанию:
 #
-#   ./tools/read_data.sh [выходной_файл] [--wipe]
+#   ./tools/read_data.sh [выходной_файл]          копировать с тома USB
+#   ./tools/read_data.sh [выходной_файл] --swd    сырой образ флеш по ST-Link
+#   ./tools/read_data.sh [выходной_файл] --wipe   --swd и затем стереть флеш
 #
-# --wipe очищает архив на плате, но только вторым, отдельным проходом: сначала
-# файл снимается, сохраняется на диск и сверяется с платой (снят целиком, не
-# окнами, хеш совпал), и лишь затем прошивается второй дампер, который удаляет
-# файл при совпадении размера и хеша с сохранённым. Архив больше 32 КБ снимается
-# окнами, на диск попадает только часть строк — такой --wipe не стирает.
-# Перед стиранием снятый файл копируется в build/archive/data-<дата>-<хеш>.txt:
-# build/data.txt следующие снятия сдвигают в .prev и затирают, а копия в
-# build/archive не перезаписывается и не удаляется никогда (R5).
+# USB: воткнуть USB самой платы; диск появляется через 5–20 с (прошивка
+# собирает том по журналу). Скрипт ждёт его до USB_WAIT_SEC (60 с), копирует
+# файлы и сверяет data.txt с info.txt того же тома (число строк, последняя
+# метка). Где искать том: FS_VOLUME=<каталог тома>; иначе — диски D:..Z:
+# (Git Bash), /media, /run/media, /Volumes (FS_ROOTS=<каталоги> — свой список).
 #
-# Прошлый выходной файл перед снятием переименовывается в <файл>.prev: иначе при
+# --swd — когда USB нет или не поднимается, и для диагностики флеш: дампер
+# (tools/dump_patch.py) вставляется в main.c перед открытием журнала,
+# прошивается, отдаёт всю флеш кусками по 32 КБ, а после снятия прошивается
+# обратно рабочая версия. Образ — <выходной_файл без .txt>.img; data.txt и
+# data_old.txt из него собирает tools/log_image.py — те же байты, что на томе.
+#
+# --wipe стирает флеш целиком, только вторым, отдельным проходом и только
+# если образ снят полностью, сошёлся с хешем всей флеш, журнал в нём
+# разобран без ошибок и несменяемая копия образа и CSV легла в build/archive/
+# (flash-<дата>-<хеш>.img, data-<дата>-<хеш>.txt — не перезаписывается и не
+# удаляется никогда). Второй дампер заново считает хеш флеш и стирает её,
+# только если он совпал с сохранённым. Заказчику стирание не нужно: кольцо
+# само уносит старейшие записи, прибор пишет всегда.
+#
+# Прошлые выходные файлы перед снятием переименовываются в .prev: иначе при
 # неудачном снятии сводка показала бы старые данные как свежие (D3).
-# Рабочая прошивка после снятия собирается из main.c, каким он был ДО снятия,
+# Рабочая прошивка после --swd собирается из main.c, каким он был ДО снятия,
 # байт-в-байт. Если main.c за время снятия правили, правки откладываются в
 # build/main.c.yours-<дата> и возвращаются в main.c только после того, как на
 # плату легла рабочая версия: недописанный код в поле не уходит (R4).
 #
 # Код выхода: 0 — снято (и стёрто, если просили); 1 — данных нет или снятие
-# сломалось; 2 — нет программатора/ST-Link; 3 — снято, но стирание не сделано.
+# сломалось; 2 — нет тома USB (без --swd) или нет программатора/ST-Link;
+# 3 — снято, но стирание не сделано (причина в последней строке).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 WIPE=""
+SWD=""
 ARGS=()
 for a in "$@"; do
-    if [ "$a" = "--wipe" ]; then WIPE=1; else ARGS+=("$a"); fi
+    case "$a" in
+        --wipe) WIPE=1; SWD=1 ;;
+        --swd) SWD=1 ;;
+        *) ARGS+=("$a") ;;
+    esac
 done
 OUT="${ARGS[0]:-$ROOT/build/data.txt}"
+BASE="${OUT%.txt}"
+OLD="${BASE}_old.txt"
+INFO="${BASE}_info.txt"
+IMG="${BASE}.img"
 mkdir -p "$(dirname "$OUT")" "$ROOT/build"
+
+stamp() { date +%Y%m%d-%H%M%S; }
+
+# Старое убираем до снятия, а не после: любой сбой ниже иначе оставил бы на
+# месте выходного файла прошлый архив, и сводка выдала бы его за свежий.
+shelve() {
+    local f
+    for f in "$@"; do
+        if [ -e "$f" ]; then
+            mv -f "$f" "$f.prev"
+            echo "   прошлый снимок отложен: $f.prev"
+        fi
+    done
+}
+
+# Сводка — справка, а не проверка: на пустом архиве (только заголовок, сразу
+# после --wipe) она отвечает 1, и снятие из-за этого не должно считаться
+# сорванным.
+summary() {
+    echo
+    python "$ROOT/tools/summarize_data.py" "$OUT" || true
+}
+
+# ------------------------------------------------------------------ USB
+
+# Том узнаётся по info.txt: его первая строка — «FieldSensor <сборка>».
+is_volume() {
+    [ -f "$1/info.txt" ] && head -c 12 "$1/info.txt" 2>/dev/null | grep -q '^FieldSensor '
+}
+
+find_volume() {
+    local d
+    if [ -n "${FS_VOLUME:-}" ]; then
+        is_volume "$FS_VOLUME" && echo "$FS_VOLUME"
+        return 0
+    fi
+    # Буквы дисков перебираются явно: в Git Bash /c, /d — точки монтирования,
+    # корневой каталог их не перечисляет, и маска /[d-z] не раскрывается (R7,
+    # как в cubeide.sh). /a и /b не трогаем: опрос пустого дисковода висит.
+    local roots="${FS_ROOTS:-}" drv
+    if [ -z "$roots" ]; then
+        for drv in d e f g h i j k l m n o p q r s t u v w x y z; do roots="$roots /$drv"; done
+        roots="$roots $(echo /media/*/* /run/media/*/* /Volumes/*)"
+    fi
+    for d in $roots; do
+        [ -d "$d" ] || continue
+        if is_volume "$d"; then
+            echo "$d"
+            return 0
+        fi
+    done
+    return 0
+}
+
+read_usb() {
+    local vol="" waited=0 wait="${USB_WAIT_SEC:-60}"
+    while :; do
+        vol="$(find_volume)"
+        [ -n "$vol" ] && break
+        if [ "$waited" -ge "$wait" ]; then
+            echo "!! диска FIELDSENSOR не видно за $wait с." >&2
+            echo "   Воткните USB самой платы (диск появляется через 5–20 с) или задайте" >&2
+            echo "   FS_VOLUME=<путь к диску>. Без USB — по ST-Link: $0 --swd" >&2
+            exit 2
+        fi
+        [ "$waited" -eq 0 ] && echo "   жду диск FIELDSENSOR (до $wait с): воткните USB самой платы"
+        sleep 2
+        waited=$((waited + 2))
+    done
+    echo ">> том: $vol"
+    shelve "$OUT" "$OLD" "$INFO" "$IMG"
+    cp "$vol/info.txt" "$INFO"
+    if [ ! -f "$vol/data.txt" ]; then
+        # Журнал не открыт: на томе только info.txt с причиной.
+        sed 's/\r$//' "$INFO" >&2
+        echo "!! на томе нет data.txt — архив на плате сейчас недоступен (причина выше)" >&2
+        exit 1
+    fi
+    # Сначала во временный файл: сорванное копирование не должно лечь на
+    # место архива.
+    if ! cp "$vol/data.txt" "$OUT.part"; then
+        rm -f "$OUT.part"
+        echo "!! копирование data.txt сорвалось (кабель? плата уснула?) — повторите" >&2
+        exit 1
+    fi
+    if ! python "$ROOT/tools/unpack_dump.py" --usb "$OUT.part" "$INFO"; then
+        rm -f "$OUT.part"
+        echo "!! скопированный data.txt не сошёлся с info.txt тома — повторите копирование" >&2
+        exit 1
+    fi
+    mv -f "$OUT.part" "$OUT"
+    echo "   записано: $OUT"
+    if [ -f "$vol/data_old.txt" ]; then
+        cp "$vol/data_old.txt" "$OLD"
+        echo "   текст старого архива: $OLD"
+    fi
+    summary
+    exit 0
+}
+
+[ -n "$SWD" ] || read_usb
+
+# ------------------------------------------------------------------ SWD
 
 . "$ROOT/tools/cubeide.sh"
 
@@ -50,12 +175,11 @@ FLASHED_DUMPER=0
 RESTORED_FW=0
 PATCHED_SUM=""
 YOURS=""      # копия main.c с правками владельца, сделанными за время снятия
-ARCHIVE=""    # несменяемая копия архива, снятого перед стиранием
+ARCHIVE=""    # несменяемая копия образа, снятого перед стиранием
 
 # Всё, что сравнивается после $(...), чистится от CR: на Windows программы
 # пишут CRLF, а Git Bash срезает только LF, и «0x1234\r» != «0x1234» (R1).
 src_sum() { git hash-object --no-filters "$SRC" | tr -d '\r'; }
-stamp() { date +%Y%m%d-%H%M%S; }
 
 echo ">> 1/6 сохраняю main.c"
 # Копия снимается до установки trap: прерывание раньше этой строки оставило бы
@@ -65,11 +189,9 @@ cp "$SRC" "$BACKUP"
 ORIG_SUM="$(src_sum)"
 
 # Вернуть main.c байт-в-байт из копии, снятой до патча (D5), со сверкой хеша.
-# Если за время ожидания окна (до часа) main.c сохранили из CubeIDE, раньше из
-# файла убиралась только вставка дампера, и на плату уходила недописанная
-# правка, а если она не собиралась — на плате оставался дампер (R4). Теперь
-# такой файл откладывается в build/main.c.yours-<дата> (без вставки дампера),
-# а рабочая прошивка собирается из копии «до снятия».
+# Если за время ожидания окна (до часа) main.c сохранили из CubeIDE, такой
+# файл откладывается в build/main.c.yours-<дата> (без вставки дампера), а
+# рабочая прошивка собирается из копии «до снятия» (R4).
 restore_src() {
     [ -n "$PATCHED_SUM" ] && [ -s "$BACKUP" ] || return 0
     local cur yours
@@ -154,37 +276,13 @@ on_exit() {
         fi
     fi
     give_back_yours
-    [ -z "$ARCHIVE" ] || echo ">> копия архива, снятая перед --wipe: ${ARCHIVE#$ROOT/} (не перезаписывается)"
+    [ -z "$ARCHIVE" ] || echo ">> копия образа, снятая перед --wipe: ${ARCHIVE#$ROOT/} (не перезаписывается)"
     rm -f "$BACKUP" "$TMPBIN" "$TMPBIN.cut"
     exit "$code"
 }
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-
-# Плата почти всё время лежит в STOP, где SWD обесточен, поэтому попасть в неё
-# можно только в окно бодрствования — отсюда повторы.
-retry() {
-    local n=$1 need=$2; shift 2
-    local i out
-    for ((i = 1; i <= n; i++)); do
-        # Программатор разделяет строки одним CR, без LF. Удалять CR нельзя:
-        # весь вывод склеится в одну строку и построчный разбор рассыплется —
-        # поэтому здесь замена CR на перевод строки, а не удаление.
-        out=$("$PROG" "$@" 2>&1 | tr '\r' '\n' || true)
-        if echo "$out" | grep -q "$need"; then
-            echo "$out"
-            return 0
-        fi
-        # Пауза обязательна. Без неё попытки идут вплотную, период их повторения
-        # оказывается сравним с периодом сна платы, и они раз за разом попадают
-        # в одну и ту же фазу — в сон. С паузой фаза уползает, и окно ловится.
-        sleep 5
-    done
-    echo "$out" >&2
-    echo "не удалось за $n попыток: $need" >&2
-    return 1
-}
 
 # Адреса берём из карты линковки, а не прибиваем константами: они уезжают от
 # любой правки, а молча прочитанный не тот кусок ОЗУ выглядел бы как испорченные
@@ -200,80 +298,98 @@ locate_map() {
     fi
 }
 
-# Ответ приходит строками вида "0x20009398 : D00DFEED 000001B9 000001B9 00000A73".
-# Тринадцать слов структуры ложатся на несколько строк, поэтому склеиваем все
-# слова подряд, а не разбираем одну конкретную строку. Раскладка — dump_info_t
-# в tools/dump_patch.py.
+# Слово dump_info по смещению: адрес для -w32.
+info_addr() { printf "0x%08X" $(( INF + $1 )); }
+
+# Ответ приходит строками вида "0x20009398 : D00DFEED 00200000 ...". Слова
+# структуры ложатся на несколько строк, поэтому склеиваем все слова подряд,
+# а не разбираем одну конкретную строку. Раскладка — dump_info_t в
+# tools/dump_patch.py (14 слов).
 read_info() {
-    "$PROG" -c port=SWD mode=HOTPLUG -r32 "$INF" 52 2>&1 | tr '\r' '\n' \
+    "$PROG" -c port=SWD mode=HOTPLUG -r32 "$INF" 56 2>&1 | tr '\r' '\n' \
         | grep -E "^0x[0-9A-Fa-f]+ : " | sed 's/^[^:]*: //' | tr ' ' '\n' \
         | grep -E '^[0-9A-F]{8}$' || true
 }
 
-# Ждём именно маркер, а не просто успешный ответ отладчика. Читать структуру
-# один раз нельзя: дампер к моменту первого запроса ещё работает — монтирует
-# том, вычитывает архив (чем он длиннее, тем дольше) и выдерживает паузу на
-# выход датчиков в режим. Прочитанная в этот момент структура заполнена лишь
-# частично, и раньше это выглядело как «дамп не выполнился», хотя он просто
-# не успел.
+# Ждём именно маркер, а не просто успешный ответ отладчика: дампер к моменту
+# первого запроса ещё считает хеш всей флеш (секунды), а во втором проходе —
+# ещё и стирает её (до ~15 с). Структура, прочитанная раньше, заполнена лишь
+# частично.
 wait_dump() {
     local attempt
-    magic=""
-    for attempt in $(seq 1 20); do
+    for attempt in $(seq 1 "${DUMP_WAIT_TRIES:-60}"); do
         set -- $(read_info)
-        if [ "${1:-}" = "D00DFEED" ] && [ $# -ge 13 ]; then
-            magic=$1; fsize=$((16#$2)); len=$((16#$3))
-            win_bytes=$((16#$4)); win_count=$((16#$5)); win_step=$((16#$6))
-            soil_mv=$7; bat_mv=$8; vdd_mv=$9; bat_pct=${10}
-            status=$((16#${11})); hash="0x${12}"; wipe=$((16#${13}))
+        if [ "${1:-}" = "D00DFEED" ] && [ $# -ge 14 ]; then
+            raw_total=$((16#$2)); soil_mv=$3; bat_mv=$4; vdd_mv=$5; bat_pct=$6
+            flash_hash="${7}"; hash_ok=$((16#$8)); wipe=$((16#$9))
             return 0
         fi
         sleep 2
     done
-    echo "дамп не выполнился за 20 попыток" >&2
+    echo "дамп не выполнился за ${DUMP_WAIT_TRIES:-60} попыток" >&2
     return 1
 }
 
-# Почему снято не всё: «том не смонтирован» и «файла нет» раньше выглядели
-# одинаково — «файл на плате пуст» (D3).
-status_text() {
-    local st=$(( status & 0xFF )) fr=$(( (status >> 8) & 0xFF ))
-    case $st in
-        0) echo "" ;;
-        1) echo "файловая система не смонтирована (fs_ok=0) — запись на плате стоит" ;;
-        2) if [ "$fr" -eq 4 ]; then echo "файла data.txt на томе нет";
-           else echo "f_open вернул FRESULT $fr"; fi ;;
-        3) echo "f_read вернул FRESULT $fr — снято $len из $fsize Б" ;;
-        4) echo "f_lseek вернул FRESULT $fr — снято $len из $fsize Б" ;;
-        *) echo "неизвестный статус дампера 0x$(printf %X "$status")" ;;
-    esac
+# Один кусок образа. Повтор того же номера дампер выполняет, только если
+# raw_done сброшен, поэтому перед запросом пишется 0 в raw_done. Готовность —
+# по raw_done == n (вывод -w32 не разбирается: формулировки у версий
+# программатора разные).
+get_chunk() {
+    local n=$1 try i w len
+    for try in 1 2 3; do
+        "$PROG" -c port=SWD mode=HOTPLUG -w32 "$(info_addr 0x28)" 0 >/dev/null 2>&1 || true
+        "$PROG" -c port=SWD mode=HOTPLUG -w32 "$(info_addr 0x24)" "$n" >/dev/null 2>&1 || true
+        for i in $(seq 1 20); do
+            w=($(read_info))
+            if [ "${#w[@]}" -ge 14 ] && [ $((16#${w[10]})) -eq "$n" ]; then
+                break
+            fi
+            w=()
+            sleep 1
+        done
+        [ "${#w[@]}" -ge 14 ] || continue
+        len=$((16#${w[12]}))
+        [ "$len" -gt 0 ] || continue
+        # Смещение — то, что просили: искажённое чтение слов не положит кусок
+        # не на своё место (без хеша всей флеш его бы никто не заметил).
+        [ $((16#${w[11]})) -eq $(( (n - 1) * 32768 )) ] || continue
+        # Программатор читает только кратно четырём байтам, поэтому лишний хвост
+        # отрезаем уже на стороне компьютера.
+        "$PROG" -c port=SWD mode=HOTPLUG -r "$BUF" $(( (len + 3) / 4 * 4 )) "$(cygpath -w "$TMPBIN")" \
+            2>&1 | tr '\r' '\n' | grep -q "read successfully" || continue
+        python -c "import sys; open(sys.argv[1],'wb').write(open(sys.argv[2],'rb').read()[:int(sys.argv[3])])" \
+            "$TMPBIN.cut" "$TMPBIN" "$len"
+        # Хеш сверяется до записи: прочитанный не тот кусок ОЗУ в образ не попадёт.
+        python "$ROOT/tools/unpack_dump.py" --raw "$TMPBIN.cut" "$IMG.part" "${w[11]}" "${w[13]}" \
+            >/dev/null && return 0
+    done
+    return 1
 }
 
 # Несменяемая копия перед стиранием: после него на плате архива нет, а
-# build/data.txt два следующих снятия затирают через .prev (R5). Имя
-# уникально, существующий файл не трогается, копия сверяется по хешу.
+# build/data.img следующие снятия затирают через .prev (R5). Имя уникально,
+# существующий файл не трогается, копия сверяется по хешу.
 save_archive() {
-    local dir="$ROOT/build/archive" base f n=0
+    local dir="$ROOT/build/archive" tag n=0
     mkdir -p "$dir" || return 1
-    base="$dir/data-$(stamp)-${hash#0x}"
-    f="$base.txt"
-    while [ -e "$f" ]; do n=$((n + 1)); f="$base-$n.txt"; done
-    cp "$OUT" "$f" || return 1
-    python "$ROOT/tools/unpack_dump.py" --check "$f" "$hash" || return 1
-    chmod a-w "$f" 2>/dev/null || true
-    ARCHIVE="$f"
-    echo "   копия архива: ${f#$ROOT/}"
+    tag="$(stamp)-$flash_hash"
+    while [ -e "$dir/flash-$tag.img" ]; do n=$((n + 1)); tag="$(stamp)-$flash_hash-$n"; done
+    cp "$IMG" "$dir/flash-$tag.img" || return 1
+    python "$ROOT/tools/unpack_dump.py" --check "$dir/flash-$tag.img" "0x$flash_hash" || return 1
+    cp "$OUT" "$dir/data-$tag.txt" || return 1
+    if [ -f "$OLD" ]; then
+        cp "$OLD" "$dir/data_old-$tag.txt" || return 1
+    fi
+    chmod a-w "$dir/flash-$tag.img" "$dir/data-$tag.txt" "$dir/data_old-$tag.txt" 2>/dev/null || true
+    ARCHIVE="$dir/flash-$tag.img"
+    echo "   копия образа: ${ARCHIVE#$ROOT/}"
 }
 
 require_prog
 require_stlink
 
-# Старый файл убираем до снятия, а не после: любой сбой ниже иначе оставил бы
-# на месте выходного файла прошлый архив, и сводка выдала бы его за свежий.
-if [ -e "$OUT" ]; then
-    mv -f "$OUT" "$OUT.prev"
-    echo "   прошлый снимок отложен: $OUT.prev"
-fi
+shelve "$OUT" "$OLD" "$IMG" "$INFO"
+rm -f "$IMG.part"
 
 FAIL=""       # почему данных нет — код 1
 WIPE_FAIL=""  # почему не стёрто — код 3
@@ -288,16 +404,9 @@ echo ">> 3/6 прошиваю дампер"
 FLASHED_DUMPER=1
 flash_now
 
-echo ">> 4/6 читаю ОЗУ"
+echo ">> 4/6 снимаю образ флеш"
 locate_map
 wait_dump
-echo "   файл на флеш: $fsize Б, снято: $len Б"
-if [ "$win_bytes" -gt 0 ]; then
-    echo "   архив больше буфера: взято $win_count окон по $win_bytes Б с шагом $win_step Б"
-fi
-why="$(status_text)"
-[ -z "$why" ] || echo "   !! $why" >&2
-
 if [ "$bat_mv" = "FFFFFFFF" ]; then
     echo "   живой замер: батарея — замер не удался (нет данных о банке и VDD)"
 else
@@ -308,54 +417,60 @@ if [ "$soil_mv" = "FFFFFFFF" ]; then
 else
     echo "   датчик почвы: $((16#$soil_mv)) мВ до пересчёта"
 fi
+[ "$hash_ok" -eq 1 ] || echo "   !! флеш не прочиталась целиком при подсчёте хеша — образ сверить не с чем" >&2
 
-if [ "$len" -gt 0 ]; then
-    # Программатор читает только кратно четырём байтам, поэтому лишний хвост
-    # отрезаем уже на стороне компьютера.
-    rounded=$(( (len + 3) / 4 * 4 ))
-    retry 20 "read successfully" \
-        -c port=SWD mode=HOTPLUG -r "$BUF" "$rounded" "$(cygpath -w "$TMPBIN")" >/dev/null
-    python -c "import sys; open(sys.argv[1],'wb').write(open(sys.argv[2],'rb').read()[:int(sys.argv[3])])" \
-        "$TMPBIN.cut" "$TMPBIN" "$len"
-    # Хеш сверяется до записи: прочитанный не тот кусок ОЗУ не попадёт на диск.
-    if python "$ROOT/tools/unpack_dump.py" "$TMPBIN.cut" "$OUT" "$win_bytes" "$win_count" "$hash"; then
-        echo "   записано: $OUT"
-        [ -z "$why" ] || FAIL="снято не всё: $why"
-    else
-        FAIL="прочитанное по SWD не совпало с буфером дампера"
+nchunks=$(( (raw_total + 32767) / 32768 ))
+for ((n = 1; n <= nchunks; n++)); do
+    if ! get_chunk "$n"; then
+        FAIL="кусок $n из $nchunks не снят за три попытки — образ неполный (${IMG#$ROOT/}.part)"
+        break
     fi
-    rm -f "$TMPBIN" "$TMPBIN.cut"
-else
-    FAIL="${why:-файл на плате пуст (0 Б)}"
+    [ $((n % 8)) -ne 0 ] || echo "   снято $n из $nchunks кусков"
+done
+rm -f "$TMPBIN" "$TMPBIN.cut"
+
+if [ -z "$FAIL" ]; then
+    mv -f "$IMG.part" "$IMG"
+    echo "   образ: $IMG ($raw_total Б)"
+    hash_arg=()
+    [ "$hash_ok" -eq 1 ] && hash_arg=("0x$flash_hash")
+    if python "$ROOT/tools/unpack_dump.py" --image "$IMG" "$OUT" "$OLD" "$raw_total" ${hash_arg[@]+"${hash_arg[@]}"}; then
+        echo "   записано: $OUT"
+    elif [ -e "$OUT" ]; then
+        FAIL="журнал разобран с оговорками (выше) — data.txt собран, но образ стоит разобрать вручную"
+    else
+        FAIL="из образа не собрать data.txt (причина выше); образ сохранён: $IMG"
+    fi
 fi
 
 if [ -n "$WIPE" ]; then
     if [ -n "$FAIL" ]; then
-        WIPE_FAIL="снятие не удалось — стирать нечем подтверждённое"
-    elif [ "$win_bytes" -gt 0 ]; then
-        WIPE_FAIL="архив $fsize Б больше буфера 32 КБ и снят окнами — на диске только часть строк. Снимите файл целиком через USB самой платы (том появится как флешка) и удалите его там"
-    elif [ "$len" -ne "$fsize" ]; then
-        WIPE_FAIL="снято $len Б из $fsize"
-    elif ! python "$ROOT/tools/unpack_dump.py" --check "$OUT" "$hash"; then
+        WIPE_FAIL="образ не снят полностью или не разобран — стирать нечем подтверждённое"
+    elif [ "$hash_ok" -ne 1 ]; then
+        WIPE_FAIL="флеш не прочиталась целиком при подсчёте хеша — образ не с чем сверить"
+    elif ! python "$ROOT/tools/unpack_dump.py" --check "$IMG" "0x$flash_hash"; then
         # Сверка кодом возврата, а не сравнением строк: без CRLF-ловушки (R1).
-        WIPE_FAIL="файл на диске не совпал с прочитанным с платы"
+        WIPE_FAIL="образ на диске не совпал с флеш"
     elif ! save_archive; then
         WIPE_FAIL="не удалось сохранить несменяемую копию в build/archive"
     else
-        echo ">> 4б/6 стираю архив: второй дампер удалит файл, только если он тот же ($fsize Б, хеш $hash)"
-        saved_size=$fsize
+        echo ">> 4б/6 стираю флеш: второй дампер сотрёт её, только если она та же ($raw_total Б, хеш 0x$flash_hash)"
+        saved_hash=$flash_hash
         restore_src
-        patch_src --wipe "$fsize" "$hash"
+        patch_src --wipe "$raw_total" "0x$flash_hash"
         "$ROOT/tools/dev.sh" build >/dev/null
         # Плата сейчас крутится в первом дампере и не спит — окно ловить не надо.
         flash_now
         locate_map
-        wait_dump
+        if ! wait_dump; then
+            wipe=-1
+        fi
         case $(( wipe & 0xFF )) in
-            1) echo "   архив на плате удалён; рабочая прошивка создаст его заново" ;;
-            2) WIPE_FAIL="дампер отказался: файл на плате уже не тот, что сохранён (на диске $saved_size Б, на плате $fsize Б)" ;;
-            3) WIPE_FAIL="f_unlink вернул FRESULT $(( (wipe >> 8) & 0xFF ))" ;;
-            *) WIPE_FAIL="дампер не сообщил итог очистки (wipe=$wipe)" ;;
+            1) echo "   флеш стёрта и проверена; рабочая прошивка начнёт журнал с нуля" ;;
+            2) WIPE_FAIL="дампер отказался: флеш уже не та, что сохранена (на диске 0x$saved_hash, на плате 0x$flash_hash)" ;;
+            3) WIPE_FAIL="стирание не удалось: защита не снялась или $(( wipe >> 8 )) секторов не стёрлись — архив, возможно, стёрт частично; копия: ${ARCHIVE#$ROOT/}" ;;
+            4) WIPE_FAIL="флеш не прочиталась при сверке — не тронута" ;;
+            *) WIPE_FAIL="дампер не сообщил итог стирания (wipe=$wipe) — стёрта ли флеш, неизвестно; копия образа: ${ARCHIVE#$ROOT/}" ;;
         esac
     fi
 fi
@@ -378,17 +493,12 @@ if [ -n "$FAIL" ]; then
     fi
 fi
 
-echo
-if [ "${win_bytes:-0}" -gt 0 ]; then
-    python "$ROOT/tools/summarize_data.py" "$OUT" --windowed
-else
-    python "$ROOT/tools/summarize_data.py" "$OUT"
-fi
+summary
 
 if [ -n "$FAIL" ]; then
     exit 1
 fi
 if [ -n "$WIPE_FAIL" ]; then
-    echo "!! архив НЕ стёрт: $WIPE_FAIL" >&2
+    echo "!! флеш НЕ стёрта: $WIPE_FAIL" >&2
     exit 3
 fi
