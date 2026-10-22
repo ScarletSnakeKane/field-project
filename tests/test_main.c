@@ -883,7 +883,20 @@ static void test_log_record(void)
  * Программирование только сбрасывает биты (1 -> 0), стирание сектора —
  * в 0xFF, счётчик стираний по секторам. Обрыв питания: операция номер
  * fm_cut выполняется частично (ничего / целиком / случайная часть битов) и
- * все дальнейшие операции отказывают, пока тест не «включит питание». */
+ * все дальнейшие операции отказывают, пока тест не «включит питание».
+ *
+ * Ещё три вида сбоев (приёмка П5а, второй уровень):
+ *   — отказ одного чтения: k-го по счёту (fm_read_fail) или по точному
+ *     адресу и длине (fm_fail_addr/fm_fail_len) — T1;
+ *   — блоки заперты (fm_locked): так SST26 выходит из своего сброса по
+ *     питанию. Программирование и стирание «успешны», но ничего не делают,
+ *     пока не снята защита (fm_unlock; fm_unlock_fail — сколько раз подряд
+ *     снять не удастся). fm_lock_at — запереть перед операцией с этим
+ *     номером (сброс одной флеш посреди серии) — T2;
+ *   — вид обрыва 4: оборванное стирание или программирование оставляет
+ *     ячейки «слабыми» — сейчас они читаются как 0xFF, а после fm_age()
+ *     (недели, другая температура) теряют случайные единицы, в том числе
+ *     у записанного поверх. Настоящее стирание сектора это лечит — T4. */
 #define FM_MAX_SECT  512U
 static uint8_t  fm[FM_MAX_SECT * 4096U];
 static uint32_t fm_nsect;
@@ -891,6 +904,10 @@ static uint32_t fm_erases[FM_MAX_SECT];
 static long     fm_ops, fm_cut = -1;
 static int      fm_dead, fm_mode, fm_fail_once;
 static uint32_t fm_rng = 1;
+static int      fm_locked, fm_unlock_fail;
+static long     fm_lock_at = -1;
+static uint8_t  fm_weak_sect[FM_MAX_SECT];
+static uint8_t  fm_weak_slot[FM_MAX_SECT * 64U];
 
 static uint32_t fm_rand(void)
 {
@@ -903,16 +920,39 @@ static void fm_reset(uint32_t nsect)
     fm_nsect = nsect;
     memset(fm, 0xFF, nsect * 4096U);
     memset(fm_erases, 0, sizeof(fm_erases));
+    memset(fm_weak_sect, 0, sizeof(fm_weak_sect));
+    memset(fm_weak_slot, 0, sizeof(fm_weak_slot));
     fm_ops = 0; fm_cut = -1; fm_dead = 0;
+    fm_locked = 0; fm_unlock_fail = 0; fm_lock_at = -1;
+}
+
+static uint8_t fm_unlock(void)
+{
+    if (fm_dead) return 0;
+    if (fm_unlock_fail > 0) { fm_unlock_fail--; return 0; }
+    fm_locked = 0;
+    return 1;
+}
+
+/* Слабые ячейки теряют единицы: в каждом байте слабого места — с
+ * вероятностью 1/4 один бит. */
+static void fm_age(void)
+{
+    for (uint32_t i = 0; i < fm_nsect * 4096U; i++)
+        if ((fm_weak_sect[i / 4096U] || fm_weak_slot[i / 64U]) && (fm_rand() & 3U) == 0U)
+            fm[i] &= (uint8_t)~(1U << (fm_rand() & 7U));
 }
 
 static void fm_power_on(void) { fm_dead = 0; fm_cut = -1; }
 
 static long fm_read_fail = -1;   /* через сколько чтений одно откажет */
+static long fm_fail_addr = -1;   /* или: откажет одно чтение ровно (адрес, длина) */
+static uint32_t fm_fail_len;
 
 static uint8_t fm_read(uint32_t a, uint8_t *b, uint32_t n)
 {
     if (fm_read_fail >= 0 && fm_read_fail-- == 0) return 0;
+    if (fm_fail_addr >= 0 && (long)a == fm_fail_addr && n == fm_fail_len) { fm_fail_addr = -1; return 0; }
     if (fm_dead || a + n > fm_nsect * 4096U) return 0;
     memcpy(b, fm + a, n);
     return 1;
@@ -923,6 +963,7 @@ static uint8_t fm_read(uint32_t a, uint8_t *b, uint32_t n)
 static int fm_cut_now(void)
 {
     if (fm_dead) return -1;
+    if (fm_ops == fm_lock_at) { fm_locked = 1; fm_lock_at = -1; }
     if (fm_ops++ != fm_cut) return 0;
     fm_dead = 1;
     return 1;
@@ -932,6 +973,13 @@ static uint8_t fm_program(uint32_t a, const uint8_t *b, uint32_t n)
 {
     int c = fm_cut_now();
     if (c < 0 || a + n > fm_nsect * 4096U || (a / 256U) != ((a + n - 1U) / 256U)) return 0;
+    if (fm_locked) return c ? 0 : 1;           /* заперто: «успех», ничего не записано */
+    if (c && fm_mode == 4)
+    {
+        /* Недозаряженные ячейки: читаются стёртыми, но слабые. */
+        for (uint32_t i = 0; i < n; i += 64U) fm_weak_slot[(a + i) / 64U] = 1;
+        return 0;
+    }
     if (fm_fail_once)
     {
         /* Сбой без обрыва питания: 1 — не записалось ничего (шина), 2 —
@@ -956,7 +1004,13 @@ static uint8_t fm_erase(uint32_t a)
 {
     int c = fm_cut_now();
     if (c < 0 || a % 4096U || a >= fm_nsect * 4096U) return 0;
+    if (fm_locked) return c ? 0 : 1;
     fm_erases[a / 4096U]++;
+    /* Вид 4: стирание оборвано, сектор читается чистым, но ячейки слабые.
+     * Дошедшее до конца стирание слабость снимает. */
+    fm_weak_sect[a / 4096U] = (uint8_t)(c && fm_mode == 4);
+    if (!c || fm_mode == 4)
+        memset(fm_weak_slot + a / 64U, 0, 64U);
     /* Вид 3: стирание оборвано так, что часть записей уцелела целиком, а
      * часть — в мусоре (у вида 0 уцелели все, у вида 2 — ни одной). */
     uint8_t keep = 0;
@@ -964,14 +1018,14 @@ static uint8_t fm_erase(uint32_t a)
     {
         if (i % 64U == 0U)
             keep = (uint8_t)(fm_rand() & 1U);
-        if (c == 0 || fm_mode == 1)          fm[a + i] = 0xFF;
+        if (c == 0 || fm_mode == 1 || fm_mode == 4) fm[a + i] = 0xFF;
         else if (fm_mode == 2)               fm[a + i] |= (uint8_t)fm_rand();
         else if (fm_mode == 3 && !keep)      fm[a + i] |= (uint8_t)fm_rand();
     }
     return c ? 0 : 1;
 }
 
-static const LogFlashOps FM_OPS = { fm_read, fm_program, fm_erase, NULL };
+static const LogFlashOps FM_OPS = { fm_read, fm_program, fm_erase, NULL, fm_unlock };
 
 /* Сектор за сектором записи стёрт целиком — «минимум один стёртый впереди». */
 static int fm_spare_blank(const LogRing *r)
@@ -1017,15 +1071,18 @@ static uint8_t log_is(const LogRecord *r, uint32_t id)
 /* Прочитать весь журнал: годные записи по порядку должны идти с растущими
  * id и совпадать с тем, что писалось. Возвращает число годных; *bad —
  * испорченных слотов; ids — id годных (если не NULL). */
+static uint32_t log_scan_skipped;   /* из *bad — стёртых слотов (пропуск после старта, T4) */
+
 static uint32_t log_scan(const LogRing *r, uint32_t *bad, uint32_t *ids, uint32_t max, int *alien)
 {
     LogRecord rec;
     uint32_t n = LogRing_Count(r), good = 0, prev = 0;
     *bad = 0; *alien = 0;
+    log_scan_skipped = 0;
     for (uint32_t i = 0; i < n; i++)
     {
         uint8_t st = LogRing_Read(r, i, &rec);
-        if (st == LOG_READ_BAD) { (*bad)++; continue; }
+        if (st == LOG_READ_BAD) { (*bad)++; log_scan_skipped += LogRecord_IsErased(&rec); continue; }
         if (st != LOG_READ_OK) { (*alien)++; continue; }
         uint32_t id = log_id(&rec);
         if (!log_is(&rec, id) || (good && id <= prev)) (*alien)++;
@@ -1143,23 +1200,31 @@ static void test_log_ring_g4(void)
     ok(mx - mn <= 1U, "20 кругов: стирания по секторам расходятся не больше чем на 1");
     ok(mx <= LAPS + 1U, "сектор стирается один раз за круг");
 
-    /* С перезапусками каждые 37 записей (перемонтирование не стирает лишнего). */
+    /* С перезапусками каждые 37 записей. После монтирования запасной (и
+     * сектор записи, если пишется с его слота 0) стирается безусловно (T4):
+     * не больше двух лишних стираний на старт, и они расходятся по кругу. */
     fm_reset(NS);
     (void)LogRing_Mount(&r, &FM_OPS, NS);
+    uint32_t restarts = 0, tot = 0;
     for (uint32_t id = 1; id <= NS * LOG_SLOTS * LAPS; id++)
     {
         log_make(&rec, id);
         (void)LogRing_Append(&r, &rec);
         if (id % 37U == 0U)
+        {
             (void)LogRing_Mount(&r, &FM_OPS, NS);
+            restarts++;
+        }
     }
     mn = 0xFFFFFFFFUL; mx = 0;
     for (uint32_t s = 0; s < NS; s++)
     {
+        tot += fm_erases[s];
         if (fm_erases[s] < mn) mn = fm_erases[s];
         if (fm_erases[s] > mx) mx = fm_erases[s];
     }
-    ok(mx - mn <= 1U && mx <= LAPS + 1U, "с перезапусками — то же");
+    ok(mx - mn <= 4U && tot <= NS * LAPS + 1U + 2U * restarts,
+       "с перезапусками: износ ровный, лишних стираний не больше двух на старт");
 }
 
 /* ------------------------------------------------------ G2: обрыв питания
@@ -1442,6 +1507,204 @@ static void test_log_ring_g2(void)
     }
 }
 
+/* ------------------------------------- приёмка П5а, второй уровень: T2–T4 */
+
+/* Вид обрыва 4 (слабые ячейки): обрыв на операции cut, включение, ещё два
+ * сектора записей, «старение» и перезапуск. Все подтверждённые записи моложе
+ * хвоста на месте, чужих нет, испорченных — не больше одной (та, что
+ * писалась при обрыве), остальное — стёртые пропуски после старта. */
+static int log_weak_run(long cut, int verbose)
+{
+    LogRing r, m;
+    LogRecord rec;
+    static uint8_t acked[5U * 64U * 4U + 400U];
+    const uint32_t ns = 5, total = 5U * LOG_SLOTS * 11U / 5U;
+    fm_reset(ns);
+    fm_mode = 4;
+    fm_cut = cut;
+    memset(acked, 0, sizeof(acked));
+    (void)LogRing_Mount(&r, &FM_OPS, ns);
+    uint32_t id;
+    for (id = 1; id <= total && !fm_dead; id++)
+    {
+        log_make(&rec, id);
+        if (LogRing_Append(&r, &rec)) acked[id] = 1;
+    }
+    if (!fm_dead)
+        return -1;
+    fm_power_on();
+    uint8_t mr = LogRing_Mount(&m, &FM_OPS, ns);
+    if (mr == LOG_MOUNT_EIO) return 1;
+    uint32_t last = total + 2U * LOG_SLOTS + 10U;
+    for (id = total + 1U; id <= last; id++)
+    {
+        log_make(&rec, id);
+        if (LogRing_Append(&m, &rec)) acked[id] = 1;
+    }
+    fm_age();
+    if (LogRing_Mount(&m, &FM_OPS, ns) != LOG_MOUNT_OK) return 1;
+    static uint32_t ids[5 * 64];
+    uint32_t bad; int alien;
+    uint32_t good = log_scan(&m, &bad, ids, 5 * 64, &alien);
+    uint32_t j = 0, missing = 0;
+    for (uint32_t k = good ? ids[0] : 1U; k <= last; k++)
+    {
+        if (!acked[k]) continue;
+        while (j < good && ids[j] < k) j++;
+        if (j >= good || ids[j] != k) missing++;
+    }
+    int e = (alien || missing || bad - log_scan_skipped > 1U || !good || ids[good - 1U] != last);
+    if (e && verbose)
+        printf("    вид 4, обрыв %ld: alien %d missing %u bad %u (пропусков %u)\n",
+               cut, alien, missing, bad, log_scan_skipped);
+    return e;
+}
+
+static void test_log_ring_accept2(void)
+{
+    LogRing r, m;
+    LogRecord rec;
+    puts("Журнал: приёмка второго уровня (T2–T4)");
+
+    /* T2: сброс одной флеш посреди работы — блоки заперты, запись идёт в
+     * том же вызове: защита снимается перед каждой серией. */
+    {
+        fm_reset(8);
+        fm_mode = 1;
+        (void)LogRing_Mount(&r, &FM_OPS, 8);
+        uint32_t okc = 0, id;
+        for (id = 1; id <= 100U; id++) { log_make(&rec, id); okc += LogRing_Append(&r, &rec); }
+        for (uint32_t cyc = 0; cyc < 500U; cyc++)
+        {
+            if (cyc % 7U == 0U) fm_locked = 1;
+            log_make(&rec, id++);
+            okc += LogRing_Append(&r, &rec);
+        }
+        uint32_t bad; int alien;
+        uint32_t good = log_scan(&r, &bad, NULL, 0, &alien);
+        ok(okc == 600U && !alien && !bad && good == LogRing_Count(&r),
+           "T2: флеш запирается каждые 7 записей — все 500 записей прошли, журнал читается");
+    }
+
+    /* T2: сброс флеш перед каждой операцией серии по очереди (в т.ч. перед
+     * стиранием запасного, в котором лежат старейшие записи: кольцо уже
+     * прошло круг): ни одного отказа, ни одной испорченной записи. */
+    {
+        uint32_t fails = 0, broken = 0, points = 0;
+        for (long at = 0; at < 190; at++)
+        {
+            fm_reset(8);
+            fm_mode = 1;
+            (void)LogRing_Mount(&r, &FM_OPS, 8);
+            uint32_t id;
+            for (id = 1; id <= 8U * 64U + 20U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+            fm_lock_at = fm_ops + at;
+            for (uint32_t k = 0; k < 3U * 64U; k++, id++)
+            {
+                log_make(&rec, id);
+                fails += !LogRing_Append(&r, &rec);
+            }
+            points += (fm_lock_at < 0);
+            uint32_t bad; int alien;
+            uint32_t good = log_scan(&r, &bad, NULL, 0, &alien);
+            broken += (alien || bad || good != LogRing_Count(&r) || good < 5U * 64U);
+        }
+        ok(points == 190U && fails == 0U && broken == 0U,
+           "T2: флеш заперта перед любой из 190 операций — запись возобновилась в том же вызове");
+    }
+
+    /* T2: защита не снимается — отказ без порчи и без траты слота; после
+     * переоткрытия (main переинициализирует флеш) запись идёт дальше. */
+    {
+        fm_reset(4);
+        fm_mode = 1;
+        (void)LogRing_Mount(&r, &FM_OPS, 4);
+        for (uint32_t id = 1; id <= 70U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+        fm_locked = 1;
+        fm_unlock_fail = 2;
+        log_make(&rec, 71);
+        uint8_t first = LogRing_Append(&r, &rec);
+        static LogOldVolume v;
+        equ(LogArchive_Open(&m, &FM_OPS, 4, 1, &v), LOG_OPEN_OK, "T2: переоткрытие после отказа");
+        equ(LogRing_Append(&m, &rec), 1, "T2: после переоткрытия запись прошла");
+        uint32_t bad; int alien;
+        uint32_t good = log_scan(&m, &bad, NULL, 0, &alien);
+        ok(first == 0 && good == 71U && !alien && bad == log_scan_skipped,
+           "T2: защита не снялась — отказ, потом запись; подтверждённые целы");
+    }
+
+    /* T3: один сброшенный бит в байтах 0..5 слота 0 — в середине кольца и в
+     * голове. Журнал не укорачивается, голова не стирается. */
+    {
+        uint32_t failed = 0, cases = 0;
+        for (int where = 0; where < 2; where++)
+            for (uint32_t byte = 0; byte < 6U; byte++)
+                for (uint32_t bit = 0; bit < 8U; bit++)
+                {
+                    fm_reset(64);
+                    fm_mode = 1;
+                    (void)LogRing_Mount(&r, &FM_OPS, 64);
+                    const uint32_t N = 40U * 64U + 30U;
+                    for (uint32_t id = 1; id <= N; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+                    uint32_t s = where ? r.w_sect : 20U;
+                    uint32_t cnt = LogRing_Count(&r);
+                    uint8_t *b = &fm[s * 4096U + byte];
+                    if (!(*b & (1U << bit))) continue;
+                    *b &= (uint8_t)~(1U << bit);
+                    cases++;
+                    int e = 0;
+                    if (LogRing_Mount(&m, &FM_OPS, 64) != LOG_MOUNT_OK || LogRing_Count(&m) != cnt) e++;
+                    log_make(&rec, N + 1U);
+                    if (!LogRing_Append(&m, &rec)) e++;
+                    if (LogRing_Mount(&m, &FM_OPS, 64) != LOG_MOUNT_OK) e++;
+                    uint32_t bad; int alien;
+                    uint32_t good = log_scan(&m, &bad, NULL, 0, &alien);
+                    if (alien || good != N || bad != 1U + log_scan_skipped) e++;
+                    if (e && failed < 3U)
+                        printf("    %s, байт %u бит %u: count %u good %u bad %u\n", where ? "голова" : "середина",
+                               byte, bit, LogRing_Count(&m), good, bad);
+                    failed += (e != 0);
+                }
+        char what[200];
+        snprintf(what, sizeof(what), "T3: бит 1→0 в байтах 0..5 слота 0 (%u случаев, середина и голова) — "
+                                     "журнал цел, потерян только этот слот", cases);
+        ok(cases >= 10U && failed == 0U, what);
+    }
+
+    /* T3: сектор посреди журнала испорчен целиком (ни одного годного
+     * номера) — журнал не рвётся на нём, старшие записи остаются. */
+    {
+        fm_reset(16);
+        fm_mode = 1;
+        (void)LogRing_Mount(&r, &FM_OPS, 16);
+        for (uint32_t id = 1; id <= 10U * 64U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+        memset(fm + 4U * 4096U, 0x00, 4096U);
+        equ(LogRing_Mount(&m, &FM_OPS, 16), LOG_MOUNT_OK, "T3: сектор-дыра: монтирование");
+        uint32_t bad; int alien;
+        uint32_t good = log_scan(&m, &bad, NULL, 0, &alien);
+        ok(LogRing_FirstSeq(&m) == 0U && good == 9U * 64U && bad == 64U && !alien,
+           "T3: сектор-дыра посреди журнала — выпали только его 64 записи");
+    }
+
+    /* T4: обрыв вида 4 (слабые ячейки) на каждой операции. */
+    {
+        uint32_t points = 0, failed = 0;
+        for (long cut = 0;; cut++)
+        {
+            fm_rng = 0xC0FFEEU + (uint32_t)cut;
+            int res = log_weak_run(cut, failed < 3U);
+            if (res < 0) break;
+            points++;
+            failed += (uint32_t)res;
+        }
+        char what[200];
+        snprintf(what, sizeof(what), "T4: слабые ячейки после обрыва (%u точек): после «старения» "
+                                     "подтверждённые целы", points);
+        ok(points > 700U && failed == 0U, what);
+    }
+    fm_mode = 1;
+}
+
 /* ------------------------------------------ импорт старого архива (FAT)
  *
  * Старый том строится в модели флеш так же, как его клал f_mkfs прошлых
@@ -1722,7 +1985,8 @@ static void test_log_import(void)
         equ(bad_open, 0U, "три круга после импорта: перезапуски не трогают журнал");
         uint32_t bad; int alien;
         uint32_t good = log_scan(&r, &bad, NULL, 0, &alien);
-        ok(good == LogRing_Count(&r) && !bad && !alien && good >= 30U * 64U, "журнал цел, импорт вытеснен кругом");
+        ok(good + bad == LogRing_Count(&r) && bad == log_scan_skipped && !alien && good >= 29U * 64U,
+           "журнал цел (испорченных нет, только пропуски после стартов), импорт вытеснен кругом");
     }
 
     /* Не помещается выше тома — переносятся самые новые файлы. */
@@ -1815,11 +2079,182 @@ static void test_log_import(void)
         equ((unsigned)import_check(&r, G, GO, 1, old_texts, 1), 0, "после сбоя чтения импорт полон");
     }
 
+    /* T1: отказ одного чтения при разборе старого тома — не «тома нет».
+     * Сценарии стенда приёмки: загрузочный сектор (LBA 63), корень (LBA 96),
+     * запись FAT первого кластера data.txt; на первом старте открытие
+     * отвечает EIO и ничего не пишет, следующее переносит все три файла. */
+    {
+        static const OldFileSpec P[3] = {
+            { "DATA_1  TXT", 1100, 3 }, { "DATA_2  TXT", 5000, 2 }, { "DATA    TXT", 23456, 1 } };
+        static const uint32_t PO[3] = { 0, 1, 2 };
+        static const char *what3[3] = { "загрузочный сектор", "корень", "FAT data.txt" };
+        for (int which = 0; which < 3; which++)
+        {
+            char what[200];
+            fm_reset(LOG_FLASH_SECTORS);
+            fm_mode = 1;
+            uint32_t end = old_volume(16, P, 3, 0, old_texts);
+            static uint8_t before[64 * 4096];
+            memcpy(before, fm, sizeof(before));
+            fm_fail_len = 512;
+            if (which == 0) fm_fail_addr = 63 * 512;
+            if (which == 1) fm_fail_addr = 96 * 512;
+            if (which == 2)
+            {
+                uint32_t c = fm[96 * 512 + 2 * 32 + 26] | (fm[96 * 512 + 2 * 32 + 27] << 8);
+                fm_fail_addr = (long)(64U * 512U + c * 2U);
+                fm_fail_len = 2;
+            }
+            long ops0 = fm_ops;
+            uint8_t res = LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v);
+            snprintf(what, sizeof(what), "T1 (%s): сбой чтения — EIO, ничего не записано", what3[which]);
+            ok(res == LOG_OPEN_EIO && fm_fail_addr < 0 && fm_ops == ops0 && memcmp(before, fm, end) == 0, what);
+            res = LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v);
+            snprintf(what, sizeof(what), "T1 (%s): повтор переносит все три файла, том цел", what3[which]);
+            ok(res == LOG_OPEN_OK && import_check(&r, P, PO, 3, old_texts, 1) == 0 &&
+               memcmp(before, fm, end) == 0, what);
+        }
+
+        /* Незаконченный импорт и отказ чтения корня при повторе: не
+         * «тома нет» — импорт не закрывается тем, что успели. */
+        fm_reset(LOG_FLASH_SECTORS);
+        fm_mode = 1;
+        uint32_t end = old_volume(16, P, 3, 0, old_texts);
+        static uint8_t before[64 * 4096];
+        memcpy(before, fm, sizeof(before));
+        fm_ops = 0;
+        fm_cut = 200;
+        (void)LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v);
+        fm_power_on();
+        fm_fail_addr = 96 * 512;
+        fm_fail_len = 512;
+        long ops0 = fm_ops;
+        ok(LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v) == LOG_OPEN_EIO && fm_ops == ops0,
+           "T1: незаконченный импорт, сбой чтения корня — EIO, ничего не стёрто");
+        ok(LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v) == LOG_OPEN_OK &&
+           import_check(&r, P, PO, 3, old_texts, 1) == 0 && memcmp(before, fm, end) == 0,
+           "T1: следующий старт доводит импорт целиком");
+    }
+
+    /* T1: отказывает k-е чтение, для каждого k — на первом старте и при
+     * незаконченном импорте. Открытие повторяется, как в main (до трёх раз,
+     * потом в следующем цикле). Критерии: том ниже границы не тронут,
+     * все файлы перенесены, а при ответе EIO на флеш не записано ничего.
+     * При незаконченном импорте чтений ~35 тысяч (проверка чистоты
+     * журнальной области): подряд — первые 1200 (монтирование, проверка
+     * импорта, оба разбора тома — около 650), дальше каждое 499-е;
+     * LOG_FULL=1 — все. */
+    {
+        static const OldFileSpec G[2] = { { "DATA    TXT", 6000, 7 }, { "DATA_1  TXT", 700, 8 } };
+        static const uint32_t GO[2] = { 1, 0 };
+        const int full = getenv("LOG_FULL") != NULL;
+        for (int pend = 0; pend < 2; pend++)
+        {
+            uint32_t points = 0, failed = 0;
+            for (long k = 0;; k = (!pend || full || k < 1200) ? k + 1 : k + 499)
+            {
+                fm_reset(LOG_FLASH_SECTORS);
+                fm_mode = 1;
+                uint32_t end = old_volume(16, G, 2, 1, old_texts);
+                static uint8_t before[64 * 4096];
+                memcpy(before, fm, sizeof(before));
+                if (pend)
+                {
+                    fm_ops = 0;
+                    fm_cut = 60;
+                    (void)LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v);
+                    fm_power_on();
+                }
+                long ops0 = fm_ops;
+                fm_read_fail = k;
+                uint8_t res = LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v);
+                if (fm_read_fail >= 0)
+                {
+                    fm_read_fail = -1;
+                    break;            /* чтений меньше k — точки кончились */
+                }
+                points++;
+                int e = 0;
+                if (res == LOG_OPEN_EIO && fm_ops != ops0) e++;
+                for (int t = 0; t < 4 && res != LOG_OPEN_OK; t++)
+                    res = LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v);
+                if (res != LOG_OPEN_OK) e++;
+                if (memcmp(before, fm, end) != 0) e++;
+                if (import_check(&r, G, GO, 2, old_texts, 0)) e++;
+                if (e && failed < 3U) printf("    %s, отказ чтения %ld: ошибок %d\n",
+                                             pend ? "повтор импорта" : "первый старт", k, e);
+                failed += (e != 0);
+            }
+            char what[200];
+            snprintf(what, sizeof(what), "T1: отказ k-го чтения (%s, %u точек) — том цел, импорт полон",
+                     pend ? "незаконченный импорт" : "первый старт", points);
+            ok(points > (pend ? 1200U : 1000U) && failed == 0U, what);
+        }
+    }
+
+    /* T1: то же для обрезанного большого data.txt (заголовок и хвост с
+     * границы строки ищутся чтением): итог после сбоя — тот же, что без него. */
+    {
+        static const OldFileSpec T[1] = { { "DATA    TXT", 30000, 6 } };
+        static LogRecord ref[32 * 64];
+        fm_reset(32);
+        fm_mode = 1;
+        (void)old_volume(16, T, 1, 0, old_texts);
+        (void)LogArchive_Open(&r, &FM_OPS, 32, 1, &v);
+        uint32_t nref = LogRing_Count(&r);
+        for (uint32_t i = 0; i < nref; i++) (void)LogRing_Read(&r, i, &ref[i]);
+        uint32_t points = 0, failed = 0;
+        for (long k = 0;; k++)
+        {
+            fm_reset(32);
+            uint32_t end = old_volume(16, T, 1, 0, old_texts);
+            static uint8_t before[32 * 4096];
+            memcpy(before, fm, sizeof(before));
+            fm_read_fail = k;
+            uint8_t res = LogArchive_Open(&r, &FM_OPS, 32, 1, &v);
+            if (fm_read_fail >= 0) { fm_read_fail = -1; break; }
+            points++;
+            for (int t = 0; t < 4 && res != LOG_OPEN_OK; t++)
+                res = LogArchive_Open(&r, &FM_OPS, 32, 1, &v);
+            int e = (res != LOG_OPEN_OK || memcmp(before, fm, end) != 0 || LogRing_Count(&r) != nref);
+            LogRecord got;
+            for (uint32_t i = 0; !e && i < nref; i++)
+                e = (LogRing_Read(&r, i, &got) != LOG_READ_OK ||
+                     memcmp(got.b, ref[i].b, 2) != 0 ||
+                     memcmp(got.b + LOG_PAYLOAD_OFS, ref[i].b + LOG_PAYLOAD_OFS, LOG_PAYLOAD_SIZE) != 0);
+            if (e && failed < 3U) printf("    большой data.txt, отказ чтения %ld\n", k);
+            failed += (uint32_t)e;
+        }
+        char what[200];
+        snprintf(what, sizeof(what), "T1: отказ k-го чтения (обрезанный data.txt, %u точек) — импорт как без сбоя", points);
+        ok(nref > 300U && points > 500U && failed == 0U, what);
+    }
+
+    /* T5: место проверяется и перед записью FILE (и END): запись, стоящая
+     * у края старого тома, импорт не начинает. */
+    {
+        static const OldFileSpec H[1] = { { "DATA    TXT", 3000, 9 } };
+        fm_reset(32);
+        fm_mode = 1;
+        uint32_t end = old_volume(16, H, 1, 0, old_texts);
+        static uint8_t before[64 * 4096];
+        memcpy(before, fm, sizeof(before));
+        equ(LogImport_Probe(&FM_OPS, 32U * 4096U, &v), LOG_PROBE_VOL, "T5: том узнан");
+        uint32_t first = v.end / LOG_SECTOR_SIZE;
+        LogRing_Start(&r, &FM_OPS, 32, first, 0);
+        r.w_sect = 30;
+        r.w_slot = LOG_SLOTS - 2U;   /* за ней — сектор 31 и запасной 0 (MBR) */
+        r.w_erased = 1;
+        r.spare_erased = 1;
+        ok(LogImport_Run(&r, &v, 32U * 4096U, first) == 0 && memcmp(before, fm, end) == 0 &&
+           r.next_seq == 0U, "T5: у края тома запись FILE не делается, MBR не стёрт");
+    }
+
     /* Не наш том или флеш с мусором — журнал с начала, без импорта. */
     {
         fm_reset(16);
         memset(fm, 0x5A, 16U * 4096U);
-        equ(LogImport_Probe(&FM_OPS, 16U * 4096U, &v), 0, "мусор — не том");
+        equ(LogImport_Probe(&FM_OPS, 16U * 4096U, &v), LOG_PROBE_NONE, "мусор — не том");
         equ(LogArchive_Open(&r, &FM_OPS, 16, 1, &v), LOG_OPEN_OK, "мусор: журнал открыт");
         LogRecord rec;
         uint32_t fails = 0;
@@ -1881,6 +2316,7 @@ int main(void)
     test_log_ring_g1();
     test_log_ring_g4();
     test_log_ring_g2();
+    test_log_ring_accept2();
     test_log_import();
 
     printf("\n%d проверок, %d провалов\n", checks, failures);

@@ -28,12 +28,18 @@
  *      тогда ищем годный слот дальше в секторе и выводим seq слота 0 из него.
  *   2. Голова — сектор с наибольшим seq. Позиция записи — за последним
  *      нестёртым слотом головы: испорченный обрывом слот пропускается, он
- *      уже израсходовал свой номер (G2: потеряна одна запись).
+ *      уже израсходовал свой номер (G2: потеряна одна запись). Первый
+ *      стёртый за ним слот тоже пропускается (тратит номер): обрыв мог
+ *      оставить в нём недозаряженные ячейки, которые читаются как 0xFF, и
+ *      запись поверх испортилась бы уже после сверки (T4).
  *   3. Хвост — идём от головы назад, пока seq предыдущего сектора ровно на
  *      64 меньше. Так в журнал не попадают ни чужие данные (старый том),
  *      ни запасной сектор, стирание которого могло оборваться.
- *   4. Запасной сектор проверяется на чистоту целиком; не чист — его сотрёт
- *      первая же дозапись.
+ *   4. Запасной сектор (и сектор записи, если запись начнётся с его слота
+ *      0) первая же дозапись стирает безусловно, даже если он читается
+ *      чистым: оборванное стирание оставляет «слабо стёртые» ячейки, которые
+ *      сейчас читаются как 1, а через недели — как 0 (T4). Это одно-два
+ *      стирания по 25 мс на старт.
  *
  * Флаг занятости флеш для MSC и запрет записи во время USB-сессии — забота
  * main.c; ожидание BUSY микросхемы — внутри SPI_Flash_*. Журнал только
@@ -54,6 +60,11 @@ typedef struct {
     uint8_t (*program)(uint32_t addr, const uint8_t *buf, uint32_t len);
     uint8_t (*erase)(uint32_t addr);      /* сектор 4 КБ, addr выровнен */
     void    (*kick)(void);                /* сторож; может быть NULL */
+    /* Снять защиту блоков; 1 — снята (проверено). SST26 после своего сброса
+     * по питанию (просадка, при которой МК жив) запирает все блоки, и
+     * программирование со стиранием молча не делают ничего. Журнал зовёт её
+     * перед каждой серией записи и перед повтором (T2). Может быть NULL. */
+    uint8_t (*unlock)(void);
 } LogFlashOps;
 
 typedef struct {
@@ -66,6 +77,7 @@ typedef struct {
     uint32_t tail_seq;       /* seq старейшей читаемой записи */
     uint8_t  spare_erased;   /* запасной сектор (за w_sect) заведомо чист */
     uint8_t  w_erased;       /* сектор записи заведомо чист (важно при w_slot 0) */
+    uint8_t  w_skip;         /* после монтирования пропустить слот w_slot (T4) */
     uint8_t  mounted;
 } LogRing;
 
@@ -135,6 +147,13 @@ typedef struct {
     uint8_t  dropped;        /* файлов не влезло или не прочлось */
     LogOldFile files[LOG_IMPORT_MAX_FILES];
 } LogOldVolume;
+
+/* Итог разбора: том найден, тома нет (прочитано и не наше) или флеш не
+ * прочиталась. Последнее — не «тома нет»: по такому ответу нельзя ни
+ * начинать журнал поверх, ни закрывать незаконченный импорт (T1). */
+#define LOG_PROBE_NONE  0U
+#define LOG_PROBE_VOL   1U
+#define LOG_PROBE_EIO   2U
 
 uint8_t LogImport_Probe(const LogFlashOps *ops, uint32_t flash_bytes, LogOldVolume *v);
 
@@ -215,10 +234,29 @@ static uint8_t LogRing_SectorSeq(const LogFlashOps *ops, uint32_t sect, uint32_t
             continue;
         }
         *any = 1;
-        /* Слот 0 не похож даже на недописанную запись — сектор чужой (старый
-         * том), дальше не читаем: иначе каждый старт читал бы весь чип. */
+        /* Слот 0 не похож даже на недописанную запись — сектор, скорее всего,
+         * чужой (старый том), и весь его не читаем: иначе каждый старт читал
+         * бы весь чип. Но один сброшенный бит в байте типа выглядит так же,
+         * поэтому решают ещё слот 1 и последний (T3): годная CRC с номером в
+         * любом из них — сектор наш. На чужом томе это два лишних чтения. */
         if (k == 0U && !LogRecord_MayBeOurs(&buf))
+        {
+            static const uint32_t more[2] = { 1U, LOG_SLOTS - 1U };
+            for (uint32_t j = 0; j < 2U; j++)
+            {
+                if (!ops->read(LogRing_Addr(sect, more[j]), buf.b, LOG_RECORD_SIZE))
+                {
+                    *eio = 1;
+                    return 0;
+                }
+                if (LogRecord_Check(&buf) == LOG_REC_OK)
+                {
+                    *seq0 = LogRecord_Seq(&buf) - more[j];
+                    return 1;
+                }
+            }
             return 0;
+        }
     }
     return 0;
 }
@@ -235,6 +273,7 @@ void LogRing_Start(LogRing *r, const LogFlashOps *ops, uint32_t nsect,
     r->tail_seq = first_seq;
     r->spare_erased = 0;
     r->w_erased = 0;
+    r->w_skip = 0;
     r->mounted = 1;
 }
 
@@ -292,18 +331,22 @@ uint8_t LogRing_Mount(LogRing *r, const LogFlashOps *ops, uint32_t nsect)
     r->next_seq = head_seq0 + k;
     if (k == LOG_SLOTS)
     {
+        /* Голова полна: следующий сектор стирается перед записью, даже если
+         * читается чистым (T4). Годных записей там нет (иначе головой был бы
+         * он), стереть его ничего не теряет. */
         r->w_sect = LogRing_Next(r, head);
         r->w_slot = 0;
-        /* Голова полна: следующий сектор должен быть чист. Не чист — в нём
-         * недописанный слот 0 или прерванное стирание; годных записей там нет
-         * (иначе головой был бы он), стереть его ничего не теряет. */
-        r->w_erased = LogRing_SectorBlank(ops, r->w_sect);
+        r->w_erased = 0;
+        r->w_skip = 0;
     }
     else
     {
+        /* Слот k читается стёртым, но мог быть недописан обрывом без единого
+         * сброшенного бита: первая дозапись его пропустит (T4). */
         r->w_sect = head;
         r->w_slot = k;
         r->w_erased = 1;
+        r->w_skip = 1;
     }
 
     /* Хвост: назад от головы, пока номера идут подряд. Сектор записи (если
@@ -323,7 +366,24 @@ uint8_t LogRing_Mount(LogRing *r, const LogFlashOps *ops, uint32_t nsect)
         {
             if (eio)
                 return LOG_MOUNT_EIO;
-            break;
+            /* Сектор без годного номера посреди журнала (испорчен целиком)
+             * журнал не рвёт, если за ним номера идут дальше ровно через
+             * сектор: он остаётся внутри и читается как испорченные слоты. */
+            uint32_t pp = LogRing_Prev(r, p);
+            if (!any || n + 1U >= nsect || pp == spare || pp == r->w_sect)
+                break;
+            if (!LogRing_SectorSeq(ops, pp, &seq0, &any, &eio))
+            {
+                if (eio)
+                    return LOG_MOUNT_EIO;
+                break;
+            }
+            if (seq0 != t_seq0 - 2U * LOG_SLOTS)
+                break;
+            t = pp;
+            t_seq0 = seq0;
+            n++;
+            continue;
         }
         if (seq0 != t_seq0 - LOG_SLOTS)
             break;
@@ -333,18 +393,30 @@ uint8_t LogRing_Mount(LogRing *r, const LogFlashOps *ops, uint32_t nsect)
     r->tail_sect = t;
     r->tail_seq = t_seq0;
 
-    r->spare_erased = LogRing_SectorBlank(ops, spare);
+    r->spare_erased = 0;   /* сотрёт первая дозапись, безусловно (T4) */
     r->mounted = 1;
     LogRing_Kick(ops);
     return LOG_MOUNT_OK;
 }
 
+static uint8_t LogRing_Unlock(const LogFlashOps *ops)
+{
+    return ops->unlock ? ops->unlock() : 1U;
+}
+
+/* Стереть и проверить чтением: запертая (T2) или оборванная микросхема
+ * отвечает на стирание «успехом», ничего не стерев. */
+static uint8_t LogRing_EraseSect(const LogFlashOps *ops, uint32_t sect)
+{
+    LogRing_Kick(ops);
+    uint8_t ok = ops->erase(sect * LOG_SECTOR_SIZE);
+    LogRing_Kick(ops);   /* стирание сектора SST26 — до 25 мс по паспорту */
+    return ok && LogRing_SectorBlank(ops, sect);
+}
+
 static uint8_t LogRing_Erase(LogRing *r, uint32_t sect)
 {
-    LogRing_Kick(r->ops);
-    uint8_t ok = r->ops->erase(sect * LOG_SECTOR_SIZE);
-    LogRing_Kick(r->ops);   /* стирание сектора — до ~400 мс по паспорту */
-    return ok;
+    return LogRing_EraseSect(r->ops, sect);
 }
 
 /* Стереть запасной сектор. Если в нём лежат старейшие записи журнала —
@@ -380,6 +452,11 @@ static void LogRing_Advance(LogRing *r)
 
 static uint8_t LogRing_TryAppend(LogRing *r, LogRecord *rec)
 {
+    if (r->w_skip)
+    {
+        r->w_skip = 0;
+        LogRing_Advance(r);
+    }
     if (r->w_slot == 0U && !r->w_erased)
     {
         /* Сектор записи не стёрт: после старта на чужой флеш или после
@@ -436,9 +513,13 @@ uint8_t LogRing_Append(LogRing *r, LogRecord *rec)
 {
     if (!r->mounted)
         return 0;
-    if (LogRing_TryAppend(r, rec))
+    /* Защита снимается перед каждой записью и ещё раз перед повтором: это
+     * пара байт по SPI, а сброс одной флеш посреди работы иначе запер бы
+     * запись до перезагрузки МК (T2). Не снялась — отказ, main
+     * переинициализирует флеш. */
+    if (LogRing_Unlock(r->ops) && LogRing_TryAppend(r, rec))
         return 1;
-    return r->mounted ? LogRing_TryAppend(r, rec) : 0U;
+    return (r->mounted && LogRing_Unlock(r->ops)) ? LogRing_TryAppend(r, rec) : 0U;
 }
 
 uint32_t LogRing_Count(const LogRing *r)
@@ -491,12 +572,14 @@ uint8_t LogRing_Newest(const LogRing *r, LogRecord *out, uint32_t *idx)
 
 #define LOG_FAT_SECTOR  512U
 
+/* 1 — прочитано, 0 — сектора нет на физической флеш (это ответ «не том»),
+ * LOG_PROBE_EIO — не прочиталось. */
 static uint8_t LogImport_ReadSector(const LogFlashOps *ops, uint32_t flash_bytes,
                                     uint32_t lba, uint8_t *buf)
 {
     if (lba >= flash_bytes / LOG_FAT_SECTOR)
         return 0;
-    return ops->read(lba * LOG_FAT_SECTOR, buf, LOG_FAT_SECTOR);
+    return ops->read(lba * LOG_FAT_SECTOR, buf, LOG_FAT_SECTOR) ? 1U : LOG_PROBE_EIO;
 }
 
 /* Загрузочный сектор FAT12/16 с 512-байтным сектором? Заполняет геометрию. */
@@ -534,16 +617,20 @@ static uint8_t LogImport_Boot(const uint8_t *b, uint32_t lba, LogOldVolume *v)
     return 1;
 }
 
-/* Следующий кластер по FAT; 0 — ошибка чтения или битая цепочка,
- * 0xFFFFFFFF — конец файла. */
+/* Следующий кластер по FAT; 0 — битая цепочка, 0xFFFFFFFF — конец файла,
+ * LOG_CLUST_EIO — FAT не прочиталась (это не «битая»: файл не выбрасывать). */
+#define LOG_CLUST_EIO  0xFFFFFFFEUL
+
 static uint32_t LogImport_NextClust(const LogFlashOps *ops, uint32_t flash_bytes,
                                     const LogOldVolume *v, uint32_t c)
 {
     uint32_t ofs = (v->fatbits == 12U) ? c + c / 2U : c * 2U;
     uint8_t  e[2];
     uint32_t addr = v->fat_lba * LOG_FAT_SECTOR + ofs;
-    if (addr + 2U > flash_bytes || !ops->read(addr, e, 2))
+    if (addr + 2U > flash_bytes)
         return 0;
+    if (!ops->read(addr, e, 2))
+        return LOG_CLUST_EIO;
     uint32_t n = LogRecord_Get16(e);
     if (v->fatbits == 12U)
     {
@@ -564,7 +651,8 @@ static uint32_t LogImport_ClustAddr(const LogOldVolume *v, uint32_t c)
 }
 
 /* Пройти цепочку файла: длина хватает на размер, кластеры — на физической
- * флеш, без петель. *last — байт за последним кластером. */
+ * флеш, без петель. *last — байт за последним кластером (и у битой цепочки —
+ * за последним пройденным). 1 — цела, 0 — битая, LOG_PROBE_EIO — сбой чтения. */
 static uint8_t LogImport_CheckChain(const LogFlashOps *ops, uint32_t flash_bytes,
                                     const LogOldVolume *v, const LogOldFile *f, uint32_t *last)
 {
@@ -584,6 +672,8 @@ static uint8_t LogImport_CheckChain(const LogFlashOps *ops, uint32_t flash_bytes
         if (i + 1U < need)
         {
             c = LogImport_NextClust(ops, flash_bytes, v, c);
+            if (c == LOG_CLUST_EIO)
+                return LOG_PROBE_EIO;
             if (c == 0U || c == 0xFFFFFFFFUL)
                 return 0;
         }
@@ -660,26 +750,36 @@ uint8_t LogImport_Probe(const LogFlashOps *ops, uint32_t flash_bytes, LogOldVolu
 
     /* Где том: по MBR, по LBA 63 (наш f_mkfs; MBR мог быть стёрт прерванной
      * правкой — R3) или без MBR с нуля. */
+    /* Любой сбой чтения — LOG_PROBE_EIO сразу, а не «следующий кандидат»:
+     * иначе отказ чтения загрузочного сектора дал бы «тома нет». */
     uint32_t cand[3] = { 0xFFFFFFFFUL, 63U, 0U };
-    if (LogImport_ReadSector(ops, flash_bytes, 0, sec) && sec[510] == 0x55 && sec[511] == 0xAA)
+    uint8_t  rd = LogImport_ReadSector(ops, flash_bytes, 0, sec);
+    if (rd == LOG_PROBE_EIO)
+        return LOG_PROBE_EIO;
+    if (rd && sec[510] == 0x55 && sec[511] == 0xAA)
         cand[0] = LogRecord_Get32(sec + 446 + 8);
     uint8_t found = 0;
     for (uint32_t i = 0; i < 3 && !found; i++)
     {
-        if (cand[i] == 0xFFFFFFFFUL || !LogImport_ReadSector(ops, flash_bytes, cand[i], sec))
+        if (cand[i] == 0xFFFFFFFFUL)
             continue;
-        found = LogImport_Boot(sec, cand[i], v);
+        rd = LogImport_ReadSector(ops, flash_bytes, cand[i], sec);
+        if (rd == LOG_PROBE_EIO)
+            return LOG_PROBE_EIO;
+        if (rd)
+            found = LogImport_Boot(sec, cand[i], v);
     }
     if (!found || v->meta_end > flash_bytes)
-        return 0;
+        return LOG_PROBE_NONE;
 
     /* Корневой каталог: только наши файлы, удалённые и каталоги — мимо. */
     uint32_t last = v->meta_end;
     uint8_t  done = 0;
     for (uint32_t lba = v->root_lba; lba < v->data_lba && !done; lba++)
     {
-        if (!LogImport_ReadSector(ops, flash_bytes, lba, sec))
-            return 0;
+        rd = LogImport_ReadSector(ops, flash_bytes, lba, sec);
+        if (rd != 1U)
+            return LOG_PROBE_EIO;   /* корень внутри флеш: Boot это проверил */
         for (uint32_t o = 0; o < LOG_FAT_SECTOR; o += 32U)
         {
             const uint8_t *de = sec + o;
@@ -694,9 +794,17 @@ uint8_t LogImport_Probe(const LogFlashOps *ops, uint32_t flash_bytes, LogOldVolu
             f.size  = LogRecord_Get32(de + 28);
             if (f.size == 0U)
                 continue;
-            if (!LogImport_CheckChain(ops, flash_bytes, v, &f, &f.end))
+            uint8_t ch = LogImport_CheckChain(ops, flash_bytes, v, &f, &f.end);
+            if (ch == LOG_PROBE_EIO)
+                return LOG_PROBE_EIO;
+            if (!ch)
             {
-                v->dropped++;   /* битая цепочка — не наш случай гадать */
+                /* Битая цепочка — не наш случай гадать. Но пройденные её
+                 * кластеры граница всё равно накрывает: журнал импорта не
+                 * ляжет на то, что от файла осталось. */
+                v->dropped++;
+                if (f.end > last)
+                    last = f.end;
                 continue;
             }
             LogImport_AddFile(v, &f);
@@ -712,7 +820,7 @@ uint8_t LogImport_Probe(const LogFlashOps *ops, uint32_t flash_bytes, LogOldVolu
         v->total += v->files[i].size;
     }
     v->end = (last + LOG_SECTOR_SIZE - 1U) / LOG_SECTOR_SIZE * LOG_SECTOR_SIZE;
-    return 1;
+    return LOG_PROBE_VOL;
 }
 
 /* Первая строка (заголовок) файла с пропущенным началом — не длиннее. */
@@ -751,7 +859,7 @@ static uint8_t LogImport_Seek(const LogFlashOps *ops, uint32_t flash_bytes, cons
     while (pos - c->pos >= csize)
     {
         c->clust = LogImport_NextClust(ops, flash_bytes, v, c->clust);
-        if (c->clust == 0U || c->clust == 0xFFFFFFFFUL)
+        if (c->clust == 0U || c->clust >= LOG_CLUST_EIO)
             return 0;
         c->pos += csize;
     }
@@ -769,7 +877,7 @@ static uint8_t LogImport_Get(const LogFlashOps *ops, uint32_t flash_bytes, const
         if (c->in_clust == csize)
         {
             c->clust = LogImport_NextClust(ops, flash_bytes, v, c->clust);
-            if (c->clust == 0U || c->clust == 0xFFFFFFFFUL)
+            if (c->clust == 0U || c->clust >= LOG_CLUST_EIO)   /* и конец, и сбой чтения */
                 return 0;
             c->in_clust = 0;
         }
@@ -783,21 +891,27 @@ static uint8_t LogImport_Get(const LogFlashOps *ops, uint32_t flash_bytes, const
     return 1;
 }
 
-/* Позиция сразу за первым '\n' в [from, limit); 0 — нет или сбой чтения. */
+/* Позиция сразу за первым '\n' в [from, limit); 0 — нет, LOG_NL_EIO — сбой
+ * чтения (это не «нет»: иначе обрезанный файл ушёл бы в журнал пустым, а
+ * импорт закрылся бы как удачный). */
+#define LOG_NL_EIO  0xFFFFFFFFUL
+
 static uint32_t LogImport_AfterNl(const LogFlashOps *ops, uint32_t flash_bytes, const LogOldVolume *v,
                                   const LogOldFile *f, uint32_t from, uint32_t limit)
 {
     LogImportCur c;
     uint8_t buf[LOG_TEXT_MAX];
-    if (from >= limit || !LogImport_Seek(ops, flash_bytes, v, f, &c, from))
+    if (from >= limit)
         return 0;
+    if (!LogImport_Seek(ops, flash_bytes, v, f, &c, from))
+        return LOG_NL_EIO;
     while (c.pos < limit)
     {
         uint32_t n = limit - c.pos;
         if (n > sizeof(buf)) n = sizeof(buf);
         uint32_t at = c.pos;
         if (!LogImport_Get(ops, flash_bytes, v, &c, buf, n))
-            return 0;
+            return LOG_NL_EIO;
         for (uint32_t i = 0; i < n; i++)
             if (buf[i] == '\n')
                 return at + i + 1U;
@@ -806,9 +920,17 @@ static uint32_t LogImport_AfterNl(const LogFlashOps *ops, uint32_t flash_bytes, 
     return 0;
 }
 
-/* Переложить байты [from, to) файла в записи TEXT. Перед каждой записью —
- * проверка, что ни она, ни стирание запасного не зайдут на старый том
- * (повторы испорченных слотов могли съесть запас). */
+/* Хватает ли места на ещё одну запись импорта: ни она, ни стирание
+ * запасного не должны зайти на старый том (повторы испорченных слотов могли
+ * съесть запас). Проверяется перед каждой записью импорта — FILE, TEXT и END
+ * (T5). */
+static uint8_t LogImport_Room(const LogRing *r, uint32_t first)
+{
+    return !(r->w_slot >= LOG_SLOTS - 2U &&
+             LogRing_Next(r, LogRing_Next(r, r->w_sect)) < first);
+}
+
+/* Переложить байты [from, to) файла в записи TEXT. */
 static uint8_t LogImport_Emit(LogRing *r, const LogOldVolume *v, uint32_t flash_bytes,
                               const LogOldFile *f, uint8_t idx, uint32_t from, uint32_t to,
                               uint32_t first, uint32_t *total)
@@ -826,8 +948,7 @@ static uint8_t LogImport_Emit(LogRing *r, const LogOldVolume *v, uint32_t flash_
         if (n > LOG_TEXT_MAX) n = LOG_TEXT_MAX;
         if (!LogImport_Get(r->ops, flash_bytes, v, &c, chunk, n))
             return 0;
-        if (r->w_slot >= LOG_SLOTS - 2U &&
-            LogRing_Next(r, LogRing_Next(r, r->w_sect)) < first)
+        if (!LogImport_Room(r, first))
             return 0;
         LogRecord_MakeText(&rec, idx, chunk, n);
         if (!LogRing_Append(r, &rec))
@@ -849,7 +970,7 @@ static uint8_t LogImport_Run(LogRing *r, const LogOldVolume *v, uint32_t flash_b
         const LogOldFile *f = &v->files[i];
         LogRecord_MakeImportFile(&rec, (uint8_t)i, f->size, f->name);
         LogRecord_Put32(rec.b + LOG_PAYLOAD_OFS + 18, f->skip);
-        if (!LogRing_Append(r, &rec))
+        if (!LogImport_Room(r, first) || !LogRing_Append(r, &rec))
             return 0;
 
         uint32_t from = 0;
@@ -859,9 +980,12 @@ static uint8_t LogImport_Run(LogRing *r, const LogOldVolume *v, uint32_t flash_b
              * затем текст с первой целой строки после пропуска. */
             uint32_t lim = (f->skip < LOG_IMPORT_HDR_MAX) ? f->skip : LOG_IMPORT_HDR_MAX;
             uint32_t hdr = LogImport_AfterNl(r->ops, flash_bytes, v, f, 0, lim);
-            if (!LogImport_Emit(r, v, flash_bytes, f, (uint8_t)i, 0, hdr, first, &total))
+            if (hdr == LOG_NL_EIO ||
+                !LogImport_Emit(r, v, flash_bytes, f, (uint8_t)i, 0, hdr, first, &total))
                 return 0;
             from = LogImport_AfterNl(r->ops, flash_bytes, v, f, f->skip, f->size);
+            if (from == LOG_NL_EIO)
+                return 0;
             if (from == 0U)
                 from = f->size;
         }
@@ -870,7 +994,7 @@ static uint8_t LogImport_Run(LogRing *r, const LogOldVolume *v, uint32_t flash_b
     }
     LogRecord_MakeImportEnd(&rec, v->nfiles, total);
     rec.b[LOG_PAYLOAD_OFS + 5] = v->dropped;
-    return LogRing_Append(r, &rec);
+    return LogImport_Room(r, first) && LogRing_Append(r, &rec);
 }
 
 /* Импорт начат и не закончен: самая новая годная запись — FILE или TEXT. */
@@ -912,9 +1036,19 @@ uint8_t LogArchive_Open(LogRing *r, const LogFlashOps *ops, uint32_t nsect,
         return LOG_OPEN_NEED_POWER;
 
     uint8_t vol = LogImport_Probe(ops, flash_bytes, v);
+    if (vol == LOG_PROBE_EIO)
+        return LOG_OPEN_EIO;          /* ничего не записано: main повторит */
     if (pending)
     {
-        if (!vol)
+        /* По этому разбору будет стираться всё выше границы, а при «тома
+         * нет» — закрываться импорт. Разбор повторяется и должен дать то же
+         * самое: одно искажённое (а не отказавшее) чтение не решает. */
+        uint32_t end = v->end, total = v->total;
+        uint8_t  nfiles = v->nfiles;
+        uint8_t  again = LogImport_Probe(ops, flash_bytes, v);
+        if (again != vol || v->end != end || v->total != total || v->nfiles != nfiles)
+            return LOG_OPEN_EIO;
+        if (vol == LOG_PROBE_NONE)
         {
             /* Старого тома больше не видно, хотя импорт не закончен. Ниже
              * границы журнал не писал — значит, том испортил кто-то другой.
@@ -927,17 +1061,19 @@ uint8_t LogArchive_Open(LogRing *r, const LogFlashOps *ops, uint32_t nsect,
         /* Стереть журнальную область целиком и начать заново. Только выше
          * границы тома — сам том не трогаем. Обрыв здесь — опять «не
          * закончен» (или «журнала нет»), и всё повторится. */
+        if (!LogRing_Unlock(ops))
+            return LOG_OPEN_FAIL;
         for (uint32_t s = v->end / LOG_SECTOR_SIZE; s < nsect; s++)
         {
             LogRing_Kick(ops);
             if (LogRing_SectorBlank(ops, s))
                 continue;
-            if (!ops->erase(s * LOG_SECTOR_SIZE))
+            if (!LogRing_EraseSect(ops, s))
                 return LOG_OPEN_FAIL;
         }
     }
 
-    if (!vol || v->nfiles == 0U)
+    if (vol == LOG_PROBE_NONE || v->nfiles == 0U)
     {
         /* Не наш том или переносить нечего: журнал с начала, чужое
          * стирается по мере хода кольца. */
