@@ -141,8 +141,55 @@ void SystemClock_Config(void);
  * Теперь хост видит том, когда запись цикла уже закончена. */
 static uint8_t usb_started = 0;
 
+/* 48 МГц для OTG FS. USB FS требует точности ±0.25 %, а HSI даёт ±1 % при
+ * 25 °C и хуже по температуре: в теплице от 5 до 40 °C перечисление и
+ * копирование архива срывались бы (A10). На BlackPill есть кварц 25 МГц —
+ * PLL на время USB-сессии берём от него: 25 / 25 × 192 / 4 = 48 МГц.
+ * Ядро и шины остаются на HSI: PLL нужен только USB, и замерное окно его
+ * не ждёт. Выход P (не используется) — тоже 48 МГц, в пределах 84 МГц.
+ * HSE не завёлся — откат на HSI, как было раньше: хуже, но не мёртвый USB. */
+static void Clock_UsbOn(void)
+{
+  RCC_OscInitTypeDef osc = {0};
+
+  osc.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  osc.HSEState = RCC_HSE_ON;
+  osc.PLL.PLLState = RCC_PLL_ON;
+  osc.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  osc.PLL.PLLM = 25;
+  osc.PLL.PLLN = 192;
+  osc.PLL.PLLP = RCC_PLLP_DIV4;
+  osc.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&osc) == HAL_OK)
+      return;
+
+  osc.HSEState = RCC_HSE_OFF;
+  osc.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  osc.PLL.PLLM = 16;
+  (void)HAL_RCC_OscConfig(&osc);
+}
+
+/* STOP и так останавливает PLL и HSE, но цикл удержания может закончиться
+ * и без сна — гасим явно, чтобы не держать их зря. */
+static void Clock_UsbOff(void)
+{
+  RCC_OscInitTypeDef osc = {0};
+
+  /* Сначала PLL, потом его источник: HAL в одном вызове гасит HSE раньше
+   * PLL, и тот на миг остался бы без опоры. */
+  osc.OscillatorType = RCC_OSCILLATORTYPE_NONE;
+  osc.PLL.PLLState = RCC_PLL_OFF;
+  (void)HAL_RCC_OscConfig(&osc);
+
+  osc.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  osc.HSEState = RCC_HSE_OFF;
+  osc.PLL.PLLState = RCC_PLL_NONE;
+  (void)HAL_RCC_OscConfig(&osc);
+}
+
 static void Usb_Start(void)
 {
+  Clock_UsbOn();
   MX_USB_DEVICE_Init();
   usb_started = 1;
 }
@@ -158,6 +205,7 @@ static void Usb_Stop(void)
   USB_OTG_FS->GCCFG &= ~USB_OTG_GCCFG_PWRDWN;
 
   USBD_DeInit(&hUsbDeviceFS);
+  Clock_UsbOff();
   usb_started = 0;
 }
 
