@@ -34,6 +34,7 @@
 #include "storage_policy.h"
 #include "time_service.h"
 #include "soil_sensor.h"
+#include "soil_curve.h"
 #include "battery.h"
 #include "ds18b20.h"
 #include "power_policy.h"
@@ -111,19 +112,46 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* Набор колонок CSV. Держим одной строкой, чтобы при старте сверить с тем, что
  * уже лежит в файле: состав колонок меняется от версии к версии, а архив теперь
- * переживает перезагрузку — иначе строки разного формата смешались бы в одном файле. */
+ * переживает перезагрузку — иначе строки разного формата смешались бы в одном файле.
+ * Архив с другим заголовком не стирается, а уходит в data_N.txt (A11/C5). */
 /* Сначала то, ради чего прибор существует, затем состояние питания, затем
- * диагностика. Отладочные колонки времени цикла и внутренних кодов AHT20 сняты:
- * они своё отработали — за весь снятый архив ни одной ошибки, — а платил за них
- * архив своей длиной. Оставшиеся нужны и в поле: по ним видно, ПОЧЕМУ значение
- * отсутствует, вместо того чтобы гадать над пустой ячейкой.
+ * признаки достоверности, диагностика и в конце сырые отсчёты. Отладочные
+ * колонки времени цикла и внутренних кодов AHT20 сняты: они своё отработали.
+ * Оставшиеся нужны и в поле: по ним видно, ПОЧЕМУ значение отсутствует или
+ * чему не верить, вместо того чтобы гадать над пустой ячейкой.
+ *   vdd           — реальное VDD по VREFINT, В (известно и при банке вне шкалы);
  *   soil_valid    — 0, если банка просела ниже дропаута LDO и опора АЦП уплыла;
- *   lse_ok        — 0, если часовой кварц не завёлся: тогда времени верить нельзя;
- *   aht_*, ds_err — почему не прочитались воздух и почва;
- *   write_fails   — сколько строк за всю жизнь не удалось записать. */
+ *   lse_ok        — 0, если часовой кварц не завёлся и RTC идёт от LSI (A5);
+ *   time_ok       — 0, если календарь терялся и часы откатились на время
+ *                   сборки (A6): меткам таких строк верить нельзя;
+ *   aht_*, ds_err — почему не прочитались воздух и почва (ds_err 8 — датчики
+ *                   не опрашивались: карантин питания);
+ *   air_xchk      — сверка AHT20 с BMP280: 0 сошлись, 1 разошлись > 2 °C,
+ *                   2 BMP280 не ответил, 3 сверять нечего (sensor_policy.h);
+ *   i2c_rec       — шину I2C пришлось освобождать (B6): 1 тактами, 2 снятием
+ *                   питания, 3 не освободилась;
+ *   sens_off      — карантин питания датчиков: сколько циклов ещё без питания;
+ *   write_fails   — сколько строк за всю жизнь не удалось записать;
+ *   lowpower_skips — сколько строк пропущено из-за низкого питания (П1, C3);
+ *   reset_cause   — почему стартовали: биты флагов сброса и код сбоя
+ *                   (Policy_ResetCause);
+ *   boot_count    — стартов с последней подачи питания: рост без замены
+ *                   банки — тихие перезагрузки;
+ *   soil_raw, bat_raw — отсчёты АЦП почвы и делителя банки (0..4095): по ним
+ *                   и vdd значения можно пересчитать заново, если уплывёт
+ *                   калибровка. */
 #define CSV_HEADER "timestamp,air_temp,air_hum,soil_temp,soil_hum," \
-                   "bat_pct,vbat,soil_valid,lse_ok," \
-                   "aht_init_st,aht_read_st,ds_err,write_fails"
+                   "bat_pct,vbat,vdd,soil_valid,lse_ok,time_ok," \
+                   "aht_init_st,aht_read_st,ds_err,air_xchk,i2c_rec,sens_off," \
+                   "write_fails,lowpower_skips,reset_cause,boot_count," \
+                   "soil_raw,bat_raw"
+
+/* Опора и канал АЦП — как в soil_sensor.c и battery.c: оттуда отсчёты наружу
+ * не отдаются, а модули не наши. Почва — тот же отсчёт, обращённый из
+ * напряжения; банка — отдельная выборка того же канала сразу после замера. */
+#define SOIL_ADC_VREF       3.3f
+#define BAT_RAW_CHANNEL     ADC_CHANNEL_2
+#define BAT_RAW_SAMPLETIME  ADC_SAMPLETIME_84CYCLES
 
 /* USER CODE END PD */
 
@@ -843,11 +871,10 @@ int main(void)
 	   * строки идут как обычно: архив показывает, что прибор жив. */
 	  uint8_t  sens_powered = Policy_SensorsPowerAllowed(&sens_quarantine);
 	  uint32_t sens_off = sens_powered ? 0U : sens_quarantine.skip_left;
-	  (void)sens_off;   /* колонки sens_off и air_xchk — в изменении заголовка CSV */
 
 	  AHT20_Data aht = { NAN, NAN };
 	  HAL_StatusTypeDef aht_init_st = HAL_ERROR, aht_read_st = HAL_ERROR;
-	  float   soil_temp = NAN, soil_hum = NAN;
+	  float   soil_temp = NAN, soil_hum = NAN, soil_raw = NAN;
 	  uint8_t ds_err = DS_ERR_NOT_POLLED;
 	  uint8_t air_xchk = SENSOR_XCHK_NO_AHT;
 	  i2c_rec = 0;
@@ -929,13 +956,15 @@ int main(void)
 	      if (BMP280_Init(&hi2c1) == HAL_OK)
 	          (void)BMP280_ReadTemperature(&hi2c1, &bmp_t);
 	      air_xchk = Sensor_AirCrossCheck(aht.temperature, bmp_t);
-	      (void)air_xchk;   /* в CSV — с изменением заголовка */
 
 	      if (!DS18B20_ReadTemp(GPIOA, GPIO_PIN_8, &soil_temp))
 	          soil_temp = NAN; // датчик не ответил или CRC не сошёлся
 	      ds_err = (uint8_t)DS18B20_LastError();   /* почему 1-Wire не ответил */
 
-	      soil_hum = Soil_ReadMoisture();
+	      /* Напряжение — один раз: из него и влажность, и сырой отсчёт для CSV. */
+	      float soil_v = Soil_ReadVoltage();
+	      soil_hum = isnan(soil_v) ? NAN : Soil_VoltageToMoisture(soil_v);
+	      soil_raw = isnan(soil_v) ? NAN : roundf(soil_v * 4095.0f / SOIL_ADC_VREF);
 	  }
 
 	  Policy_QuarantineUpdate(&sens_quarantine, sens_powered,
@@ -944,6 +973,9 @@ int main(void)
 
 	  Battery_Data bat;
 	  Battery_Read(&bat);
+	  uint32_t bat_adc = 0;
+	  float    bat_raw = ADC_ReadChannel(BAT_RAW_CHANNEL, BAT_RAW_SAMPLETIME, &bat_adc)
+	                   ? (float)bat_adc : NAN;
 	  Watchdog_Kick();   /* опрос датчиков — до нескольких секунд; запись впереди */
 
 	  char ts[32];
@@ -952,8 +984,7 @@ int main(void)
 	  /* На просевшем питании не пишем вовсе: каждая дозапись стирает и
 	   * перепрограммирует 4-КБ блоки каталога и FAT, и сбой посреди них теряет
 	   * весь data.txt. Правило — в storage_policy.h. Пропуски считаем отдельно
-	   * от write_fails: это не отказ тома. В CSV счётчик пока не выводится
-	   * (формат строки — не этого блока), его видно отладчиком. */
+	   * от write_fails: это не отказ тома; в CSV — колонка lowpower_skips. */
 	  static volatile uint32_t lowpower_skips = 0;
 	  uint8_t power_ok = Storage_MayWrite(bat.valid, bat.low, bat.vdd);
 
@@ -992,13 +1023,14 @@ int main(void)
 
 	  if (res == FR_OK)
 	  {
-	      char line[128];
+	      char line[224];   /* строка ~130 символов; запас — на nan и длинные счётчики */
 	      /* Перевод строки задаём одним "\n": FatFs собран с _USE_STRFUNC = 2,
 	       * и f_puts сам разворачивает \n в \r\n. Со старым "\r\n" в формате на
 	       * диск уходило "\r\r\n" — лишний байт в каждой строке и мусорный
 	       * символ в конце последнего поля при разборе строгим парсером. */
 	      snprintf(line, sizeof(line),
-	               "%s,%.2f,%.2f,%.2f,%.2f,%.0f,%.2f,%u,%u,%d,%d,%u,%lu\n",
+	               "%s,%.2f,%.2f,%.2f,%.2f,%.0f,%.2f,%.3f,%u,%u,%u,%d,%d,%u,%u,%u,%lu,"
+	               "%lu,%lu,%u,%lu,%.0f,%.0f\n",
 	               ts,
 	               aht.temperature,
 	               aht.humidity,
@@ -1010,14 +1042,24 @@ int main(void)
 	                * через %.0f ради того же nan; для целых 0..100 вывод прежний. */
 	               bat.valid ? (double)bat.percent : (double)NAN,
 	               bat.valid ? (double)bat.volts   : (double)NAN,
+	               (double)bat.vdd,
 	               /* soil_valid: ниже дропаута LDO опора АЦП уплывает вместе с банкой,
 	                * поэтому влажность почвы с этого момента недостоверна. */
 	               (unsigned)(bat.valid && !bat.low),
 	               (unsigned)lse_ok,
+	               (unsigned)time_ok,
 	               (int)aht_init_st,
 	               (int)aht_read_st,
 	               (unsigned)ds_err,
-	               (unsigned long)write_fails);
+	               (unsigned)air_xchk,
+	               (unsigned)i2c_rec,
+	               (unsigned long)sens_off,
+	               (unsigned long)write_fails,
+	               (unsigned long)lowpower_skips,
+	               (unsigned)reset_cause,
+	               (unsigned long)boot_count,
+	               (double)soil_raw,
+	               (double)bat_raw);
 
 	      int      puts_res  = f_puts(line, &file);
 	      FRESULT  close_res = f_close(&file);
