@@ -15,6 +15,9 @@
 #define LOG_RING_IMPLEMENTATION
 #include "log_ring.h"
 #define VFAT_IMPLEMENTATION
+/* vfat.h берёт серийный номер тома из уникального ID МК (П5б+, V3). У оракула
+ * МК нет, а серийный номер в сверяемые файлы не попадает — хватит нулей. */
+#define VFAT_DEVICE_UID(w) ((w)[0] = 0U, (w)[1] = 0U, (w)[2] = 0U)
 #include "vfat.h"
 
 #include <stdio.h>
