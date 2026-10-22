@@ -861,6 +861,33 @@ static void test_log_record(void)
     }
     /* CRC — стандартный CRC32 (zip): "123456789" -> CBF43926. */
     equ(LogRecord_Crc32((const uint8_t *)"123456789", 9), 0xCBF43926UL, "CRC32 по стандартному вектору");
+    /* Табличный CRC (П5б+) обязан совпасть с прежним побитовым: в журнале
+     * на флеш лежат записи, запечатанные им. Случайные данные и длины,
+     * включая 0 и длину записи. */
+    {
+        uint8_t buf[300];
+        uint32_t rng = 12345, bad = 0;
+        for (int t = 0; t < 2000; t++)
+        {
+            for (uint32_t i = 0; i < sizeof(buf); i++)
+            {
+                rng = rng * 1103515245UL + 12345UL;
+                buf[i] = (uint8_t)(rng >> 16);
+            }
+            uint32_t n = (t < 300) ? (uint32_t)t
+                       : (t & 1) ? LOG_CRC_OFS : (rng >> 8) % (sizeof(buf) + 1U);
+            uint32_t c = 0xFFFFFFFFUL;
+            for (uint32_t i = 0; i < n; i++)
+            {
+                c ^= buf[i];
+                for (int k = 0; k < 8; k++)
+                    c = (c >> 1) ^ (0xEDB88320UL & (0U - (c & 1U)));
+            }
+            if (LogRecord_Crc32(buf, n) != ~c)
+                bad++;
+        }
+        equ(bad, 0, "табличный CRC32 совпадает с побитовым на случайных данных");
+    }
 
     /* Неразобранная метка — заметная дыра, а не правдоподобная дата. */
     {

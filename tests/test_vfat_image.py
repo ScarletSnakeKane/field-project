@@ -261,6 +261,10 @@ int main(void){
   a = now(); for (int i = 0; i < 20; i++) (void)VFat_FormatMeas(&r, x); uint32_t tf = ticks(a, now());
   a = now(); for (int i = 0; i < 20; i++) (void)VFat_FormatMeasSlow(&r, y); uint32_t ts = ticks(a, now());
   printf("LINE %s", x);
+  /* CRC одной записи — его считает каждое чтение журнала при сборке. */
+  volatile uint32_t sink = 0;
+  a = now(); for (int i = 0; i < 20; i++) sink += LogRecord_Crc32(r.b, LOG_CRC_OFS); uint32_t tcrc = ticks(a, now());
+  (void)sink;
 
   /* Журнал на NS секторов, том, худший сектор (поиск без курсора) и
    * последовательное чтение. */
@@ -275,8 +279,9 @@ int main(void){
   }
   vol.cur[0].valid = 0;
   a = now(); for (uint32_t s = 0; s < nsec; s++) (void)VFat_Read(&vol, first + s, sec); seq = ticks(a, now());
-  printf("CALIB %lu FAST %lu SLOW %lu BUILD %lu RECS %lu WORST %lu SEQ %lu NSEC %lu\n",
-         (unsigned long)calib, (unsigned long)(tf / 20U), (unsigned long)(ts / 20U), (unsigned long)tb,
+  printf("CALIB %lu FAST %lu SLOW %lu CRC %lu BUILD %lu RECS %lu WORST %lu SEQ %lu NSEC %lu\n",
+         (unsigned long)calib, (unsigned long)(tf / 20U), (unsigned long)(ts / 20U),
+         (unsigned long)(tcrc / 20U), (unsigned long)tb,
          (unsigned long)LogRing_Count(&ring), (unsigned long)worst, (unsigned long)seq, (unsigned long)nsec);
   semi_exit();
   return 0;
@@ -312,11 +317,12 @@ class Newlib(unittest.TestCase):
             self.assertEqual(mism[0].split()[1], "0", "newlib-nano печатает иначе: " + mism[0])
             st = dict(zip(*[iter(next(l for l in out.splitlines() if l.startswith("CALIB")).split())] * 2))
             k = 100000.0 / int(st["CALIB"])                 # инструкций на тик SysTick
-            ins = {n: int(st[n]) * k for n in ("FAST", "SLOW", "BUILD", "WORST", "SEQ")}
+            ins = {n: int(st[n]) * k for n in ("FAST", "SLOW", "CRC", "BUILD", "WORST", "SEQ")}
             nsec, recs = int(st["NSEC"]), int(st["RECS"])
             print("\n  newlib-nano, Cortex-M4 (инструкций): строка — своя %.0f, snprintf %.0f;"
-                  " сборка — %.0f на запись; сектор — худший %.0f, подряд %.0f"
-                  % (ins["FAST"], ins["SLOW"], ins["BUILD"] / recs, ins["WORST"], ins["SEQ"] / nsec),
+                  " CRC записи %.0f; сборка — %.0f на запись; сектор — худший %.0f, подряд %.0f"
+                  % (ins["FAST"], ins["SLOW"], ins["CRC"], ins["BUILD"] / recs, ins["WORST"],
+                     ins["SEQ"] / nsec),
                   file=sys.stderr)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
