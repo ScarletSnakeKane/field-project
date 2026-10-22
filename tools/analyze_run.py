@@ -7,6 +7,10 @@
     python tools/analyze_run.py <файл> [--from "ГГГГ-ММ-ДД ЧЧ:ММ"] [--to ...]
     python tools/analyze_run.py --compare <стенд.csv> <боевой.csv>
 
+Файл — data.txt с тома USB (или любой CSV прошивки) либо сырой образ флеш
+из read_data.sh --swd: из образа data.txt собирается тем же разбором, что
+у тома (tools/log_image.py).
+
 Границы окна нужны чаще, чем кажется: в архиве обычно перемешаны стендовый и
 боевой участки, а хвост испорчен возней с программатором — во время прошивки
 плата не спит и просаживает банку, и эти точки нельзя пускать в регрессию.
@@ -28,6 +32,7 @@ import sys
 # колонок-отказов живут в одном месте — в summarize_data.py.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import summarize_data  # noqa: E402
+import log_image       # noqa: E402
 
 # Заряд считается той же кривой, что и в прошивке: таблица читается прямо из
 # Core/Src/battery_curve.c, чтобы две копии не разошлись. Раньше здесь стояла
@@ -71,15 +76,18 @@ def load(path, lo=None, hi=None):
     время сборки, A6) вместо метки None: отказы, диапазоны и старты по ним
     считаются, а интервалы, «время назад» и разряд — нет. В окно --from/--to
     такие строки не попадают: их место на оси времени неизвестно.
-    Пятый элемент — сколько строк с time_ok = 0 в файле."""
-    raw = open(path, "rb").read()
+    Пятый элемент — сколько строк с time_ok = 0 в файле. Неразобранная
+    метка (xxxx-xx-xx, прошивка не смогла её прочесть) — как недоверенная."""
+    raw, note = log_image.read_archive(path)
+    for n in note:
+        print(n)
     text = raw.decode("ascii", "replace").replace("\r\n", "\n").replace("\r", "\n")
     lines = [l for l in text.split("\n") if l.strip()]
     head = lines[0].split(",")
     rows = [l.split(",") for l in lines[1:] if len(l.split(",")) == len(head)]
     col = {n: [r[i] for r in rows] for i, n in enumerate(head)}
     bad_time = summarize_data.time_untrusted(col)
-    ts = [None if i in bad_time else dt.datetime.strptime(x, "%Y-%m-%d %H:%M:%S")
+    ts = [None if i in bad_time else summarize_data.parse_ts(x)
           for i, x in enumerate(col["timestamp"])]
     windowed = lo is not None or hi is not None
     keep = [i for i in range(len(ts)) if not windowed or (ts[i] is not None and
@@ -235,8 +243,8 @@ def report(path, lo, hi):
     if not ts and "vbat" in col:
         # Все метки недоверенные: часы шли от времени сборки, но шли — ход
         # внутри одного такого участка верен. Разряд по нему, с оговоркой.
-        rel = [dt.datetime.strptime(x, "%Y-%m-%d %H:%M:%S") for x in col["timestamp"]]
-        if all(b >= a for a, b in zip(rel, rel[1:])):
+        rel = [summarize_data.parse_ts(x) for x in col["timestamp"]]
+        if None not in rel and all(b >= a for a, b in zip(rel, rel[1:])):
             ts, vb = rel, num(col, "vbat")
             print("  разряд — по недоверенным меткам: их ход верен, абсолютное время нет")
     if "vbat" in col and ts:
