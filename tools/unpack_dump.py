@@ -11,7 +11,7 @@
     python tools/unpack_dump.py <вход.bin> <выход.csv> <win_bytes> <win_count> [хеш]
     python tools/unpack_dump.py --fnv <файл>
     python tools/unpack_dump.py --check <файл> <хеш>
-    python tools/unpack_dump.py --raw <кусок.bin> <образ.img> <смещение> <хеш>
+    python tools/unpack_dump.py --raw <кусок.bin> <образ.img> <смещение> <хеш>   (оба — hex)
 
 win_bytes = 0 означает непрерывный дамп. Хеш — dump_info.hash из дампера:
 если прочитанные по SWD байты с ним не сходятся (не тот адрес, обрыв чтения),
@@ -46,7 +46,9 @@ def main():
         sys.exit(0 if got == int(sys.argv[3], 0) else 1)
     if sys.argv[1] == "--raw":
         chunk = open(sys.argv[2], "rb").read()
-        img, off, want = sys.argv[3], int(sys.argv[4], 0), int(sys.argv[5], 0)
+        # Шестнадцатеричные, как их печатает -r32 (без 0x; с 0x тоже можно):
+        # int(x, 0) не разобрал бы «00008000», а «12345678» прочёл бы десятичным.
+        img, off, want = sys.argv[3], int(sys.argv[4], 16), int(sys.argv[5], 16)
         got = fnv1a(chunk)
         if got != want:
             sys.exit("   !! хеш куска (0x%08X) не совпал с хешем на плате (0x%08X):"

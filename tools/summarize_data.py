@@ -66,25 +66,41 @@ FAULT_TEXT = {1: "HardFault", 2: "MemManage", 3: "BusFault", 4: "UsageFault",
 
 
 def reset_text(code):
-    """«питание+NRST+просадка» или «программный, HardFault». Подача питания
-    на F401 взводит и NRST, и просадку — это одно событие, не три."""
+    """«питание» или «программный, HardFault». Подача питания на F401 взводит
+    и NRST, и просадку — это одно событие, не три. Программный сброс, сторож
+    и WWDG/LPWR сами дёргают вывод NRST, так что PINRSTF при них — не нажатие
+    кнопки RESET, и в тексте не показывается."""
     if code & 1:
         flags = "питание"
     else:
+        if code & (8 | 16 | 32 | 64):
+            code &= ~2
         flags = "+".join(t for b, t in RESET_BITS if code & b) or "без флагов"
     fault = (code >> 8) & 0xF
     return flags + (", " + FAULT_TEXT.get(fault, "сбой %d" % fault) if fault else "")
 
 
 def starts(col):
-    """Старты прибора, видимые в архиве: строки, где boot_count сменился.
-    Возвращает Counter причин или None, если колонок нет."""
+    """Старты прибора, видимые в архиве. Возвращает Counter причин или None,
+    если колонок нет.
+
+    Старт — строка, где boot_count сменился. Но подача питания обнуляет
+    backup-домен, и два старта от питания подряд (включили, потом заменили
+    банку) дают одинаковый boot_count = 1. Их различаем по следам потери
+    календаря: метка времени пошла назад или time_ok сменился с 1 на 0.
+    Потеря питания без таких следов (банку заменили до первой строки после
+    прошивки) не видна — это предел того, что есть в архиве."""
     if "boot_count" not in col or "reset_cause" not in col:
         return None
+    ts = col.get("timestamp", [""] * len(col["boot_count"]))
+    tok = col.get("time_ok", ["1"] * len(col["boot_count"]))
     cnt = collections.Counter()
     prev = None
-    for b, r in zip(col["boot_count"], col["reset_cause"]):
-        if b != prev:
+    for i, (b, r) in enumerate(zip(col["boot_count"], col["reset_cause"])):
+        new = (i == 0) or b != prev
+        if not new and b.strip() == "1":
+            new = ts[i] < ts[i - 1] or (tok[i - 1].strip() == "1" and tok[i].strip() == "0")
+        if new:
             try:
                 cnt[reset_text(int(r))] += 1
             except ValueError:

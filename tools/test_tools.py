@@ -151,6 +151,7 @@ class PatchCompiles(unittest.TestCase):
 
 # Заглушки ровно под то, что использует вставка дампера.
 STUBS = r"""
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -186,7 +187,8 @@ static FRESULT f_unlink(const char *n) { (void)n; g_unlinked = 1; g_exists = 0; 
 static uint8_t g_flash[FLASH_SIZE_BYTES];
 static int g_flash_fail = 0;
 static uint8_t SPI_Flash_Read(uint32_t a, uint8_t *b, uint32_t n)
-{ if (g_flash_fail) return 0; memcpy(b, g_flash + a, n); return 1; }
+{ if (g_flash_fail || a + n > FLASH_SIZE_BYTES || n > 4096) return 0;   /* за край — как у драйвера, отказ */
+  memcpy(b, g_flash + a, n); return 1; }
 static struct { volatile uint32_t KR; } g_iwdg;
 #define IWDG (&g_iwdg)
 #define HAL_GPIO_WritePin(a, b, c) ((void)0)
@@ -207,6 +209,23 @@ static void Battery_Read(Battery_Data *b)
 MAIN = r"""
 int main(int argc, char **argv)
 {
+    if (strcmp(argv[1], "layout") == 0)
+    {
+        /* Смещения полей dump_info_t: read_data.sh читает первые 13 слов
+         * по номерам, хост сырого образа — raw_* по смещениям из шапки. */
+        printf("%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u\n",
+               (unsigned)offsetof(dump_info_t, magic), (unsigned)offsetof(dump_info_t, fsize),
+               (unsigned)offsetof(dump_info_t, len), (unsigned)offsetof(dump_info_t, win_bytes),
+               (unsigned)offsetof(dump_info_t, win_count), (unsigned)offsetof(dump_info_t, win_step),
+               (unsigned)offsetof(dump_info_t, soil_mv), (unsigned)offsetof(dump_info_t, bat_mv),
+               (unsigned)offsetof(dump_info_t, vdd_mv), (unsigned)offsetof(dump_info_t, bat_pct),
+               (unsigned)offsetof(dump_info_t, status), (unsigned)offsetof(dump_info_t, hash),
+               (unsigned)offsetof(dump_info_t, wipe), (unsigned)offsetof(dump_info_t, raw_req),
+               (unsigned)offsetof(dump_info_t, raw_done), (unsigned)offsetof(dump_info_t, raw_off),
+               (unsigned)offsetof(dump_info_t, raw_len), (unsigned)offsetof(dump_info_t, raw_hash),
+               (unsigned)offsetof(dump_info_t, raw_total), (unsigned)sizeof(dump_info_t));
+        return 0;
+    }
     g_size = (uint32_t)atoi(argv[1]);
     g_exists = atoi(argv[2]);
     fs_ok = (uint8_t)atoi(argv[3]);
@@ -360,12 +379,14 @@ class DumperWipe(unittest.TestCase):
         for (off, ln, h, _, _), part in ((r[1], flash[32768:]), (r[0], flash[:32768])):
             src = os.path.join(d, "part.bin")
             spit(src, part)
-            self.assertEqual(run_tool("unpack_dump.py", "--raw", src, img, str(off), hex(h))[0], 0)
+            # Как печатает -r32: hex без 0x, с ведущими нулями.
+            self.assertEqual(run_tool("unpack_dump.py", "--raw", src, img,
+                                      "%08X" % off, "%08X" % h)[0], 0)
         self.assertEqual(slurp(img), flash)
 
         # Испорченный кусок в образ не попадает.
         spit(os.path.join(d, "bad.bin"), b"x" * 10)
-        rc = run_tool("unpack_dump.py", "--raw", os.path.join(d, "bad.bin"), img, "0", hex(r[0][2]))[0]
+        rc = run_tool("unpack_dump.py", "--raw", os.path.join(d, "bad.bin"), img, "0", "%08X" % r[0][2])[0]
         self.assertNotEqual(rc, 0)
         self.assertEqual(slurp(img), flash)
 
@@ -377,6 +398,17 @@ class DumperWipe(unittest.TestCase):
         self.assertTrue(all(x[4] == 1 for x in r), "повтор того же запроса не перечитывает")
         # Следующие запросы — снова честно.
         self.assertEqual(r[2][1], 32768)
+
+    def test_layout_for_read_data(self):
+        # Раскладка: 13 прежних слов на прежних местах, raw_* — 0x34..0x48.
+        out = subprocess.check_output([self.build(), "layout"]).decode().split()
+        self.assertEqual(list(map(int, out)), [4 * i for i in range(19)] + [76])
+
+    def test_raw_loop_feeds_watchdog(self):
+        # Цикл раздачи кусков вечный, тестом по шагам не гоняется — проверяем
+        # хотя бы, что в нём и в чтении кусков есть пинок IWDG (иначе плата
+        # перезагрузится посреди снятия).
+        self.assertEqual(dump_patch.DECL.count("IWDG->KR = 0x0000AAAAU;"), 2)
 
     def test_dump_status_unchanged_for_read_data(self):
         # Слова 0..12 — те, что читает read_data.sh, — при fs_ok = 0 прежние:
@@ -496,6 +528,9 @@ class HeaderColumns(unittest.TestCase):
         convs = re.findall(r"%[-+ #0]*\d*(?:\.\d+)?(?:l|ll|h)?[sdufxX]", fmt)
         self.assertEqual(len(convs), len(firmware_header()), fmt)
 
+    def test_new_columns_fixture_is_current(self):
+        self.assertEqual(NEW_HEAD.split(","), firmware_header(), "образец NewColumns устарел")
+
     def test_parser_knows_columns(self):
         import summarize_data
         head = set(firmware_header())
@@ -532,9 +567,11 @@ class NewColumns(unittest.TestCase):
         rows[5] = new_row("2026-09-01 00:00:00", time_ok=0, boot=1, cause=7)
         rows[6] = new_row("2026-09-01 01:00:00", time_ok=0, boot=1, cause=7)
         # Затем — HardFault и программный перезапуск (boot_count 2).
-        rows[7] = new_row("2026-10-01 07:00:00", boot=2, cause=8 | (1 << 8))
-        rows[8] = new_row("2026-10-01 08:00:00", boot=2, cause=8 | (1 << 8), ds_err=8, sens=5, air="nan")
-        rows[9] = new_row("2026-10-01 09:00:00", boot=2, cause=8 | (1 << 8))
+        # Программный сброс на F401 взводит и PINRSTF — как в поле.
+        hf = 8 | 2 | (1 << 8)
+        rows[7] = new_row("2026-10-01 07:00:00", boot=2, cause=hf)
+        rows[8] = new_row("2026-10-01 08:00:00", boot=2, cause=hf, ds_err=8, sens=5, air="nan")
+        rows[9] = new_row("2026-10-01 09:00:00", boot=2, cause=hf)
         spit(self.path, ("\r\n".join([NEW_HEAD] + rows) + "\r\n").encode())
 
     def test_summarize(self):
@@ -548,19 +585,35 @@ class NewColumns(unittest.TestCase):
         self.assertIn("код 2 (шину освободило только снятие питания", out)
         self.assertIn("код 8 (не опрашивался — карантин", out)
         self.assertIn("sens_off != 0 в 1 строках", out)
-        self.assertIn("стартов в архиве: 2", out)
+        # Два старта от питания подряд (оба boot_count = 1) различаются по
+        # откату меток: включение, замена банки, HardFault — три старта.
+        self.assertIn("стартов в архиве: 3", out)
         self.assertIn("программный, HardFault x1", out)
-        self.assertIn("питание x1", out)
+        self.assertNotIn("NRST", out)
+        self.assertIn("питание x2", out)
         self.assertNotIn("reset_cause ", out, "код причины — не диапазон")
 
     def test_analyze(self):
         rc, out, err = run_tool("analyze_run.py", self.path)
         self.assertEqual(rc, 0, err)
-        self.assertIn("отброшено строк с time_ok = 0", out)
+        self.assertIn("строк с time_ok = 0 (часы откатились на время сборки): 2", out)
         self.assertNotIn("время шло назад", out)
-        self.assertIn("стартов: 2", out)
+        self.assertIn("стартов: 3", out)
         self.assertIn("код 1 (AHT20 и BMP280 разошлись", out)
-        self.assertIn("8 строк", out)
+        self.assertIn("10 строк", out)
+        self.assertIn("в 2 из 10", out, "отказы считаются и по недоверенным строкам")
+
+    def test_analyze_all_untrusted(self):
+        # После замены банки time_ok = 0 держится до перепрошивки: такой архив
+        # не должен превращаться в «нет строк» — отказы и разряд остаются.
+        rows = [new_row("2026-09-01 %02d:00:00" % h, time_ok=0, xchk=1 if h == 3 else 0)
+                for h in range(10)]
+        spit(self.path, ("\r\n".join([NEW_HEAD] + rows) + "\r\n").encode())
+        rc, out, err = run_tool("analyze_run.py", self.path)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("ни одной с достоверной меткой", out)
+        self.assertIn("air_xchk != 0 в 1 из 10", out)
+        self.assertIn("разряд — по недоверенным меткам", out)
 
     def test_old_archive_still_parsed(self):
         # Старый архив (data_N.txt после смены заголовка) разбирается как раньше.
