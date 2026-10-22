@@ -819,6 +819,74 @@ static void test_mbr_restore(void)
     equ(Storage_BootTotalSectors(alien), 8129, "размер берётся и из 32-битного поля BPB");
 }
 
+/* Тестовый «том»: занятые имена — списком. */
+struct names { const char *taken[8]; int n; int calls; };
+
+static uint8_t names_taken(const char *name, void *ctx)
+{
+    struct names *t = (struct names *)ctx;
+    t->calls++;
+    for (int i = 0; i < t->n; i++)
+        if (strcmp(t->taken[i], name) == 0)
+            return 1;
+    return 0;
+}
+
+static uint8_t all_taken(const char *name, void *ctx)
+{
+    (void)name; (void)ctx;
+    return 1;
+}
+
+static void test_archive_rename(void)
+{
+    const char *H = "timestamp,air_temp,write_fails";
+    char out[13];
+
+    puts("Старый архив при смене заголовка");
+
+    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails\n", H), STORAGE_HDR_KEEP,
+        "заголовок совпал — дописываем");
+    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails", H), STORAGE_HDR_KEEP,
+        "совпал и без перевода строки (последняя строка файла)");
+
+    /* Залита прошивка с новой колонкой — старый архив переименовать, не стирать. */
+    equ(Storage_HeaderAction(1, "timestamp,air_temp\n", H), STORAGE_HDR_RENAME,
+        "старый заголовок короче — переименовать");
+
+    /* Обратный случай: заголовок более новой прошивки начинается с нашего.
+     * Сравнение по префиксу (как было) смешало бы два формата в одном файле. */
+    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails,extra\n", H), STORAGE_HDR_RENAME,
+        "заголовок длиннее нашего — тоже другой формат");
+
+    /* Сорванное чтение (или пустой файл) — не «другой заголовок» (A11):
+     * раньше оно стирало архив. */
+    equ(Storage_HeaderAction(0, "", H), STORAGE_HDR_KEEP, "f_gets не прочёл строку — файл не трогаем");
+
+    /* Файл, записанный с \r\n и прочитанный без снятия \r, — тот же заголовок. */
+    equ(Storage_HeaderAction(1, "timestamp,air_temp,write_fails\r\n", H), STORAGE_HDR_KEEP,
+        "CRLF после заголовка — совпал");
+
+    /* Имя: первое свободное data_N.txt, имена 8.3. */
+    struct names t = { { 0 }, 0, 0 };
+    equ(Storage_PickOldArchiveName(names_taken, &t, out), 1, "том чистый — data_1");
+    ok(strcmp(out, "data_1.txt") == 0, "имя data_1.txt");
+
+    struct names u = { { "data_1.txt", "data_2.txt", "data_4.txt" }, 3, 0 };
+    equ(Storage_PickOldArchiveName(names_taken, &u, out), 3, "1 и 2 заняты — data_3 (дыра раньше 4)");
+    ok(strcmp(out, "data_3.txt") == 0, "имя data_3.txt");
+
+    Storage_OldArchiveName(999, out);
+    ok(strcmp(out, "data_999.txt") == 0 && strlen(out) == 12, "data_999.txt — ещё 8.3 и влезает в 13 байт");
+    Storage_OldArchiveName(10, out);
+    ok(strcmp(out, "data_10.txt") == 0, "двузначный N без ведущих нулей");
+
+    /* Свободных имён нет — 0 и пустое имя: ничего не переименовываем и,
+     * главное, ничего не затираем. */
+    equ(Storage_PickOldArchiveName(all_taken, NULL, out), 0, "все 999 имён заняты — 0");
+    ok(out[0] == '\0', "имя пустое");
+}
+
 int main(void)
 {
     test_ds18b20();
@@ -831,6 +899,7 @@ int main(void)
     test_quarantine_policy();
     test_storage_policy();
     test_mbr_restore();
+    test_archive_rename();
 
     printf("\n%d проверок, %d провалов\n", checks, failures);
     return failures ? 1 : 0;

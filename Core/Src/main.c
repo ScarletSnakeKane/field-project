@@ -105,7 +105,7 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
  * смотрелку телефон имеет всегда, а на компьютере .txt открывается и
  * блокнотом, и Excel через мастер импорта. */
 #define DATA_FILE       "data.txt"
-#define DATA_FILE_OLD   "data.csv"   /* удаляем при первом запуске после переименования */
+#define DATA_FILE_OLD   "data.csv"   /* архив старых прошивок: уходит в data_N.txt */
 
 /* Набор колонок CSV. Держим одной строкой, чтобы при старте сверить с тем, что
  * уже лежит в файле: состав колонок меняется от версии к версии, а архив теперь
@@ -188,6 +188,41 @@ static void Watchdog_Start(void)
 static void Watchdog_Kick(void)
 {
   IWDG->KR = 0x0000AAAAU;
+}
+
+/* Занято ли имя на томе — для Storage_PickOldArchiveName. Любой ответ,
+ * кроме «нет такого файла», считаем «занято»: лучше не найти имени, чем
+ * затереть чужой файл. */
+static uint8_t Archive_NameTaken(const char *name, void *ctx)
+{
+  FILINFO fi;
+  (void)ctx;
+  return (f_stat(name, &fi) != FR_NO_FILE) ? 1U : 0U;
+}
+
+/* Убрать файл архива с дороги, не удаляя: data_N.txt с первым свободным N.
+ * Возвращает 1, если переименован. */
+static uint8_t Archive_RenameAway(const char *path)
+{
+  char old_name[13];
+  if (Storage_PickOldArchiveName(Archive_NameTaken, NULL, old_name) == 0U)
+      return 0;
+  return (f_rename(path, old_name) == FR_OK) ? 1U : 0U;
+}
+
+/* Открыть data.txt на дозапись. Нет файла — создаётся; пуст — сначала
+ * заголовок. Так файл, удалённый владельцем с компьютера по USB (это и есть
+ * способ стереть архив), начинается заново с заголовком, а не со строки
+ * данных без имён колонок. */
+static FRESULT Archive_OpenForAppend(FIL *f)
+{
+  FRESULT r = f_open(f, DATA_FILE, FA_OPEN_APPEND | FA_WRITE);
+  if (r == FR_OK && f_size(f) == 0U && f_puts(CSV_HEADER "\n", f) < 0)
+  {
+      f_close(f);
+      return FR_DISK_ERR;
+  }
+  return r;
 }
 
 /* USB поднимается только из цикла удержания, когда VBUS уже есть, и только
@@ -704,46 +739,40 @@ int main(void)
   //       способ стереть архив; прошивка сама его не удаляет никогда;
   //     — заголовок в файле не совпал с текущим (залита версия с другим составом
   //       колонок) — иначе строки разного формата смешались бы в одном файле.
-  uint8_t header_mismatch = 0;
-  if (fs_ok)
+  //     Старый файл при этом не удаляется, а переименовывается в data_N.txt
+  //     (A11/C5): раньше f_unlink уносил весь архив при любой перепрошивке
+  //     с новой колонкой и при одном сорванном чтении первой строки.
+  //     Все операции ниже — под флагом занятости флеш (выставлен выше) и
+  //     только при достаточном питании, как и форматирование.
+  if (fs_ok && boot_power_ok)
   {
       FIL hf;
+      uint8_t action = STORAGE_HDR_KEEP;
       if (f_open(&hf, DATA_FILE, FA_READ) == FR_OK)
       {
           char hdr[sizeof(CSV_HEADER) + 8];
-          header_mismatch = (f_gets(hdr, sizeof(hdr), &hf) == NULL) ||
-                            (strncmp(hdr, CSV_HEADER, strlen(CSV_HEADER)) != 0);
+          uint8_t read_ok = (f_gets(hdr, sizeof(hdr), &hf) != NULL);
+          action = Storage_HeaderAction(read_ok, hdr, CSV_HEADER);
           f_close(&hf);
       }
+
+      /* Не нашлось свободного имени или переименование не прошло — файл
+       * остаётся на месте и дописывается строками нового формата: смешанные
+       * форматы лучше потерянного архива. */
+      if (action == STORAGE_HDR_RENAME)
+          (void)Archive_RenameAway(DATA_FILE);
+
+      /* Файл переименован из .csv в .txt ещё старой прошивкой. Раньше старый
+       * data.csv здесь удалялся — но это тоже архив, просто давний: теперь
+       * он уходит под тем же правилом в data_N.txt. Нет файла — нет и дела. */
+      FILINFO fi;
+      if (f_stat(DATA_FILE_OLD, &fi) == FR_OK)
+          (void)Archive_RenameAway(DATA_FILE_OLD);
   }
 
-  if (fs_ok && header_mismatch)
-      f_unlink(DATA_FILE);
-
-  /* Файл переименован из .csv в .txt — старый остался бы на диске мёртвым грузом
-   * и сбивал бы с толку при просмотре с телефона. Удаляем один раз; если его нет,
-   * вызов просто вернёт ошибку, которая нам безразлична. */
-  if (fs_ok)
-      f_unlink(DATA_FILE_OLD);
-
-  // 3) Создаём CSV файл с заголовком, если файла нет
-  res = f_open(&file, DATA_FILE, FA_OPEN_EXISTING | FA_WRITE);
-
-  if (res == FR_NO_FILE)
-  {
-      // Файл отсутствует → создаём новый и пишем заголовок
-      res = f_open(&file, DATA_FILE, FA_OPEN_APPEND | FA_WRITE);
-      if (res == FR_OK)
-      {
-          f_puts(CSV_HEADER "\n", &file);
-          f_close(&file);
-      }
-  }
-  else if (res == FR_OK)
-  {
-      // Файл существует → просто закрываем
-      f_close(&file);
-  }
+  // 3) Новый data.txt с заголовком создаёт первая же дозапись в цикле
+  //    (Archive_OpenForAppend) — она же восстанавливает заголовок, если файл
+  //    удалили с компьютера по USB посреди работы.
 
   /* Датчики поднимает и гасит сам цикл, здесь они не нужны. Явно обесточиваем
    * их перед первым сном: MX_GPIO_Init() оставляет питание включённым, и без
@@ -901,7 +930,7 @@ int main(void)
 
 	  FIL file;
 	  res = !power_ok ? FR_DENIED
-	      : fs_ok     ? f_open(&file, DATA_FILE, FA_OPEN_APPEND | FA_WRITE)
+	      : fs_ok     ? Archive_OpenForAppend(&file)
 	                  : FR_NOT_READY;
 
 	  /* Архив заполнен — закрываем файл и не пишем: следующая строка ушла бы

@@ -196,6 +196,67 @@ static inline void Storage_BuildMbr(const uint8_t *boot, uint8_t *mbr)
     mbr[511] = 0xAA;
 }
 
+/* Что делать со старым data.txt при старте (A11/C5). Раньше любое отличие
+ * первой строки от CSV_HEADER — в том числе сорванное чтение — вело к
+ * f_unlink: перепрошивка с новой колонкой молча стирала архив за полгода.
+ * Теперь архив не удаляется никогда: другой заголовок — файл переименуется
+ * (Storage_PickOldArchiveName) и начнётся новый. Сорванное чтение — не
+ * «другой заголовок»: файл не трогаем и дописываем как есть. Пустой файл
+ * (f_gets ничего не прочёл) тоже не трогаем — заголовок допишет первая же
+ * дозапись.
+ *   read_ok — f_gets вернул строку;
+ *   line    — прочитанная первая строка (f_gets снимает \r, оставляет \n). */
+#define STORAGE_HDR_KEEP    0U
+#define STORAGE_HDR_RENAME  1U
+
+static inline uint8_t Storage_HeaderAction(uint8_t read_ok, const char *line,
+                                           const char *header)
+{
+    if (!read_ok)
+        return STORAGE_HDR_KEEP;
+
+    /* Совпасть должна строка целиком: заголовок более новой прошивки
+     * начинается с нашего, и сравнение по префиксу смешало бы форматы. */
+    size_t n = strlen(header);
+    if (strncmp(line, header, n) != 0)
+        return STORAGE_HDR_RENAME;
+    char c = line[n];
+    return (c == '\0' || c == '\n' || c == '\r') ? STORAGE_HDR_KEEP : STORAGE_HDR_RENAME;
+}
+
+/* Имя для старого архива: data_N.txt с первым свободным N от 1. Имена 8.3 —
+ * FatFs собран без длинных имён, поэтому N не больше 999. taken(name, ctx)
+ * — занято ли имя (в прошивке — f_stat; любая ошибка, кроме «нет файла»,
+ * считается «занято», чтобы ничего не затереть). Возвращает N, а имя
+ * кладёт в out (13 байт); 0 — свободных имён нет, out пуст. */
+#define STORAGE_OLD_ARCHIVE_MAX  999U
+
+typedef uint8_t (*Storage_NameTaken)(const char *name, void *ctx);
+
+static inline void Storage_OldArchiveName(uint32_t n, char *out)
+{
+    /* Без snprintf: формат тривиален, а заголовку незачем тянуть stdio. */
+    char digits[4];
+    uint32_t len = 0;
+    do { digits[len++] = (char)('0' + n % 10U); n /= 10U; } while (n && len < 3U);
+    memcpy(out, "data_", 5);
+    for (uint32_t i = 0; i < len; i++)
+        out[5 + i] = digits[len - 1U - i];
+    memcpy(out + 5 + len, ".txt", 5);
+}
+
+static inline uint32_t Storage_PickOldArchiveName(Storage_NameTaken taken, void *ctx, char *out)
+{
+    for (uint32_t n = 1; n <= STORAGE_OLD_ARCHIVE_MAX; n++)
+    {
+        Storage_OldArchiveName(n, out);
+        if (!taken(out, ctx))
+            return n;
+    }
+    out[0] = '\0';
+    return 0;
+}
+
 /* Можно ли MSC (из прерывания OTG) читать флеш прямо сейчас. Не готова —
  * значит не инициализирована или спит, и будить её из прерывания нельзя:
  * задержки там не идут. Занята — основной поток посреди операции FatFs, и
