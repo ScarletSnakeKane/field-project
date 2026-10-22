@@ -95,6 +95,9 @@ static void RTC_StartClockSource(void)
    * если RTC уже идёт от LSE, проверяем по SSR, что он действительно идёт. */
   if (st == HAL_OK &&
       (RCC->BDCR & (RCC_BDCR_RTCEN | RCC_BDCR_RTCSEL)) == (RCC_BDCR_RTCEN | RCC_BDCR_RTCSEL_0) &&
+      /* В init-режиме (сброс посреди установки времени) счётчик стоит и на
+       * живом кварце — откат со сбросом календаря был бы ложным. */
+      (RTC->ISR & RTC_ISR_INITF) == 0U &&
       !Policy_CounterMoves(RTC_ReadSsr, NULL, RTC_TICK_CHECK_POLLS))
   {
     st = HAL_TIMEOUT;
