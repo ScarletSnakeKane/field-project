@@ -396,11 +396,12 @@ static USBD_HandleTypeDef dev;
 static USBD_MSC_BOT_HandleTypeDef h;
 
 /* READ10 на 4 сектора с LBA 100; отказ чтения на fail. Печатает, что увидел хост. */
-static void run(int fail){
+static void run(int fail, int reset){
   memset(&dev, 0, sizeof dev); memset(&h, 0, sizeof h);
   dev.pClassDataCmsit[0] = &h; dev.pUserData[0] = &st; dev.dev_speed = USBD_SPEED_FULL;
   stall_in = 0; tx_n = 0; fail_at = fail;
   MSC_BOT_Init(&dev);
+  if (reset) MSC_BOT_Reset(&dev);                   /* Bulk-Only Mass Storage Reset от хоста */
   h.scsi_medium_state = SCSI_MEDIUM_UNLOCKED;
   h.scsi_blk[0].nbr = 32768U; h.scsi_blk[0].size = 512U;      /* как после READ CAPACITY */
   h.cbw.dSignature = USBD_BOT_CBW_SIGNATURE; h.cbw.dTag = 0x1234; h.cbw.dDataLength = 4U * 512U;
@@ -433,10 +434,10 @@ static void run(int fail){
   MSC_BOT_DataOut(&dev, 1);
   int next_ok = (tx_n == before + 1 && tx_len[before] == 13 && tx_buf[before][12] == 0 &&
                  tx_buf[before][4] == 0x78 && tx_buf[before][5] == 0x56);
-  printf("FAIL %d DATA %d STALL %d EARLY %d STATUS %u RESIDUE %lu TAG %lu NEXT %d\n", fail, data, stalled,
+  printf("FAIL %d DATA %d STALL %d EARLY %d STATUS %u RESIDUE %lu TAG %lu NEXT %d\n", fail + (reset ? 1000 : 0), data, stalled,
          early, (unsigned)status, (unsigned long)residue, (unsigned long)tag, next_ok);
 }
-int main(void){ run(-1); run(100); run(102); return 0; }
+int main(void){ run(-1, 0); run(100, 0); run(102, 0); run(102, 1); return 0; }
 """
 
 
@@ -464,7 +465,9 @@ class MscBot(unittest.TestCase):
             self.assertEqual((res[-1]["DATA"], res[-1]["STALL"], res[-1]["STATUS"]), (4, 0, 0), out)
             # Отказ первого сектора и посреди команды: STALL, CSW не раньше
             # CLEAR_FEATURE, статус FAILED, остаток — непереданные секторы.
-            for fail, sent in ((100, 0), (102, 2)):
+            # 1102 — тот же отказ после Bulk-Only Mass Storage Reset: класс ST
+            # оставлял статус RECOVERY, и CSW после CLEAR_FEATURE не уходил.
+            for fail, sent in ((100, 0), (102, 2), (1102, 2)):
                 r = res[fail]
                 self.assertEqual((r["DATA"], r["STALL"], r["EARLY"], r["STATUS"], r["RESIDUE"],
                                   r["TAG"], r["NEXT"]),
