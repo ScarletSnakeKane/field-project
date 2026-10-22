@@ -17,6 +17,7 @@
 #include "battery_curve.h"
 #include "ds18b20_decode.h"
 #include "power_policy.h"
+#include "sensor_policy.h"
 #include "soil_curve.h"
 #include "storage_policy.h"
 
@@ -940,12 +941,41 @@ static void test_time_trust(void)
     equ(Storage_LastTimestamp(t5, (uint32_t)strlen(t5), 0, ts), 0, "буква вместо цифры — не метка");
 }
 
+static void test_bmp280(void)
+{
+    puts("BMP280 и сверка воздуха");
+
+    /* Пример из даташита BMP280 (3.12): dig_T1 = 27504, dig_T2 = 26435,
+     * dig_T3 = -1000, adc_T = 519888 -> 25.08 °C. Независимый эталон. */
+    eqf(Bmp280_CompensateT(519888, 27504, 26435, -1000), 25.08f, 0.001f, "пример даташита — 25.08 °C");
+    ok(Bmp280_CalibOk(27504, 26435, -1000), "калибровка из даташита пригодна");
+
+    /* Отказы, которые раньше превращались в правдоподобное число. */
+    ok(isnan(Bmp280_CompensateT(0x80000, 27504, 26435, -1000)), "отсчёт 0x80000 (замера не было) — NAN");
+    ok(isnan(Bmp280_CompensateT(0, 27504, 26435, -1000)), "нулевой отсчёт — NAN");
+    ok(isnan(Bmp280_CompensateT(0xFFFFF, 27504, 26435, -1000)), "отсчёт из единиц (шина в воздухе) — NAN");
+    ok(isnan(Bmp280_CompensateT(1000000, 27504, 26435, -1000)), "пересчёт вне −40..85 °C — NAN");
+    ok(!Bmp280_CalibOk(0, 0, 0), "нулевая калибровка — непригодна");
+    ok(!Bmp280_CalibOk(0xFFFF, -1, -1), "стёртая калибровка (0xFF) — непригодна");
+    ok(!Bmp280_CalibOk(27504, 0, -1000), "dig_T2 = 0 — непригодна");
+
+    /* Правило сверки (порог 2.0 °C — обоснование в sensor_policy.h). */
+    equ(Sensor_AirCrossCheck(21.0f, 21.9f), SENSOR_XCHK_OK, "расхождение 0.9 °C — сошлись");
+    equ(Sensor_AirCrossCheck(21.0f, 23.0f), SENSOR_XCHK_OK, "ровно 2.0 °C — ещё сошлись");
+    equ(Sensor_AirCrossCheck(21.0f, 23.1f), SENSOR_XCHK_DIFF, "2.1 °C — расхождение");
+    equ(Sensor_AirCrossCheck(25.0f, 21.0f), SENSOR_XCHK_DIFF, "расхождение в другую сторону — тоже");
+    equ(Sensor_AirCrossCheck(21.0f, NAN), SENSOR_XCHK_NO_BMP, "BMP280 не ответил — сверки нет");
+    equ(Sensor_AirCrossCheck(NAN, 21.0f), SENSOR_XCHK_NO_AHT, "AHT20 nan — сверять нечего");
+    equ(Sensor_AirCrossCheck(NAN, NAN), SENSOR_XCHK_NO_AHT, "оба nan — сверять нечего");
+}
+
 int main(void)
 {
     test_ds18b20();
     test_battery();
     test_soil();
     test_aht20();
+    test_bmp280();
     test_sleep_policy();
     test_usb_policy();
     test_watchdog_policy();

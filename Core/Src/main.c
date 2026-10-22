@@ -37,6 +37,8 @@
 #include "battery.h"
 #include "ds18b20.h"
 #include "power_policy.h"
+#include "sensor_policy.h"
+#include "bmp280.h"
 #include "usbd_core.h"
 #include "usbd_def.h"
 #include <stdio.h>
@@ -841,12 +843,13 @@ int main(void)
 	   * строки идут как обычно: архив показывает, что прибор жив. */
 	  uint8_t  sens_powered = Policy_SensorsPowerAllowed(&sens_quarantine);
 	  uint32_t sens_off = sens_powered ? 0U : sens_quarantine.skip_left;
-	  (void)sens_off;   /* колонка sens_off — в изменении заголовка CSV */
+	  (void)sens_off;   /* колонки sens_off и air_xchk — в изменении заголовка CSV */
 
 	  AHT20_Data aht = { NAN, NAN };
 	  HAL_StatusTypeDef aht_init_st = HAL_ERROR, aht_read_st = HAL_ERROR;
 	  float   soil_temp = NAN, soil_hum = NAN;
 	  uint8_t ds_err = DS_ERR_NOT_POLLED;
+	  uint8_t air_xchk = SENSOR_XCHK_NO_AHT;
 	  i2c_rec = 0;
 
 	  if (sens_powered)
@@ -917,6 +920,16 @@ int main(void)
 	          aht.temperature = NAN;
 	          aht.humidity    = NAN;
 	      }
+
+	      /* Сверка воздуха по BMP280 на том же модуле — после AHT20, чтобы
+	       * отказ BMP280 (даже повисшая на нём шина) не стоил замера AHT20:
+	       * шину следующего цикла освободит I2C1_BusRecover. AHT20 при
+	       * расхождении не заменяется на NAN — строка только помечается. */
+	      float bmp_t = NAN;
+	      if (BMP280_Init(&hi2c1) == HAL_OK)
+	          (void)BMP280_ReadTemperature(&hi2c1, &bmp_t);
+	      air_xchk = Sensor_AirCrossCheck(aht.temperature, bmp_t);
+	      (void)air_xchk;   /* в CSV — с изменением заголовка */
 
 	      if (!DS18B20_ReadTemp(GPIOA, GPIO_PIN_8, &soil_temp))
 	          soil_temp = NAN; // датчик не ответил или CRC не сошёлся
