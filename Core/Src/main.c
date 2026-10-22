@@ -54,6 +54,14 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 /* Время на стабилизацию питания датчиков (AHT20/DS18B20/почва) после включения PA0. */
 #define SENSOR_POWERUP_DELAY_MS   500U
 
+/* Восстановление шины I2C (B6), колонка i2c_rec: 0 — шина свободна, 1 —
+ * освобождена тактами SCL, 2 — понадобилось снять питание датчиков, 3 —
+ * не освободилась и после этого. Пауза без питания — разрядить ёмкость
+ * модуля, чтобы его логика действительно сбросилась. */
+#define I2C_REC_POWER        2U
+#define I2C_REC_DEAD         3U
+#define I2C_POWER_CYCLE_MS   200U
+
 /* Пока кнопка удерживается, МК не уходит в STOP — так USB-сессия не рвётся на время сна.
  * BTN_HOLD_MAX_MS — страховка на случай залипшей/залитой кнопки в поле: по истечении
  * этого времени засыпаем принудительно и больше не ждём кнопку, пока её не отпустят
@@ -125,6 +133,7 @@ static uint32_t write_fails = 0;  /* накопленное число неуд�
 static Policy_Button btn_policy;  /* удержание KEY через все циклы сна (A1) */
 static uint16_t reset_cause = 0;  /* почему стартовали — Policy_ResetCause */
 static uint32_t boot_count  = 0;  /* стартов с последней подачи питания */
+static uint8_t  i2c_rec     = 0;  /* как освобождали шину в этом цикле (B6) */
 static Policy_Usb    usb_policy;  /* VBUS без хоста через все циклы сна (A9) */
 static volatile uint8_t woke_by_vbus = 0;    /* фронт VBUS: вставили кабель */
 /* USER CODE END PV */
@@ -767,6 +776,21 @@ int main(void)
 	  HAL_I2C_DeInit(&hi2c1);
 	  __HAL_RCC_I2C1_FORCE_RESET();
 	  __HAL_RCC_I2C1_RELEASE_RESET();
+
+	  /* Сброс периферии не отпускает ведомого, который держит SDA (B6), —
+	   * шину освобождаем тактами SCL. Не помогло — ведомый завис глубже:
+	   * снимаем питание датчиков ещё раз и повторяем, один раз. Выводы шины
+	   * на это время — в вход, чтобы не питать модуль через подтяжки. */
+	  i2c_rec = I2C1_BusRecover();
+	  if (i2c_rec == I2C_BUS_STUCK)
+	  {
+	      HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8 | GPIO_PIN_9);
+	      HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_SET);
+	      HAL_Delay(I2C_POWER_CYCLE_MS);
+	      HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
+	      HAL_Delay(SENSOR_POWERUP_DELAY_MS);
+	      i2c_rec = (I2C1_BusRecover() == I2C_BUS_STUCK) ? I2C_REC_DEAD : I2C_REC_POWER;
+	  }
 	  MX_I2C1_Init();
 
 	  /* Ждём, пока AHT20 реально начнёт подтверждать свой адрес на шине, вместо
