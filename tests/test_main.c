@@ -358,6 +358,56 @@ static void test_usb_policy(void)
     equ(Policy_MeasureDue(3600000U, 3600000U), 1, "прошёл интервал — замер, не засыпая");
 }
 
+static void test_watchdog_policy(void)
+{
+    puts("Сторож и причина сброса");
+
+    /* Час сна кусками по 15 с: ровно 240 кусков, в сумме ровно час —
+     * пинки сторожу не сдвигают расписание замеров. */
+    uint32_t left = 3600U, n = 0U, longest = 0U;
+    while (left > 0U && n < 10000U)
+    {
+        uint32_t c = Policy_SleepChunkSec(left, 15U);
+        if (c == 0U) break;
+        if (c > longest) longest = c;
+        left -= c; n++;
+    }
+    equ(n, 240U, "3600 с по 15 с — 240 кусков");
+    equ(left, 0U, "куски складываются ровно в интервал");
+    equ(longest, 15U, "ни один кусок не длиннее шага сторожа");
+
+    /* Интервал, не кратный шагу: последний кусок — остаток. */
+    equ(Policy_SleepChunkSec(37U, 15U), 15U, "37 с: первый кусок 15");
+    equ(Policy_SleepChunkSec(7U, 15U), 7U, "остаток 7 с — кусок 7, а не 15");
+    equ(Policy_SleepChunkSec(15U, 15U), 15U, "ровно шаг — один кусок");
+    equ(Policy_SleepChunkSec(0U, 15U), 0U, "спать нечего — 0");
+
+    /* Флаги RCC_CSR после подачи питания на F401: POR + PIN + BOR. */
+    const uint32_t POR = POLICY_CSR_PORRSTF | POLICY_CSR_PINRSTF | POLICY_CSR_BORRSTF;
+    equ(Policy_ResetCause(POR, 0), 7U, "подача питания — POR|PIN|BOR");
+    equ(Policy_ResetCause(POLICY_CSR_PINRSTF, 0), 2U, "кнопка RESET — PIN");
+    equ(Policy_ResetCause(POLICY_CSR_IWDGRSTF | POLICY_CSR_PINRSTF, 0), 18U, "сторож — IWDG (и PIN)");
+    equ(Policy_ResetCause(POLICY_CSR_LPWRRSTF | POLICY_CSR_WWDGRSTF, 0), 96U, "WWDG и LPWR — свои биты");
+
+    /* HardFault: обработчик оставил код и сбросил программно. */
+    equ(Policy_ResetCause(POLICY_CSR_SFTRSTF | POLICY_CSR_PINRSTF,
+                          POLICY_FAULT_MAGIC | POLICY_FAULT_HARD),
+        8U | 2U | (POLICY_FAULT_HARD << 8), "HardFault — SFT и код 1 в старшем байте");
+
+    /* Error_Handler сбрасывает сторожем — его код тоже засчитывается. */
+    equ(Policy_ResetCause(POLICY_CSR_IWDGRSTF, POLICY_FAULT_MAGIC | POLICY_FAULT_ERROR),
+        16U | (POLICY_FAULT_ERROR << 8), "Error_Handler — IWDG и код 6");
+
+    /* Код от прошлого раза при сбросе питанием — не причина этого старта. */
+    equ(Policy_ResetCause(POR, POLICY_FAULT_MAGIC | POLICY_FAULT_HARD), 7U,
+        "старый код сбоя при подаче питания не засчитывается");
+
+    /* Без метки — мусор или ноль backup-домена. */
+    equ(Policy_ResetCause(POLICY_CSR_SFTRSTF, 0x00000001U), 8U, "код без метки — не код");
+    equ(Policy_ResetCause(POLICY_CSR_SFTRSTF, POLICY_FAULT_MAGIC | 0x1234U), 8U,
+        "код вне диапазона — не код");
+}
+
 /* ----------------------------------------------------------------- AHT20 */
 
 /* Кадры AHT20: статус, пять байт данных, CRC-8 (полином 0x31, начало 0xFF).
@@ -642,6 +692,7 @@ int main(void)
     test_aht20();
     test_sleep_policy();
     test_usb_policy();
+    test_watchdog_policy();
     test_storage_policy();
 
     printf("\n%d проверок, %d провалов\n", checks, failures);

@@ -67,6 +67,11 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
  * ~30 мкА среднего, против ~10 мА непрерывно раньше. */
 #define USB_ENUM_MAX_MS    10000U
 
+/* Шаг пинка сторожа во сне (A4): меньше худшего периода IWDG (~22 с при LSI
+ * 47 кГц) с запасом. 3600 и 60 делятся на 15 нацело. Цена — пробуждение на
+ * ~0.1–0.3 мс раз в 15 с, доли микроампера среднего (расчёт — в отчёте П4). */
+#define WDG_KICK_SEC       15U
+
 /* Потолок размера архива. Тому заявлено 4 МБ ради FAT16 (см. spiflash.h), но
  * физически есть только 2 МБ, из которых на служебные структуры уходит ~50 КБ.
  * Предел взят с запасом ниже физической границы: перешагнув её, запись уходила
@@ -118,6 +123,8 @@ static volatile uint8_t woke_by_button = 0;  /* выставляется в EXTI
 static uint8_t fs_ok = 0;    /* смонтирована ли файловая система */
 static uint32_t write_fails = 0;  /* накопленное число неудачных записей строки */
 static Policy_Button btn_policy;  /* удержание KEY через все циклы сна (A1) */
+static uint16_t reset_cause = 0;  /* почему стартовали — Policy_ResetCause */
+static uint32_t boot_count  = 0;  /* стартов с последней подачи питания */
 static Policy_Usb    usb_policy;  /* VBUS без хоста через все циклы сна (A9) */
 static volatile uint8_t woke_by_vbus = 0;    /* фронт VBUS: вставили кабель */
 /* USER CODE END PV */
@@ -134,6 +141,35 @@ void SystemClock_Config(void);
 /* Один цикл сна: погасить периферию, уйти в STOP и подняться обратно.
  * Вынесено из main() отдельной функцией, чтобы первый замер после включения
  * можно было сделать не засыпая, не дублируя при этом весь блок. */
+/* Сторожевой таймер (A4). Раньше IWDG запускался только из Error_Handler, а
+ * HardFault и любое зависание в активной фазе крутились вечно на полной
+ * частоте: прибор стоял на ~10 мА до приезда владельца. Теперь сторож
+ * запущен с первой строки main() и кормится в основном цикле, в цикле
+ * удержания и в коротких пробуждениях из сна (см. Policy_SleepChunkSec).
+ * Период — наибольший: делитель 256, перезагрузка 0xFFF, ~32 с при LSI
+ * 32 кГц и ~22 с при 47 кГц (верх допуска); пинок раз в WDG_KICK_SEC.
+ * Регистры напрямую: модуль IWDG в HAL этой сборки не включён. Запущенный
+ * сторож остановить нельзя — поэтому он замораживается на время остановки
+ * ядра отладчиком, иначе каждая точка останова кончалась бы сбросом. */
+static void Watchdog_Start(void)
+{
+  __HAL_DBGMCU_FREEZE_IWDG();
+
+  IWDG->KR  = 0x0000CCCCU;   /* пуск */
+  IWDG->KR  = 0x00005555U;   /* разрешить запись PR/RLR */
+  IWDG->PR  = 0x06U;         /* делитель 256 */
+  IWDG->RLR = 0x0FFFU;       /* максимальная перезагрузка */
+  for (volatile uint32_t i = 0U; i < 100000U && (IWDG->SR != 0U); i++)
+  {
+  }
+  IWDG->KR  = 0x0000AAAAU;
+}
+
+static void Watchdog_Kick(void)
+{
+  IWDG->KR = 0x0000AAAAU;
+}
+
 /* USB поднимается только из цикла удержания, когда VBUS уже есть, и только
  * после записи цикла (A3). Раньше стек стартовал при каждом пробуждении ДО
  * замера и при старте ДО монтирования: хост, вставленный в этот момент,
@@ -242,6 +278,8 @@ static uint8_t SleepUntilNextSample(void)
       vbus_edge = woke_by_vbus;   /* фронт за время ожидания — новый шанс хосту */
       woke_by_vbus = 0;
 
+      Watchdog_Kick();   /* сессия с хостом может длиться сутки */
+
       if (!btn_awake && !usb_awake)
           break;
 
@@ -287,14 +325,9 @@ static uint8_t SleepUntilNextSample(void)
   DWT->CTRL &= ~DWT_CTRL_CYCCNTENA_Msk;
   CoreDebug->DEMCR &= ~CoreDebug_DEMCR_TRCENA_Msk;
 
-  /* --- уход в сон: STOP mode, будим только по RTC Wakeup Timer ---
-   * Таймер перевзводим заново перед каждым входом в STOP, чтобы длительность сна
-   * была стабильной (RTC_WAKEUP_INTERVAL_SEC) каждый цикл, а не "плавала" от фазы
-   * свободно бегущего таймера относительно переменной длины активной фазы. */
-  HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
-  HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, RTC_WAKEUP_INTERVAL_SEC, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
-
   woke_by_button = 0;   /* сбрасываем перед сном: интересен источник ЭТОГО пробуждения */
+  woke_by_vbus   = 0;
+  (void)RTC_TakeWakeup();
 
   /* Залипшую кнопку на время сна отключаем от подтяжки и EXTI (A1): через
    * замкнутый контакт иначе тёк бы ток весь час, а её «нажатие» больше
@@ -317,8 +350,60 @@ static uint8_t SleepUntilNextSample(void)
    * флеш надо снова поднять, — что на фоне часового интервала незаметно. */
   HAL_PWREx_EnableFlashPowerDown();
 
-  HAL_SuspendTick();
-  HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+  /* --- уход в сон: STOP mode, будит RTC Wakeup Timer, кнопка или VBUS ---
+   * Интервал RTC_WAKEUP_INTERVAL_SEC режется на куски по WDG_KICK_SEC (A4):
+   * сторож в STOP не замирает и часа не переживёт. Между кусками — короткое
+   * пробуждение на HSI: пинок сторожу и сразу обратно, без замера и без
+   * периферии. Таймер перевзводится заново перед первым куском, чтобы
+   * длительность сна не «плавала» от фазы свободно бегущего таймера. */
+  uint32_t left  = RTC_WAKEUP_INTERVAL_SEC;
+  uint32_t armed = 0;
+  while (left > 0U)
+  {
+      uint32_t chunk = Policy_SleepChunkSec(left, WDG_KICK_SEC);
+      if (chunk != armed)
+      {
+          /* Перевзвод ждёт флага RTC с таймаутом по тику — тик на это время
+           * возвращаем, иначе таймаут не сработал бы никогда (см. ниже).
+           * Счётчик CK_SPRE даёт (WUT + 1) с, отсюда «- 1». */
+          HAL_ResumeTick();
+          HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+          HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, chunk - 1U, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+          armed = chunk;
+      }
+
+      Watchdog_Kick();
+      HAL_SuspendTick();
+      HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+      /* Кнопка и VBUS — это человек: просыпаемся на замер сразу. */
+      if (woke_by_button || woke_by_vbus)
+          break;
+
+      /* Не таймер и не человек — случайное прерывание; кусок не отработан,
+       * спим дальше, таймер продолжает считать с того же места. */
+      if (!RTC_TakeWakeup())
+          continue;
+      left -= chunk;
+
+      /* Залипшую кнопку могли отпустить. Проверка — доли микросекунды на
+       * подтяжке; отпустили — оставляем EXTI включённым до конца сна. */
+      if (btn_parked && left > 0U)
+      {
+          MX_GPIO_ButtonRestore();
+          MX_GPIO_ButtonSettle();
+          if (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_SET)
+          {
+              (void)Policy_ButtonKeepsAwake(&btn_policy, 0, 0, BTN_HOLD_MAX_MS);
+              btn_parked = 0;
+          }
+          else
+          {
+              MX_GPIO_ButtonPark();
+          }
+      }
+  }
+  Watchdog_Kick();
 
   /* --- пробуждение: ядро на HSI без PLL. Шины и задержки работают от того
    * же HSI 16 МГц, что и до сна (делители и латентность флеш STOP сохраняет),
@@ -335,6 +420,11 @@ static uint8_t SleepUntilNextSample(void)
    * поднимает HSE и PLL. Частота та же, что была до сна (HSI 16 МГц), поэтому
    * перенастраивать SysTick не нужно: достаточно вернуть его прерывание. */
   HAL_ResumeTick();
+
+  /* Таймер куска на время бодрствования не нужен: его прерывание с высшим
+   * приоритетом каждые WDG_KICK_SEC вклинивалось бы в тайминги 1-Wire.
+   * Сторожа в активной фазе кормит основной цикл. */
+  HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
 
   /* В аналоге PA0 читается нулём, то есть «зажата», — вернуть подтяжку до
    * того, как цикл удержания спросит кнопку, иначе залипание не кончилось
@@ -383,6 +473,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+    Watchdog_Start();   /* до всего остального: зависнуть может уже старт */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk; // разрешить трассировочный блок ядра
     DWT->CYCCNT = 0;                                 // сбросить счётчик тактов
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;             // запустить счётчик тактов
@@ -392,8 +483,9 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-//  HAL_Init();
-//  DWT->CTRL |= 1;
+  /* Причина сброса и код сбоя — до MX_RTC_Init: смена источника тактирования
+   * RTC (A5) сбрасывает backup-домен, и код из DR1 пропал бы. */
+  reset_cause = Policy_ResetCause(RCC->CSR, RTC->BKP1R);
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -417,6 +509,16 @@ int main(void)
    * Архив теперь стирает только владелец: удаляет data.txt с компьютера,
    * подключив прибор по USB. KEY при старте ничего не значит. */
   __HAL_RCC_CLEAR_RESET_FLAGS();
+
+  /* Счётчик стартов с последней подачи питания (DR2) и сброс кода сбоя (DR1),
+   * чтобы следующий старт не унаследовал чужую причину. Backup-домен сидит
+   * на VDD (VBAT не отдельный), так что подача питания обнуляет и счётчик —
+   * это и нужно: он считает именно тихие перезагрузки. */
+  HAL_PWR_EnableBkUpAccess();
+  boot_count = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2) + 1U;
+  HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, boot_count);
+  HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, 0U);
+  Watchdog_Kick();   /* запуск LSE в MX_RTC_Init мог занять до 10 с */
 
   // Включаем питание датчиков (LOW)
   HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
@@ -454,6 +556,7 @@ int main(void)
       if (res == FR_OK)
           break;
   }
+  Watchdog_Kick();
 
   /* Раньше здесь всё, что не FAT16, принудительно переформатировалось — ради
    * Android, который FAT12 не монтирует. Это стирало рабочий архив любой
@@ -514,6 +617,7 @@ int main(void)
               /* Размер кластера задан явно — 512 байт, минимум. Автовыбор для тома 4 МБ
                * взял бы 1 КБ, кластеров получилось бы около 4050 при пороге FAT16 в 4085,
                * и том снова вышел бы FAT12 — тот самый, который Android не монтирует. */
+              Watchdog_Kick();
               res = f_mkfs(USERPath, FM_FAT, FLASH_SECTOR_BYTES, work, sizeof(work));
               if (res == FR_OK)
               {
@@ -619,6 +723,7 @@ int main(void)
 	  if (!first_pass)
 	      SleepUntilNextSample();
 	  first_pass = 0;
+	  Watchdog_Kick();
 
 	  /* --- включаем датчики (LOW) --- */
 	  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
@@ -682,6 +787,7 @@ int main(void)
 
 	  Battery_Data bat;
 	  Battery_Read(&bat);
+	  Watchdog_Kick();   /* опрос датчиков — до нескольких секунд; запись впереди */
 
 	  char ts[32];
 	  Time_GetTimestamp(ts, sizeof(ts));
@@ -897,6 +1003,24 @@ void Error_Handler(void)
    * нельзя. Отдельного тактирования у IWDG нет, он доступен всегда. */
   __disable_irq();
 
+  /* Все прерывания — и в NVIC: при запрещённых прерываниях WFI всё равно
+   * просыпается от любого ожидающего, а таймер куска сна (A4) или VBUS
+   * держали бы ожидающее вечно — и STOP ниже превратился бы в горячий цикл
+   * до самого сброса. Запрещённое в NVIC прерывание WFI не будит. */
+  for (uint32_t i = 0U; i < (sizeof(NVIC->ICER) / sizeof(NVIC->ICER[0])); i++)
+  {
+    NVIC->ICER[i] = 0xFFFFFFFFU;
+    NVIC->ICPR[i] = 0xFFFFFFFFU;
+  }
+
+  /* Причина — в backup-регистр: после перезапуска она уйдёт в reset_cause
+   * каждой строки, и цикл «сбой — перезапуск» будет виден в архиве. */
+  RCC->APB1ENR |= RCC_APB1ENR_PWREN;
+  PWR->CR |= PWR_CR_DBP;
+  RTC->BKP1R = POLICY_FAULT_MAGIC | POLICY_FAULT_ERROR;
+
+  /* Сторож обычно уже запущен (Watchdog_Start); повторный пуск безвреден и
+   * нужен, если сюда попали раньше него. */
   IWDG->KR  = 0x0000CCCCU;   /* пуск */
   IWDG->KR  = 0x00005555U;   /* разрешить запись PR/RLR */
   IWDG->PR  = 0x06U;         /* делитель 256 */

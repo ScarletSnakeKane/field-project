@@ -49,3 +49,36 @@ uint8_t Policy_MeasureDue(uint32_t awake_ms, uint32_t interval_ms)
 {
     return (awake_ms >= interval_ms) ? 1U : 0U;
 }
+
+uint32_t Policy_SleepChunkSec(uint32_t left_sec, uint32_t kick_sec)
+{
+    if (kick_sec == 0U || left_sec < kick_sec)
+        return left_sec;
+    return kick_sec;
+}
+
+uint16_t Policy_ResetCause(uint32_t rcc_csr, uint32_t bkp_fault)
+{
+    uint16_t c = 0;
+
+    if (rcc_csr & POLICY_CSR_PORRSTF)  c |= 1U;
+    if (rcc_csr & POLICY_CSR_PINRSTF)  c |= 2U;
+    if (rcc_csr & POLICY_CSR_BORRSTF)  c |= 4U;
+    if (rcc_csr & POLICY_CSR_SFTRSTF)  c |= 8U;
+    if (rcc_csr & POLICY_CSR_IWDGRSTF) c |= 16U;
+    if (rcc_csr & POLICY_CSR_WWDGRSTF) c |= 32U;
+    if (rcc_csr & POLICY_CSR_LPWRRSTF) c |= 64U;
+
+    /* Метка не та — это ноль после потери питания или мусор, а не наш код.
+     * Код без программного сброса или сброса сторожем тоже не в счёт:
+     * обработчики исключений сбрасывают программно, Error_Handler — сторожем,
+     * а при другом сбросе код остался от прошлого раза. */
+    if ((bkp_fault & 0xFFFF0000UL) == POLICY_FAULT_MAGIC &&
+        (rcc_csr & (POLICY_CSR_SFTRSTF | POLICY_CSR_IWDGRSTF)))
+    {
+        uint32_t code = bkp_fault & 0xFFFFUL;
+        if (code >= 1U && code <= 15U)
+            c |= (uint16_t)(code << 8);
+    }
+    return c;
+}

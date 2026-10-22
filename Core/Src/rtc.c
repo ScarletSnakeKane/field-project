@@ -196,9 +196,21 @@ void HAL_RTC_MspDeInit(RTC_HandleTypeDef* rtcHandle)
 }
 
 /* USER CODE BEGIN 1 */
+/* Сон режется на куски для сторожа (A4), и после каждого пробуждения надо
+ * знать, разбудил ли нас таймер (кусок отработан) или что-то другое. */
+static volatile uint8_t rtc_wakeup_fired = 0;
+
 void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc)
 {
-    // Пока ничего не делаем — факт пробуждения
+    (void)hrtc;
+    rtc_wakeup_fired = 1;
+}
+
+uint8_t RTC_TakeWakeup(void)
+{
+    uint8_t f = rtc_wakeup_fired;
+    rtc_wakeup_fired = 0;
+    return f;
 }
 /* USER CODE END 1 */
 

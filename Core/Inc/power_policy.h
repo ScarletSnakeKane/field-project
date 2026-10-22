@@ -62,5 +62,44 @@ uint8_t Policy_UsbKeepsAwake(Policy_Usb *u, uint8_t usb_present, uint8_t usb_con
  * полный интервал. Без этого USB-сессия длиной в сутки давала в архиве
  * дыру на сутки. */
 uint8_t Policy_MeasureDue(uint32_t awake_ms, uint32_t interval_ms);
+/* Сон кусками для сторожа (A4). IWDG на F401 в STOP не замирает, а его
+ * наибольший период — ~32 с при LSI 32 кГц и всего ~22 с при LSI 47 кГц
+ * (верх допуска). Час сна он не переживёт, поэтому интервал режется на куски
+ * не длиннее kick_sec: RTC будит, сторож получает пинок, и плата сразу
+ * засыпает снова — без замера, без PLL, без периферии. Последний кусок —
+ * остаток, чтобы интервал между замерами не менялся.
+ * Возвращает длину следующего куска сна, 0 — спать больше не нужно. */
+uint32_t Policy_SleepChunkSec(uint32_t left_sec, uint32_t kick_sec);
+
+/* Причина сброса — в каждую строку CSV. Тихие перезагрузки в поле иначе
+ * невидимы: архив растёт, а прибор, может быть, падает каждый час.
+ * Биты флагов RCC_CSR (RM0368, 6.3.21) повторены здесь числами, чтобы
+ * правило проверялось без CMSIS. */
+#define POLICY_CSR_BORRSTF   (1UL << 25)
+#define POLICY_CSR_PINRSTF   (1UL << 26)
+#define POLICY_CSR_PORRSTF   (1UL << 27)
+#define POLICY_CSR_SFTRSTF   (1UL << 28)
+#define POLICY_CSR_IWDGRSTF  (1UL << 29)
+#define POLICY_CSR_WWDGRSTF  (1UL << 30)
+#define POLICY_CSR_LPWRRSTF  (1UL << 31)
+
+/* Код сбоя, который обработчик исключения оставляет в backup-регистре перед
+ * сбросом (программным или сторожем): старшие 16 бит — метка (чтобы отличить от мусора и от
+ * нуля после потери питания), младшие — что случилось. */
+#define POLICY_FAULT_MAGIC   0xFA170000UL
+#define POLICY_FAULT_HARD    1U
+#define POLICY_FAULT_MEM     2U
+#define POLICY_FAULT_BUS     3U
+#define POLICY_FAULT_USAGE   4U
+#define POLICY_FAULT_NMI     5U
+#define POLICY_FAULT_ERROR   6U   /* Error_Handler: отказ инициализации */
+
+/* Колонка reset_cause: биты 0..6 — флаги сброса
+ *   1 POR (подача питания), 2 PIN (вывод NRST), 4 BOR (просадка),
+ *   8 SFT (программный), 16 IWDG (сторож), 32 WWDG, 64 LPWR;
+ * биты 8..11 — код сбоя POLICY_FAULT_*, если обработчик его оставил.
+ * Подача питания взводит заодно PIN и BOR — так устроен сброс F401, это
+ * не три события. bkp_fault — содержимое backup-регистра как есть. */
+uint16_t Policy_ResetCause(uint32_t rcc_csr, uint32_t bkp_fault);
 
 #endif

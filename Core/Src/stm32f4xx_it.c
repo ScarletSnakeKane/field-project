@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "power_policy.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,6 +53,21 @@
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/* Исключение — не повод стоять вечно (A4). Заготовка CubeMX крутила
+ * while(1) на полной частоте: одно зависание в поле, и прибор стоял на
+ * ~10 мА с включёнными PLL и, может быть, датчиками — батарея за неделю,
+ * архив не растёт, и узнают об этом только на выезде. Теперь код сбоя
+ * остаётся в backup-регистре RTC (DR1), а плата перезапускается; при старте
+ * код попадает в колонку reset_cause, так что падения видны в архиве.
+ * Регистры трогаем напрямую: в обработчике сбоя на HAL полагаться нельзя. */
+static void Fault_Reset(uint32_t code)
+{
+  RCC->APB1ENR |= RCC_APB1ENR_PWREN;
+  PWR->CR |= PWR_CR_DBP;
+  RTC->BKP1R = POLICY_FAULT_MAGIC | code;
+  NVIC_SystemReset();
+}
+
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
@@ -72,9 +88,7 @@ void NMI_Handler(void)
 
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
-   while (1)
-  {
-  }
+  Fault_Reset(POLICY_FAULT_NMI);
   /* USER CODE END NonMaskableInt_IRQn 1 */
 }
 
@@ -84,7 +98,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  Fault_Reset(POLICY_FAULT_HARD);
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -99,7 +113,7 @@ void HardFault_Handler(void)
 void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
+  Fault_Reset(POLICY_FAULT_MEM);
   /* USER CODE END MemoryManagement_IRQn 0 */
   while (1)
   {
@@ -114,7 +128,7 @@ void MemManage_Handler(void)
 void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
-
+  Fault_Reset(POLICY_FAULT_BUS);
   /* USER CODE END BusFault_IRQn 0 */
   while (1)
   {
@@ -129,7 +143,7 @@ void BusFault_Handler(void)
 void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
-
+  Fault_Reset(POLICY_FAULT_USAGE);
   /* USER CODE END UsageFault_IRQn 0 */
   while (1)
   {
