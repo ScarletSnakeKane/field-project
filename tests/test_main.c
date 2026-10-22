@@ -263,6 +263,17 @@ static void test_soil(void)
 
 /* ------------------------------------------------------- уход в STOP */
 
+/* Счётчик для Policy_CounterMoves: значение 0, начиная с чтения at — 1. */
+typedef struct { uint32_t at; uint32_t calls; } Fake_Counter;
+
+static uint32_t Fake_CounterRead(void *ctx)
+{
+    Fake_Counter *c = (Fake_Counter *)ctx;
+    uint32_t v = (c->at != 0U && c->calls >= c->at) ? 1U : 0U;
+    c->calls++;
+    return v;
+}
+
 static void test_sleep_policy(void)
 {
     const uint32_t MAX = 300000U;   /* тот же потолок, что и в прошивке: 5 минут */
@@ -382,6 +393,22 @@ static void test_watchdog_policy(void)
     equ(Policy_SleepChunkSec(7U, 15U), 7U, "остаток 7 с — кусок 7, а не 15");
     equ(Policy_SleepChunkSec(15U, 15U), 15U, "ровно шаг — один кусок");
     equ(Policy_SleepChunkSec(0U, 15U), 0U, "спать нечего — 0");
+
+    /* S1: RTC от остановившегося LSE. Счётчик меняется на чтении номер at
+     * (с нуля), at = 0 — не меняется никогда. */
+    puts("Идёт ли RTC (остановка LSE)");
+    {
+        Fake_Counter c;
+        c = (Fake_Counter){0, 0};
+        equ(Policy_CounterMoves(Fake_CounterRead, &c, 100U), 0, "кварц встал — SSR стоит, откат на LSI");
+        equ(c.calls, 100U, "стоящий счётчик опрошен все 100 раз, не меньше");
+        c = (Fake_Counter){1, 0};
+        equ(Policy_CounterMoves(Fake_CounterRead, &c, 100U), 1, "SSR сменился сразу — RTC идёт");
+        c = (Fake_Counter){99, 0};
+        equ(Policy_CounterMoves(Fake_CounterRead, &c, 100U), 1, "SSR сменился на последнем чтении — идёт");
+        c = (Fake_Counter){100, 0};
+        equ(Policy_CounterMoves(Fake_CounterRead, &c, 100U), 0, "сменился бы только за окном — не идёт");
+    }
 
     /* Флаги RCC_CSR после подачи питания на F401: POR + PIN + BOR. */
     const uint32_t POR = POLICY_CSR_PORRSTF | POLICY_CSR_PINRSTF | POLICY_CSR_BORRSTF;

@@ -59,6 +59,17 @@ uint32_t Policy_SleepChunkSec(uint32_t left_sec, uint32_t kick_sec)
     return kick_sec;
 }
 
+uint8_t Policy_CounterMoves(Policy_ReadCounter read, void *ctx, uint32_t polls)
+{
+    uint32_t first = read(ctx);
+    for (uint32_t i = 1U; i < polls; i++)
+    {
+        if (read(ctx) != first)
+            return 1;
+    }
+    return 0;
+}
+
 uint16_t Policy_ResetCause(uint32_t rcc_csr, uint32_t bkp_fault)
 {
     uint16_t c = 0;

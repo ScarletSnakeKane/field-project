@@ -465,8 +465,19 @@ static uint8_t SleepUntilNextSample(void)
            * возвращаем, иначе таймаут не сработал бы никогда (см. ниже).
            * Счётчик CK_SPRE даёт (WUT + 1) с, отсюда «- 1». */
           HAL_ResumeTick();
-          HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
-          HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, chunk - 1U, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+          (void)HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+          if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, chunk - 1U, RTC_WAKEUPCLOCK_CK_SPRE_16BITS) != HAL_OK)
+          {
+              /* Таймер не взвёлся — RTC не тактируется: кварц встал после
+               * старта (S1). Спать вслепую нельзя: будил бы только сторож,
+               * и строк больше не было бы. Откатываться на LSI прямо здесь
+               * тоже нельзя: сброс backup-домена унёс бы календарь, а
+               * time_ok в памяти осталась бы 1. Перезапуск с кодом в DR1:
+               * старт проверит, идёт ли RTC, перейдёт на LSI (lse_ok = 0),
+               * а time_service увидит потерю часов. */
+              RTC->BKP1R = POLICY_FAULT_MAGIC | POLICY_FAULT_ERROR;
+              NVIC_SystemReset();
+          }
           armed = chunk;
       }
 
