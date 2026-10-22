@@ -2369,8 +2369,632 @@ static void test_log_import(void)
     }
 }
 
+/* ------------------------------------------------ виртуальный том (П5б) */
+
+/* Эталон самопроверки vfat.h: при vf_break «другая libc» печатает иначе. */
+static int vf_break;
+#define VFAT_CHECK_LINE vf_check_line
+static int vf_check_line(const LogRecord *r, char *out);
+#define VFAT_IMPLEMENTATION
+#include "vfat.h"
+
+static int vf_check_line(const LogRecord *r, char *out)
+{
+    int n = VFat_FormatMeasSlow(r, out);
+    if (vf_break && n > 0)
+        out[0] ^= 1;
+    return n;
+}
+
+/* Счёт чтений флеш — сколько стоит сектор при копировании подряд. */
+static long vf_reads;
+static uint8_t vf_count_read(uint32_t a, uint8_t *b, uint32_t n)
+{
+    vf_reads++;
+    return fm_read(a, b, n);
+}
+static const LogFlashOps VF_COUNT_OPS = { vf_count_read, fm_program, fm_erase, NULL, fm_unlock };
+
+/* Помеха на SPI: следующие vf_glitch_left чтений адреса vf_glitch_addr
+ * приходят с одним перевёрнутым битом (CRC не сходится). */
+static long vf_glitch_addr = -1, vf_glitch_left;
+static uint8_t vf_glitch_read(uint32_t a, uint8_t *b, uint32_t n)
+{
+    vf_reads++;
+    uint8_t r = fm_read(a, b, n);
+    if (r && (long)a == vf_glitch_addr && vf_glitch_left > 0)
+    {
+        vf_glitch_left--;
+        b[30] ^= 0x04U;
+    }
+    return r;
+}
+static const LogFlashOps VF_GLITCH_OPS = { vf_glitch_read, fm_program, fm_erase, NULL, fm_unlock };
+
+/* Эталон: строка LogRecord_FormatCsv (буфер VFAT_LINE_BUF - 1) с \r\n вместо \n. */
+static int vf_ref_line(const LogRecord *r, char *out)
+{
+    int n = LogRecord_FormatCsv(r, out, VFAT_LINE_BUF - 1U);
+    if (n <= 0)
+        return -1;
+    out[n - 1] = '\r';
+    out[n] = '\n';
+    return n + 1;
+}
+
+static float vf_bits(uint32_t b) { float f; memcpy(&f, &b, 4); return f; }
+
+/* Значение float для проверки форматтера: всё, что бывает, и всё, на чём
+ * ошибается самодельный printf. */
+static float vf_float(void)
+{
+    uint32_t k = fm_rand() % 12U, h = fm_rand();
+    switch (k)
+    {
+    case 0:  return vf_bits(h);                                   /* любой битовый образ */
+    case 1:  return NAN;
+    case 2:  return vf_bits(0xFFC00000U);                         /* -nan */
+    case 3:  return (h & 1U) ? INFINITY : -INFINITY;
+    case 4:  return (h & 1U) ? 0.0f : -0.0f;
+    case 5:  return vf_bits(h & 0x807FFFFFU);                     /* субнормальные */
+    case 6:  return (float)((int32_t)(h % 2000001U) - 1000000) / 8.0f;   /* точные половинки */
+    case 7:  return (float)((int32_t)(h % 200001U) - 100000) / 1000.0f + ((h >> 20) & 1U ? 0.0005f : -0.0005f);
+    case 8:  return (float)((int32_t)(h % 20001U) - 10000) / 100.0f;      /* как у датчиков */
+    case 9:  return vf_bits((h & 0x80000000U) | ((uint32_t)(140U + h % 12U) << 23) | (fm_rand() & 0x7FFFFFU)); /* у порога 2^20 */
+    case 10: return (float)(h % 65536U);
+    default: return (float)(h % 4096U);
+    }
+}
+
+static void vf_random_meas(LogMeas *m)
+{
+    memset(m, 0, sizeof(*m));
+    uint32_t h = fm_rand();
+    snprintf(m->ts, sizeof(m->ts), "20%02u-%02u-%02u %02u:%02u:%02u",
+             (unsigned)(h % 100U), (unsigned)(h % 12U + 1U), (unsigned)(h % 28U + 1U),
+             (unsigned)(h % 24U), (unsigned)(h % 60U), (unsigned)((h >> 8) % 60U));
+    if ((h >> 20) % 50U == 0U)
+        memcpy(m->ts, "garbage", 8);                              /* метка не разобрана */
+    m->air_temp = vf_float(); m->air_hum = vf_float();
+    m->soil_temp = vf_float(); m->soil_hum = vf_float();
+    m->bat_valid = (uint8_t)(fm_rand() & 1U); m->bat_low = (uint8_t)(fm_rand() & 1U);
+    m->bat_percent = (uint8_t)fm_rand(); m->bat_volts = vf_float(); m->vdd = vf_float();
+    m->lse_ok = (uint8_t)(fm_rand() & 1U); m->time_ok = (uint8_t)(fm_rand() & 1U);
+    m->aht_init_st = (int)(fm_rand() % 4U); m->aht_read_st = (int)(fm_rand() % 4U);
+    m->ds_err = (uint8_t)(fm_rand() % 16U); m->air_xchk = (uint8_t)(fm_rand() % 4U);
+    m->i2c_rec = (uint8_t)(fm_rand() % 4U);
+    m->sens_off = fm_rand() % 70000U; m->write_fails = fm_rand();
+    m->lowpower_skips = fm_rand() >> (fm_rand() % 32U); m->reset_cause = (uint16_t)fm_rand();
+    m->boot_count = fm_rand(); m->soil_raw = vf_float(); m->bat_raw = vf_float();
+}
+
+static void test_vfat_format(void)
+{
+    char a[VFAT_LINE_BUF + 64], b[VFAT_LINE_BUF + 64];
+    LogRecord r;
+    puts("Виртуальный том: строка data.txt = LogRecord_FormatCsv байт в байт");
+
+    int bad = 0;
+    for (unsigned i = 0; i < sizeof(CSV_GOLDEN) / sizeof(CSV_GOLDEN[0]); i++)
+    {
+        LogRecord_PackMeas(&r, &CSV_GOLDEN[i].m);
+        int n = VFat_FormatMeas(&r, a), m = vf_ref_line(&r, b);
+        if (n != m || memcmp(a, b, (size_t)n) != 0) bad++;
+    }
+    equ((unsigned)bad, 0U, "эталонные строки П5а совпали (с \\r\\n)");
+
+    /* Случайные записи: все классы float, все поля. */
+    fm_rng = 12345;
+    unsigned long mism = 0, total = 0, fast_ok = 0;
+    for (uint32_t i = 0; i < 200000U; i++)
+    {
+        LogMeas m;
+        vf_random_meas(&m);
+        LogRecord_PackMeas(&r, &m);
+        LogRecord_Seal(&r, i);
+        memset(a, 0x55, sizeof(a));
+        int n = VFat_FormatMeas(&r, a), k = vf_ref_line(&r, b);
+        total++;
+        if (n != k || (n > 0 && memcmp(a, b, (size_t)n) != 0))
+        {
+            if (mism++ < 3)
+                printf("    своё:   %.*s    эталон: %.*s", n > 0 ? n : 0, a, k > 0 ? k : 0, b);
+        }
+        if (a[VFAT_LINE_BUF] != 0x55) mism++;                     /* за буфер не пишет */
+        if (n > 0) fast_ok++;
+    }
+    printf("    сверено строк: %lu\n", total);
+    equ((unsigned)mism, 0U, "200 000 случайных записей: строки совпали");
+    ok(fast_ok == total, "у каждой случайной записи есть строка — и при float 1e38");
+
+    /* Каждая половинка и соседи — у всех трёх точностей. */
+    mism = 0;
+    for (int32_t k = -40000; k <= 40000; k++)
+    {
+        float vals[3] = { (float)k / 8.0f, (float)k / 2000.0f, (float)k * 0.005f };
+        for (int j = 0; j < 3; j++)
+        {
+            LogMeas m;
+            memset(&m, 0, sizeof(m));
+            memcpy(m.ts, "2026-10-22 12:00:00", 20);
+            m.air_temp = vals[j]; m.vdd = vals[j]; m.soil_raw = vals[j];
+            m.bat_valid = 1; m.bat_volts = nextafterf(vals[j], 1e9f); m.air_hum = nextafterf(vals[j], -1e9f);
+            LogRecord_PackMeas(&r, &m);
+            int n = VFat_FormatMeas(&r, a), q = vf_ref_line(&r, b);
+            if (n != q || memcmp(a, b, (size_t)n) != 0) mism++;
+        }
+    }
+    equ((unsigned)mism, 0U, "точные половинки и соседние float: округление как у printf");
+
+    LogRecord_MakeText(&r, 0, (const uint8_t *)"abc", 3);
+    ok(VFat_FormatMeas(&r, a) == -1, "не замер — строки нет");
+}
+
+/* Замер с меняющейся длиной строки — по id однозначно. */
+static void vf_make(LogRecord *r, uint32_t id)
+{
+    LogMeas m;
+    memset(&m, 0, sizeof(m));
+    uint32_t h = id * 2654435761UL;
+    snprintf(m.ts, sizeof(m.ts), "2026-%02u-%02u %02u:%02u:%02u",
+             (unsigned)(id / 700U % 12U + 1U), (unsigned)(id / 24U % 28U + 1U),
+             (unsigned)(id % 24U), (unsigned)(h % 60U), (unsigned)((h >> 7) % 60U));
+    m.air_temp  = (h % 13U == 0U) ? NAN : -40.0f + (float)(h % 9000U) / 100.0f;
+    m.air_hum   = (float)((h >> 5) % 10001U) / 100.0f;
+    m.soil_temp = (h % 17U == 0U) ? NAN : (float)((h >> 9) % 5000U) / 100.0f - 10.0f;
+    m.soil_hum  = (float)((h >> 3) % 1000U) / 10.0f;
+    m.bat_valid = (uint8_t)(id % 11U != 0U); m.bat_low = (uint8_t)(id % 7U == 0U);
+    m.bat_percent = (uint8_t)(h % 101U);
+    m.bat_volts = 3.0f + (float)(h % 1200U) / 1000.0f;
+    m.vdd = 2.9f + (float)((h >> 11) % 400U) / 1000.0f;
+    m.lse_ok = 1; m.time_ok = (uint8_t)(id % 101U != 100U);
+    m.aht_init_st = (int)(h % 4U); m.aht_read_st = (int)((h >> 2) % 4U);
+    m.ds_err = (uint8_t)((h >> 4) % 9U); m.air_xchk = (uint8_t)((h >> 6) % 4U);
+    m.i2c_rec = (uint8_t)((h >> 8) % 4U); m.sens_off = (h % 31U == 0U) ? 360U : 0U;
+    m.write_fails = id / 1000U; m.lowpower_skips = id / 333U;
+    m.reset_cause = (uint16_t)(h >> 16); m.boot_count = 1U + id / 5000U;
+    m.soil_raw = (h % 19U == 0U) ? NAN : (float)(h % 4096U);
+    m.bat_raw = (float)((h >> 12) % 4096U);
+    LogRecord_PackMeas(r, &m);
+}
+
+#define VF_IMG_BYTES (VFAT_DISK_SECTORS * VFAT_SECTOR)
+static uint8_t vf_img[VF_IMG_BYTES], vf_img2[VF_IMG_BYTES];
+static uint8_t vf_exp_data[8U << 20], vf_exp_old[2U << 20], vf_got[8U << 20];
+static uint8_t vf_fm_copy[FM_MAX_SECT * 4096U];
+static VFat    vf_vol;
+
+/* Ожидаемые файлы — прямо из записей журнала, мимо vfat.h. */
+static void vf_expect(const LogRing *r, uint32_t *dlen, uint32_t *olen)
+{
+    char line[VFAT_LINE_BUF];
+    LogRecord rec;
+    uint32_t d = (uint32_t)strlen(LOG_CSV_HEADER), o = 0;
+    memcpy(vf_exp_data, LOG_CSV_HEADER, d);
+    vf_exp_data[d++] = '\r'; vf_exp_data[d++] = '\n';
+    for (uint32_t i = 0; i < LogRing_Count(r); i++)
+    {
+        if (LogRing_Read(r, i, &rec) != LOG_READ_OK)
+            continue;
+        const uint8_t *t;
+        uint32_t tl = LogRecord_Text(&rec, &t, NULL);
+        if (tl) { memcpy(vf_exp_old + o, t, tl); o += tl; continue; }
+        int n = vf_ref_line(&rec, line);
+        if (n > 0) { memcpy(vf_exp_data + d, line, (size_t)n); d += (uint32_t)n; }
+    }
+    *dlen = d; *olen = o;
+}
+
+static uint32_t vf_le16(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+static uint32_t vf_le32(const uint8_t *p) { return vf_le16(p) | (vf_le16(p + 2) << 16); }
+
+/* Свой разбор FAT16 по образу: MBR -> BPB -> корень -> цепочка FAT1
+ * (и FAT2 — та же). Длина файла или -1 (нет файла, цепочка битая). Это не
+ * независимый читатель — им служит tests/test_vfat_image.py (fsck.vfat,
+ * mtools); зато ловит ошибки цепочек и там, где их нет. */
+static long vf_extract(const uint8_t *img, const char *name83, uint8_t *out, uint16_t *date)
+{
+    if (img[510] != 0x55 || img[511] != 0xAA || img[446 + 4] != 0x0E) return -1;
+    const uint8_t *bs = img + vf_le32(img + 446 + 8) * 512U;
+    uint32_t bps = vf_le16(bs + 11), spc = bs[13], rsvd = vf_le16(bs + 14), nf = bs[16];
+    uint32_t rootn = vf_le16(bs + 17), fatsz = vf_le16(bs + 22);
+    if (bps != 512U || nf != 2U || bs[510] != 0x55) return -1;
+    const uint8_t *fat = bs + rsvd * 512U, *root = fat + nf * fatsz * 512U;
+    const uint8_t *data = root + rootn * 32U;
+    if (memcmp(fat, fat + fatsz * 512U, fatsz * 512U) != 0) return -1;
+    for (uint32_t e = 0; e < rootn; e++)
+    {
+        const uint8_t *de = root + e * 32U;
+        if (de[0] == 0) break;
+        if (memcmp(de, name83, 11) != 0 || (de[11] & 0x18U)) continue;
+        uint32_t size = vf_le32(de + 28), c = vf_le16(de + 26), got = 0, csz = spc * 512U;
+        if (date) *date = (uint16_t)vf_le16(de + 24);
+        while (got < size)
+        {
+            if (c < 2U || c >= 0xFFF8U) return -1;
+            uint32_t part = (size - got < csz) ? size - got : csz;
+            memcpy(out + got, data + (c - 2U) * csz, part);
+            got += part;
+            c = vf_le16(fat + c * 2U);
+        }
+        if (size && c < 0xFFF8U) return -1;                       /* цепочка не кончилась */
+        return (long)size;
+    }
+    return -1;
+}
+
+static int vf_check_file(const uint8_t *img, const char *name83, const uint8_t *want, uint32_t len)
+{
+    long n = vf_extract(img, name83, vf_got, NULL);
+    return n == (long)len && memcmp(vf_got, want, len) == 0;
+}
+
+/* Собрать образ по порядку и вразброс, проверить файлы и (по желанию)
+ * выложить для независимой проверки. */
+static void vf_scenario(const char *name, const LogRing *r, int expect_data)
+{
+    char what[160];
+    uint32_t dlen = 0, olen = 0;
+    if (r)
+        vf_expect(r, &dlen, &olen);
+
+    long ops0 = fm_ops;
+    memcpy(vf_fm_copy, fm, fm_nsect * 4096U);
+    uint8_t st = VFat_Build(&vf_vol, r, "test");
+    snprintf(what, sizeof(what), "%s: том собран", name);
+    equ(st, expect_data ? VFAT_OK : VFAT_NO_ARCHIVE, what);
+
+    int rd = 1;
+    for (uint32_t s = 0; s < VFAT_DISK_SECTORS; s++)
+        rd &= VFat_Read(&vf_vol, s, vf_img + s * VFAT_SECTOR);
+    snprintf(what, sizeof(what), "%s: все секторы прочитаны", name);
+    ok(rd, what);
+
+    if (expect_data)
+    {
+        snprintf(what, sizeof(what), "%s: data.txt байт в байт (%u Б)", name, (unsigned)dlen);
+        ok(vf_check_file(vf_img, "DATA    TXT", vf_exp_data, dlen), what);
+        snprintf(what, sizeof(what), "%s: data_old.txt %s", name, olen ? "байт в байт" : "отсутствует");
+        ok(olen ? vf_check_file(vf_img, "DATA_OLDTXT", vf_exp_old, olen)
+                : vf_extract(vf_img, "DATA_OLDTXT", vf_got, NULL) < 0, what);
+    }
+    else
+    {
+        snprintf(what, sizeof(what), "%s: data.txt нет — только info.txt", name);
+        ok(vf_extract(vf_img, "DATA    TXT", vf_got, NULL) < 0 &&
+           vf_extract(vf_img, "INFO    TXT", vf_got, NULL) > 0, what);
+    }
+    long il = vf_extract(vf_img, "INFO    TXT", vf_got, NULL);
+    snprintf(what, sizeof(what), "%s: info.txt есть и начинается с имени прибора", name);
+    ok(il > 0 && memcmp(vf_got, "FieldSensor test\r\n", 18) == 0, what);
+
+    /* Вразброс — после новой сборки, с курсором из прошлых чтений. */
+    (void)VFat_Build(&vf_vol, r, "test");
+    static uint32_t perm[VFAT_DISK_SECTORS];
+    for (uint32_t s = 0; s < VFAT_DISK_SECTORS; s++) perm[s] = s;
+    for (uint32_t s = VFAT_DISK_SECTORS - 1U; s > 0; s--)
+    {
+        uint32_t j = fm_rand() % (s + 1U), t = perm[s];
+        perm[s] = perm[j]; perm[j] = t;
+    }
+    rd = 1;
+    for (uint32_t s = 0; s < VFAT_DISK_SECTORS; s++)
+        rd &= VFat_Read(&vf_vol, perm[s], vf_img2 + perm[s] * VFAT_SECTOR);
+    snprintf(what, sizeof(what), "%s: чтение вразброс дало тот же образ", name);
+    ok(rd && memcmp(vf_img, vf_img2, VF_IMG_BYTES) == 0, what);
+
+    snprintf(what, sizeof(what), "%s: том флеш не тронул (G3)", name);
+    ok(fm_ops == ops0 && memcmp(vf_fm_copy, fm, fm_nsect * 4096U) == 0, what);
+
+    const char *dump = getenv("VFAT_DUMP_DIR");
+    if (dump)
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s.img", dump, name);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(vf_img, 1, VF_IMG_BYTES, f); fclose(f); }
+        snprintf(path, sizeof(path), "%s/%s.data.txt", dump, name);
+        if (expect_data && (f = fopen(path, "wb"))) { fwrite(vf_exp_data, 1, dlen, f); fclose(f); }
+        snprintf(path, sizeof(path), "%s/%s.old.txt", dump, name);
+        if (olen && (f = fopen(path, "wb"))) { fwrite(vf_exp_old, 1, olen, f); fclose(f); }
+    }
+}
+
+static void vf_append(LogRing *r, uint32_t from, uint32_t count)
+{
+    LogRecord rec;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        vf_make(&rec, from + i);
+        if (!LogRing_Append(r, &rec)) { ok(0, "запись в журнал"); return; }
+    }
+}
+
+static uint8_t vf_old_src[64000];
+
+static void vf_import(LogRing *r, uint32_t bytes)
+{
+    LogRecord rec;
+    uint8_t text[LOG_TEXT_MAX];
+    old_text(vf_old_src, bytes, 7);
+    LogRecord_MakeImportFile(&rec, 0, bytes, "data_1.txt");
+    LogRing_Append(r, &rec);
+    for (uint32_t o = 0; o < bytes; o += LOG_TEXT_MAX)
+    {
+        uint32_t n = (bytes - o < LOG_TEXT_MAX) ? bytes - o : LOG_TEXT_MAX;
+        memcpy(text, vf_old_src + o, n);
+        LogRecord_MakeText(&rec, 0, text, n);
+        LogRing_Append(r, &rec);
+    }
+    LogRecord_MakeImportEnd(&rec, 1, bytes);
+    LogRing_Append(r, &rec);
+}
+
+static void test_vfat_volume(void)
+{
+    LogRing r;
+    LogRecord rec;
+    char what[128];
+    puts("Виртуальный том: образы FAT16 по журналу (G5), только чтение (G3)");
+
+    ok(VFAT_CLUSTERS >= 4085U && VFAT_CLUSTERS < 65525U, "число кластеров — FAT16");
+    ok((uint64_t)LOG_FLASH_SECTORS * LOG_SLOTS * VFAT_LINE_BUF + 4096U <
+       (uint64_t)VFAT_CLUSTERS * VFAT_CLUSTER, "самый длинный data.txt влезает");
+
+    fm_rng = 777;
+    fm_reset(LOG_FLASH_SECTORS);
+    LogRing_Start(&r, &FM_OPS, LOG_FLASH_SECTORS, 0, 0);
+    vf_scenario("empty", &r, 1);
+    long dl = vf_extract(vf_img, "DATA    TXT", vf_got, NULL);
+    ok(dl == (long)VFAT_HEADER_LEN && memcmp(vf_got, VFAT_HEADER, VFAT_HEADER_LEN) == 0,
+       "пустой журнал: data.txt — один заголовок");
+
+    vf_append(&r, 800, 1);      /* метка 2026-02-06: не совпадает с фиксированной */
+    vf_scenario("one", &r, 1);
+    uint16_t date = 0;
+    (void)vf_extract(vf_img, "DATA    TXT", vf_got, &date);
+    equ(date, VFat_FatDate(2026U, 2U, 6U), "одна запись: дата файла — её метка (2026-02-06)");
+
+    vf_append(&r, 1, 1000);
+    vf_scenario("partial", &r, 1);
+    /* Последняя записана с id 1000, у неё time_ok = 1: дата — её. */
+    (void)vf_extract(vf_img, "DATA    TXT", vf_got, &date);
+    vf_make(&rec, 1000);
+    {
+        LogMeas m;
+        LogRecord_UnpackMeas(&rec, &m);
+        equ(date, VFat_FatDate(LogRecord_Digits(m.ts, 4), LogRecord_Digits(m.ts + 5, 2),
+                               LogRecord_Digits(m.ts + 8, 2)), "дата файла — метка последнего замера");
+    }
+    vf_append(&r, 1001, 110);   /* у последней, id 1110, time_ok = 0 */
+    (void)VFat_Build(&vf_vol, &r, "test");
+    (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_ROOT, vf_img);
+    equ(vf_le16(vf_img + 32 + 24), VFat_FatDate(2026U, 1U, 1U), "часам не верим — дата фиксированная");
+
+    /* Испорченный слот: в файле его нет, остальное на месте. */
+    fm[5U * 64U + 20U] ^= 0x10U;
+    vf_scenario("damaged", &r, 1);
+    equ(vf_vol.n_bad, 1U, "испорченный слот пропущен и посчитан");
+
+    /* Журнал после импорта старого архива: сначала текст, потом замеры. */
+    fm_reset(LOG_FLASH_SECTORS);
+    LogRing_Start(&r, &FM_OPS, LOG_FLASH_SECTORS, 3, 0);
+    vf_import(&r, 30000);
+    vf_append(&r, 0, 500);
+    vf_scenario("import", &r, 1);
+    ok(vf_check_file(vf_img, "DATA_OLDTXT", vf_old_src, 30000), "data_old.txt = старый файл байт в байт");
+
+    /* Несколько кругов на полной флеш: и самый большой файл. Импорт ушёл —
+     * data_old.txt больше нет. */
+    vf_append(&r, 500, LOG_FLASH_SECTORS * LOG_SLOTS * 2U + 1234U);
+    vf_scenario("rings", &r, 1);
+    snprintf(what, sizeof(what), "после кругов: в журнале %u записей, data.txt %u Б",
+             (unsigned)LogRing_Count(&r), (unsigned)vf_vol.size[VFAT_FILE_DATA]);
+    ok(LogRing_Count(&r) >= (LOG_FLASH_SECTORS - 2U) * LOG_SLOTS && vf_vol.n_import == 0U, what);
+
+    /* Кольцо, на котором импорт уходит частично: хвост текста ещё в журнале. */
+    fm_reset(64);
+    LogRing_Start(&r, &FM_OPS, 64, 0, 0);
+    vf_import(&r, 60000);
+    vf_append(&r, 0, 64U * 64U - 1200U);
+    vf_scenario("import_partial", &r, 1);
+    ok(vf_vol.n_text > 0U && vf_vol.n_text < (60000U + LOG_TEXT_MAX - 1U) / LOG_TEXT_MAX,
+       "часть импорта ушла по кругу, хвост — в data_old.txt");
+
+    /* От импорта осталась одна отметка «не влезло» (или текст ушёл по
+     * кругу): data_old.txt нет — info.txt на него не ссылается. */
+    fm_reset(LOG_FLASH_SECTORS);
+    LogRing_Start(&r, &FM_OPS, LOG_FLASH_SECTORS, 0, 0);
+    LogRecord_MakeImportEnd(&rec, 0, 0);
+    rec.b[LOG_PAYLOAD_OFS + 5] = 2;
+    LogRing_Append(&r, &rec);
+    vf_append(&r, 0, 10);
+    (void)VFat_Build(&vf_vol, &r, "test");
+    {
+        char info[VFAT_SECTOR];
+        uint32_t n = VFat_RenderInfo(&vf_vol, info, sizeof(info));
+        info[n] = 0;
+        ok(!vf_vol.present[VFAT_FILE_OLD] && strstr(info, "data_old.txt") == NULL &&
+           strstr(info, "old archive did not fit") != NULL, "info.txt: старый архив не влез, data_old.txt не упомянут");
+    }
+
+    /* Журнал не открыт. */
+    vf_scenario("no_archive", NULL, 0);
+    LogRing closed = r;
+    closed.mounted = 0;
+    equ(VFat_Build(&vf_vol, &closed, "test"), VFAT_NO_ARCHIVE, "журнал не смонтирован — тома без data.txt");
+
+    /* Разовый сбой чтения при сборке лечится повтором; стойкий — data.txt
+     * не отдаётся. */
+    fm_read_fail = 100;
+    equ(VFat_Build(&vf_vol, &r, "test"), VFAT_OK, "разовый сбой чтения при сборке — повтор");
+    fm_read_fail = -1;
+    fm_dead = 1;
+    equ(VFat_Build(&vf_vol, &r, "test"), VFAT_EIO, "сбой чтения при сборке — EIO");
+    fm_dead = 0;
+    ok(vf_vol.present[VFAT_FILE_DATA] == 0 && vf_vol.present[VFAT_FILE_INFO], "после EIO — только info.txt");
+
+    /* Журнал разошёлся с индексом (слот испортился после сборки): сектор на
+     * границе сектора журнала не отдаётся сдвинутым. */
+    fm_reset(LOG_FLASH_SECTORS);
+    LogRing_Start(&r, &FM_OPS, LOG_FLASH_SECTORS, 0, 0);
+    vf_append(&r, 0, 300);
+    (void)VFat_Build(&vf_vol, &r, "test");
+    fm[10U * 64U + 30U] ^= 0x01U;                                  /* запись 10 сектора 0 */
+    uint32_t b1 = vf_vol.off[0][1];                                /* начало сектора 1 в data.txt */
+    uint32_t lba = VFAT_PART_LBA + VFAT_DATA + b1 / VFAT_SECTOR;   /* data.txt — с кластера 2 */
+    ok(VFat_Read(&vf_vol, lba, vf_img) == 0, "запись испортилась после сборки — отказ, а не сдвиг");
+    fm[10U * 64U + 30U] ^= 0x01U;
+    ok(VFat_Read(&vf_vol, lba, vf_img) == 1, "вернулась — сектор читается");
+
+    /* Копирование подряд держится на курсоре: на сектор — несколько
+     * чтений журнала, а не проход от начала сектора журнала (до 64). */
+    {
+        LogRing rc = r;
+        rc.ops = &VF_COUNT_OPS;
+        (void)VFat_Build(&vf_vol, &rc, "test");
+        uint32_t nsec = (vf_vol.size[VFAT_FILE_DATA] + VFAT_SECTOR - 1U) / VFAT_SECTOR;
+        vf_reads = 0;
+        int rd = 1;
+        for (uint32_t s = 0; s < nsec; s++)
+            rd &= VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img + s * VFAT_SECTOR);
+        snprintf(what, sizeof(what), "подряд: %.1f чтения журнала на сектор (не больше 8)",
+                 (double)vf_reads / nsec);
+        ok(rd && vf_reads <= 8L * (long)nsec, what);
+        /* Хост повторяет чтение после ошибки или сброса: тот же сектор
+         * второй раз подряд — те же байты (курсор стоит внутри него). */
+        int same = 1;
+        for (uint32_t s = 0; s < nsec; s++)
+        {
+            (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img2);
+            (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img2 + VFAT_SECTOR);
+            same &= memcmp(vf_img2, vf_img + s * VFAT_SECTOR, VFAT_SECTOR) == 0 &&
+                    memcmp(vf_img2 + VFAT_SECTOR, vf_img + s * VFAT_SECTOR, VFAT_SECTOR) == 0;
+        }
+        ok(same, "повторное чтение того же сектора — те же байты");
+    }
+
+    /* Произвольный порядок тоже не дороже прохода одного сектора журнала:
+     * курсор, оставшийся позади, не тащит чтение от начала файла. */
+    {
+        LogRing rc = r;
+        rc.ops = &VF_COUNT_OPS;
+        (void)VFat_Build(&vf_vol, &rc, "test");
+        uint32_t nsec = (vf_vol.size[VFAT_FILE_DATA] + VFAT_SECTOR - 1U) / VFAT_SECTOR;
+        (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA, vf_img2);
+        vf_reads = 0;
+        (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + nsec - 1U, vf_img2);
+        long last = vf_reads, worst = 0;
+        for (uint32_t k = 0; k < 400U; k++)
+        {
+            vf_reads = 0;
+            (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + fm_rand() % nsec, vf_img2);
+            if (vf_reads > worst) worst = vf_reads;
+        }
+        snprintf(what, sizeof(what), "вразброс: сектор не дороже 70 чтений (после нулевого — %ld, худший — %ld)",
+                 last, worst);
+        ok(last <= 70 && worst <= 70, what);
+    }
+
+    /* Помеха на SPI посреди сектора журнала. */
+    {
+        uint32_t dlen, olen;
+        vf_expect(&r, &dlen, &olen);
+        LogRing rg = r;
+        rg.ops = &VF_GLITCH_OPS;
+        uint32_t nsec = 0;
+        /* Разовая — лечится повтором: ни отказа, ни сдвига. */
+        (void)VFat_Build(&vf_vol, &rg, "test");
+        nsec = (vf_vol.size[VFAT_FILE_DATA] + VFAT_SECTOR - 1U) / VFAT_SECTOR;
+        vf_glitch_addr = 20L * 64L; vf_glitch_left = 1;
+        int all = 1;
+        for (uint32_t s = 0; s < nsec; s++)
+            all &= VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img + s * VFAT_SECTOR);
+        ok(all && vf_glitch_left == 0 && memcmp(vf_img, vf_exp_data, dlen) == 0,
+           "разовый сбой чтения посреди сектора журнала — повтор, файл верен");
+        /* Долгая (дольше повторов): ни одного сектора «OK» с чужими байтами. */
+        vf_vol.cur[0].valid = 0;
+        vf_glitch_left = 1000000;
+        int wrong = 0, failed = 0;
+        for (uint32_t s = 0; s < nsec; s++)
+        {
+            uint32_t x = s * VFAT_SECTOR, len = (dlen - x < VFAT_SECTOR) ? dlen - x : VFAT_SECTOR;
+            if (!VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img2)) { failed++; continue; }
+            if (memcmp(vf_img2, vf_exp_data + x, len) != 0) wrong++;
+        }
+        vf_glitch_left = 0;
+        ok(failed > 0 && wrong == 0, "долгий сбой посреди сектора журнала — отказ, а не сдвиг");
+        vf_vol.cur[0].valid = 0;
+        all = 1;
+        for (uint32_t s = 0; s < nsec; s++)
+            all &= VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img2 + s * VFAT_SECTOR);
+        ok(all && memcmp(vf_img2, vf_exp_data, dlen) == 0, "сбой прошёл — повтор хоста читает верно");
+        /* Обратное: при сборке слот не прочитался ни с одной попытки, при
+         * чтении цел — лишняя строка. Ловится на границе сектора журнала:
+         * сектор, через который она проходит, — отказ. */
+        vf_glitch_left = 3;
+        (void)VFat_Build(&vf_vol, &rg, "test");
+        ok(vf_glitch_left == 0 && vf_vol.n_bad == 1U, "долгий сбой при сборке — слот испорчен");
+        uint32_t bsec = vf_vol.off[0][1] / VFAT_SECTOR;
+        ok(VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + bsec, vf_img2) == 0,
+           "слот ожил после сборки — сектор на границе сектора журнала отказывает");
+        /* При сборке: разовый сбой не выкидывает строку из индекса. */
+        vf_glitch_left = 2;
+        (void)VFat_Build(&vf_vol, &rg, "test");
+        ok(vf_glitch_left == 0 && vf_vol.n_bad == 0U && vf_vol.size[VFAT_FILE_DATA] == dlen,
+           "разовый сбой при сборке — повтор, строка на месте");
+        vf_glitch_addr = -1;
+    }
+
+    /* Форматтеры разошлись (другая libc в сборке) — том переходит на
+     * LogRecord_FormatCsv целиком, файл по-прежнему верен. */
+    {
+        uint32_t dlen, olen;
+        vf_expect(&r, &dlen, &olen);
+        vf_break = 1;
+        (void)VFat_Build(&vf_vol, &r, "test");
+        vf_break = 0;
+        ok(vf_vol.slow == 1 && vf_vol.state == VFAT_OK, "самопроверка: расхождение — медленный путь");
+        for (uint32_t s = 0; s < VFAT_DISK_SECTORS; s++)
+            (void)VFat_Read(&vf_vol, s, vf_img + s * VFAT_SECTOR);
+        ok(vf_check_file(vf_img, "DATA    TXT", vf_exp_data, dlen), "медленный путь: data.txt байт в байт");
+        long il = vf_extract(vf_img, "INFO    TXT", vf_got, NULL);
+        vf_got[il > 0 ? il : 0] = 0;
+        ok(il > 0 && strstr((const char *)vf_got, "self-check failed") != NULL, "info.txt говорит о медленном пути");
+        (void)VFat_Build(&vf_vol, &r, "test");
+        ok(vf_vol.slow == 0, "без расхождения — быстрый путь");
+    }
+
+    /* Медленный путь даёт тот же файл. */
+    (void)VFat_Build(&vf_vol, &r, "test");
+    vf_vol.slow = 1;
+    int same = 1;
+    for (uint32_t s = VFAT_PART_LBA + VFAT_DATA; s < VFAT_PART_LBA + VFAT_DATA + 120U; s++)
+    {
+        (void)VFat_Read(&vf_vol, s, vf_img + s * VFAT_SECTOR);
+        vf_vol.slow = 0;
+        vf_vol.cur[0].valid = 0;
+        (void)VFat_Read(&vf_vol, s, vf_img2 + s * VFAT_SECTOR);
+        vf_vol.slow = 1;
+        same &= memcmp(vf_img + s * VFAT_SECTOR, vf_img2 + s * VFAT_SECTOR, VFAT_SECTOR) == 0;
+    }
+    ok(same, "через LogRecord_FormatCsv — те же секторы");
+
+    /* Защита от записи: в модуле нет записи, флеш при чтении не меняется
+     * (проверено в каждом сценарии выше); usbd_storage_if.c отвечает на
+     * WRITE10 отказом и выставляет WP. */
+}
+
 int main(void)
 {
+    /* VFAT_ONLY=1 — только том (так его гоняет tests/test_vfat_image.py). */
+    if (getenv("VFAT_ONLY"))
+    {
+        test_vfat_format();
+        test_vfat_volume();
+        printf("\n%d проверок, %d провалов\n", checks, failures);
+        return failures ? 1 : 0;
+    }
     test_ds18b20();
     test_battery();
     test_soil();
@@ -2388,6 +3012,8 @@ int main(void)
     test_log_ring_g2();
     test_log_ring_accept2();
     test_log_import();
+    test_vfat_format();
+    test_vfat_volume();
 
     printf("\n%d проверок, %d провалов\n", checks, failures);
     return failures ? 1 : 0;
