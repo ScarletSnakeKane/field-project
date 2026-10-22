@@ -50,6 +50,7 @@
 #define FLASH_CMD_RBPR        0x72       // Read Block-Protection Register (SST26)
 #define FLASH_BPR_LEN         6U         // байт BPR у SST26VF016B
 #define FLASH_MFR_SST         0xBFU      // JEDEC: SST/Microchip
+#define FLASH_TYPE_SST26      0x26U      // JEDEC: тип памяти SST26 (VF016B: BF 26 41)
 
 void SPI_Flash_Init(void);
 /* Снять защиту блоков (WREN + 0x98) и проверить: у SST26 — чтением регистра

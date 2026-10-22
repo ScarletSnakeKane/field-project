@@ -24,7 +24,7 @@ static volatile uint8_t op_depth     = 0;
 static volatile uint8_t probed_ok    = 0;   /* Probe ответил живым ID */
 static volatile uint8_t in_dpd       = 1;   /* после сброса МК чип может спать */
 static volatile uint8_t host_session = 0;   /* был ли хост с момента прошлой проверки */
-static uint8_t          jedec_mfr    = 0;   /* производитель по RDID; 0 — ещё не читали */
+static uint8_t          is_sst26     = 0;   /* RDID ответил BF 26 xx (запоминается только «да») */
 
 #define OP_BEGIN()  (op_depth++)
 #define OP_END()    (op_depth--)
@@ -123,13 +123,16 @@ static uint8_t SPI_Flash_GlobalUnprotect(void)
     /* Проверка по регистру защиты — только у SST26: у совместимых чипов
      * команды 0x72 может не быть, и сверка дала бы ложный отказ. Им
      * остаётся сверка каждой записи чтением в журнале. */
-    if (ok && jedec_mfr == 0U)
+    /* Запоминается только опознанный SST26: искажённое первое чтение ID
+     * иначе навсегда отключило бы проверку; не опознан — спросим снова. */
+    if (ok && !is_sst26)
     {
         uint8_t id[3] = {0};
-        if (SPI_Flash_ReadReg(FLASH_CMD_RDID, id, sizeof(id)) && id[0] != 0x00 && id[0] != 0xFF)
-            jedec_mfr = id[0];
+        if (SPI_Flash_ReadReg(FLASH_CMD_RDID, id, sizeof(id)) &&
+            id[0] == FLASH_MFR_SST && id[1] == FLASH_TYPE_SST26)
+            is_sst26 = 1;
     }
-    if (ok && jedec_mfr == FLASH_MFR_SST)
+    if (ok && is_sst26)
     {
         uint8_t bpr[FLASH_BPR_LEN];
         ok = SPI_Flash_ReadReg(FLASH_CMD_RBPR, bpr, sizeof(bpr));

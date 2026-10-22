@@ -212,6 +212,7 @@ static uint8_t LogRing_SectorSeq(const LogFlashOps *ops, uint32_t sect, uint32_t
                                  uint8_t *any, uint8_t *eio)
 {
     LogRecord buf;
+    uint8_t  alien0 = 0;   /* байт типа слота 0 не похож на наш */
     *any = 0;
     for (uint32_t k = 0; k < LOG_SLOTS; k++)
     {
@@ -237,21 +238,28 @@ static uint8_t LogRing_SectorSeq(const LogFlashOps *ops, uint32_t sect, uint32_t
         /* Слот 0 не похож даже на недописанную запись — сектор, скорее всего,
          * чужой (старый том), и весь его не читаем: иначе каждый старт читал
          * бы весь чип. Но один сброшенный бит в байте типа выглядит так же,
-         * поэтому решают ещё слот 1 и последний (T3): годная CRC с номером в
-         * любом из них — сектор наш. На чужом томе это два лишних чтения. */
-        if (k == 0U && !LogRecord_MayBeOurs(&buf))
+         * поэтому чтение идёт дальше (T3): стёртые слоты (пропуск после
+         * старта, T4) и похожие на наши недописанные пропускаются, годная
+         * CRC с номером — сектор наш. Первый слот, не похожий на наш, —
+         * сектор чужой; напоследок смотрится ещё последний слот. На чужом
+         * томе это два-три лишних чтения на сектор. */
+        if (!LogRecord_MayBeOurs(&buf) && (k == 0U || alien0))
         {
-            static const uint32_t more[2] = { 1U, LOG_SLOTS - 1U };
-            for (uint32_t j = 0; j < 2U; j++)
+            if (k == 0U)
             {
-                if (!ops->read(LogRing_Addr(sect, more[j]), buf.b, LOG_RECORD_SIZE))
+                alien0 = 1;
+                continue;
+            }
+            if (k + 1U < LOG_SLOTS)
+            {
+                if (!ops->read(LogRing_Addr(sect, LOG_SLOTS - 1U), buf.b, LOG_RECORD_SIZE))
                 {
                     *eio = 1;
                     return 0;
                 }
                 if (LogRecord_Check(&buf) == LOG_REC_OK)
                 {
-                    *seq0 = LogRecord_Seq(&buf) - more[j];
+                    *seq0 = LogRecord_Seq(&buf) - (LOG_SLOTS - 1U);
                     return 1;
                 }
             }
@@ -1038,16 +1046,20 @@ uint8_t LogArchive_Open(LogRing *r, const LogFlashOps *ops, uint32_t nsect,
     uint8_t vol = LogImport_Probe(ops, flash_bytes, v);
     if (vol == LOG_PROBE_EIO)
         return LOG_OPEN_EIO;          /* ничего не записано: main повторит */
-    if (pending)
+
+    /* По этому разбору журнал начнётся с нуля поверх тома, будет стёрто всё
+     * выше границы или закрыт незаконченный импорт. Разбор повторяется и
+     * должен дать то же самое: одно искажённое (а не отказавшее) чтение не
+     * решает. Это старт с записью — лишние десятки чтений не в счёт. */
     {
-        /* По этому разбору будет стираться всё выше границы, а при «тома
-         * нет» — закрываться импорт. Разбор повторяется и должен дать то же
-         * самое: одно искажённое (а не отказавшее) чтение не решает. */
         uint32_t end = v->end, total = v->total;
         uint8_t  nfiles = v->nfiles;
         uint8_t  again = LogImport_Probe(ops, flash_bytes, v);
         if (again != vol || v->end != end || v->total != total || v->nfiles != nfiles)
             return LOG_OPEN_EIO;
+    }
+    if (pending)
+    {
         if (vol == LOG_PROBE_NONE)
         {
             /* Старого тома больше не видно, хотя импорт не закончен. Ниже

@@ -953,6 +953,7 @@ static void fm_power_on(void) { fm_dead = 0; fm_cut = -1; }
 static long fm_read_fail = -1;   /* через сколько чтений одно откажет */
 static long fm_fail_addr = -1;   /* или: откажет одно чтение ровно (адрес, длина) */
 static uint32_t fm_fail_len;
+static long fm_bend_addr = -1;   /* одно чтение (адрес, длина 512) вернёт байт 0 обнулённым */
 
 static uint8_t fm_read(uint32_t a, uint8_t *b, uint32_t n)
 {
@@ -960,6 +961,7 @@ static uint8_t fm_read(uint32_t a, uint8_t *b, uint32_t n)
     if (fm_fail_addr >= 0 && (long)a == fm_fail_addr && n == fm_fail_len) { fm_fail_addr = -1; return 0; }
     if (fm_dead || a + n > fm_nsect * 4096U) return 0;
     memcpy(b, fm + a, n);
+    if ((long)a == fm_bend_addr && n == 512U) { b[0] = 0; fm_bend_addr = -1; }   /* искажено, но «прочитано» */
     return 1;
 }
 
@@ -1642,15 +1644,22 @@ static void test_log_ring_accept2(void)
      * голове. Журнал не укорачивается, голова не стирается. */
     {
         uint32_t failed = 0, cases = 0;
-        for (int where = 0; where < 2; where++)
+        /* where 2 — голова, где после записи слота 0 был перезапуск: слот 1
+         * стёрт пропуском (T4), записи — с слота 2. */
+        for (int where = 0; where < 3; where++)
             for (uint32_t byte = 0; byte < 6U; byte++)
                 for (uint32_t bit = 0; bit < 8U; bit++)
                 {
                     fm_reset(64);
                     fm_mode = 1;
                     (void)LogRing_Mount(&r, &FM_OPS, 64);
-                    const uint32_t N = 40U * 64U + 30U;
-                    for (uint32_t id = 1; id <= N; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+                    const uint32_t N = 40U * 64U + (where == 2 ? 19U : 30U);
+                    for (uint32_t id = 1; id <= N; id++)
+                    {
+                        log_make(&rec, id);
+                        (void)LogRing_Append(&r, &rec);
+                        if (where == 2 && id == 40U * 64U + 1U) (void)LogRing_Mount(&r, &FM_OPS, 64);
+                    }
                     uint32_t s = where ? r.w_sect : 20U;
                     uint32_t cnt = LogRing_Count(&r);
                     uint8_t *b = &fm[s * 4096U + byte];
@@ -1666,14 +1675,15 @@ static void test_log_ring_accept2(void)
                     uint32_t good = log_scan(&m, &bad, NULL, 0, &alien);
                     if (alien || good != N || bad != 1U + log_scan_skipped) e++;
                     if (e && failed < 3U)
-                        printf("    %s, байт %u бит %u: count %u good %u bad %u\n", where ? "голова" : "середина",
+                        printf("    %s, байт %u бит %u: count %u good %u bad %u\n",
+                               where == 2 ? "голова после перезапуска" : where ? "голова" : "середина",
                                byte, bit, LogRing_Count(&m), good, bad);
                     failed += (e != 0);
                 }
         char what[200];
-        snprintf(what, sizeof(what), "T3: бит 1→0 в байтах 0..5 слота 0 (%u случаев, середина и голова) — "
+        snprintf(what, sizeof(what), "T3: бит 1→0 в байтах 0..5 слота 0 (%u случаев; середина и голова) — "
                                      "журнал цел, потерян только этот слот", cases);
-        ok(cases >= 10U && failed == 0U, what);
+        ok(cases >= 20U && failed == 0U, what);
     }
 
     /* T3: сектор посреди журнала испорчен целиком (ни одного годного
@@ -1689,6 +1699,31 @@ static void test_log_ring_accept2(void)
         uint32_t good = log_scan(&m, &bad, NULL, 0, &alien);
         ok(LogRing_FirstSeq(&m) == 0U && good == 9U * 64U && bad == 64U && !alien,
            "T3: сектор-дыра посреди журнала — выпали только его 64 записи");
+    }
+
+    /* T3: мост через сектор-дыру не перешагивает на запасной. Старейший
+     * сектор испорчен целиком, а за ним — запасной, стирание которого
+     * оборвалось и оставило записи с номером ровно на сектор меньше: в
+     * журнал он попасть не должен (его сотрёт первая же дозапись). */
+    {
+        fm_reset(8);
+        fm_mode = 1;
+        (void)LogRing_Mount(&r, &FM_OPS, 8);
+        for (uint32_t id = 1; id <= 3U * 8U * 64U + 10U; id++) { log_make(&rec, id); (void)LogRing_Append(&r, &rec); }
+        uint32_t spare = (r.w_sect + 1U) % 8U, oldest = (spare + 1U) % 8U;
+        LogRecord o;
+        memcpy(o.b, fm + oldest * 4096U, 64);
+        uint32_t seq_old = LogRecord_Seq(&o);
+        for (uint32_t k = 0; k < 64U; k++)
+        {
+            log_make(&rec, 90000U + k);
+            LogRecord_Seal(&rec, seq_old - 64U + k);
+            memcpy(fm + spare * 4096U + k * 64U, rec.b, 64);
+        }
+        memset(fm + oldest * 4096U, 0x00, 4096U);
+        equ(LogRing_Mount(&m, &FM_OPS, 8), LOG_MOUNT_OK, "T3: дыра у запасного: монтирование");
+        ok(m.tail_sect == (oldest + 1U) % 8U && LogRing_FirstSeq(&m) == seq_old + 64U,
+           "T3: дыра у запасного — хвост за дырой, запасной в журнал не пристёгнут");
     }
 
     /* T4: обрыв вида 4 (слабые ячейки) на каждой операции. */
@@ -2195,6 +2230,36 @@ static void test_log_import(void)
                      pend ? "незаконченный импорт" : "первый старт", points);
             ok(points > (pend ? 1200U : 1000U) && failed == 0U, what);
         }
+    }
+
+    /* T1: чтение не отказало, а исказилось (обнулён первый байт корня —
+     * «каталог пуст»). Разбор повторяется и не совпадает: EIO, а не «тома
+     * нет» / «переносить нечего»; следующее открытие переносит всё. */
+    for (int pend = 0; pend < 2; pend++)
+    {
+        static const OldFileSpec G[2] = { { "DATA    TXT", 6000, 7 }, { "DATA_1  TXT", 700, 8 } };
+        static const uint32_t GO[2] = { 1, 0 };
+        fm_reset(LOG_FLASH_SECTORS);
+        fm_mode = 1;
+        uint32_t end = old_volume(16, G, 2, 1, old_texts);
+        static uint8_t before[64 * 4096];
+        memcpy(before, fm, sizeof(before));
+        if (pend)
+        {
+            fm_ops = 0;
+            fm_cut = 60;
+            (void)LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v);
+            fm_power_on();
+        }
+        long ops0 = fm_ops;
+        fm_bend_addr = 96 * 512;
+        uint8_t res = LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v);
+        ok(res == LOG_OPEN_EIO && fm_bend_addr < 0 && fm_ops == ops0,
+           pend ? "T1: незаконченный импорт, искажённое чтение корня — разборы не совпали, EIO"
+                : "T1: первый старт, искажённое чтение корня — разборы не совпали, EIO");
+        ok(LogArchive_Open(&r, &FM_OPS, LOG_FLASH_SECTORS, 1, &v) == LOG_OPEN_OK &&
+           import_check(&r, G, GO, 2, old_texts, 1) == 0 && memcmp(before, fm, end) == 0,
+           pend ? "T1: после искажённого чтения импорт доведён" : "T1: после искажённого чтения импорт полон");
     }
 
     /* T1: то же для обрезанного большого data.txt (заголовок и хвост с
