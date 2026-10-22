@@ -137,6 +137,7 @@ FRESULT res;
 static BYTE work[4096];
 FIL file;
 static uint8_t lse_ok = 0;   /* запустился ли LSE-кварц (иначе метки времени врут) */
+static uint8_t time_ok = 0;  /* можно ли верить часам (A6, Policy_TimeTrusted) */
 static volatile uint8_t woke_by_button = 0;  /* выставляется в EXTI-колбэке кнопки */
 static uint8_t fs_ok = 0;    /* смонтирована ли файловая система */
 static uint32_t write_fails = 0;  /* накопленное число неудачных записей строки */
@@ -590,7 +591,7 @@ int main(void)
   // Календарь живёт в backup-домене и переживает сброс, поэтому проверки
   // "не инициализирован" мало: после обычного ресета время идёт дальше, а вот
   // новая прошивка должна переставить его на своё время сборки.
-  Time_SyncToBuildIfNeeded();
+  uint8_t time_sync = Time_SyncToBuildIfNeeded();
 
   /* Флеш занята основным потоком с этого места и до конца первой дозаписи
    * в цикле (первый проход идёт без сна, так что это пара секунд). USB до
@@ -732,6 +733,40 @@ int main(void)
           work[MBR_PART_TYPE_OFS] = 0x0E;
           disk_write(0, work, 0, 1);
       }
+  }
+
+  /* Можно ли верить часам (A6). Календарь живёт в backup-домене, а тот на
+   * этой плате сидит на VDD: замена банки возвращает часы на время сборки.
+   * Отличить это от свежей прошивки помогает только архив — правило в
+   * Policy_TimeTrusted; итог — в time_ok каждой строки и в DR3 до следующего
+   * сброса. Хвоста в 192 байта хватает на последнюю строку целиком. */
+  {
+      char last_ts[STORAGE_TS_LEN + 1] = "";
+      char build_ts[STORAGE_TS_LEN + 1];
+      uint8_t archive_read = 0;
+      if (fs_ok)
+      {
+          FIL tf;
+          FRESULT tr = f_open(&tf, DATA_FILE, FA_READ);
+          if (tr == FR_NO_FILE)
+              archive_read = 1;   /* архива нет — противоречить нечему */
+          else if (tr == FR_OK)
+          {
+              char tail[192];
+              UINT br = 0;
+              FSIZE_t sz   = f_size(&tf);
+              FSIZE_t from = (sz > sizeof(tail)) ? sz - sizeof(tail) : 0;
+              if (f_lseek(&tf, from) == FR_OK && f_read(&tf, tail, sizeof(tail), &br) == FR_OK)
+              {
+                  archive_read = 1;
+                  (void)Storage_LastTimestamp(tail, (uint32_t)br, from == 0, last_ts);
+              }
+              f_close(&tf);
+          }
+      }
+      Time_BuildTimestamp(build_ts, sizeof(build_ts));
+      time_ok = Policy_TimeTrusted(time_sync, Time_GetTrusted(), archive_read, last_ts, build_ts);
+      Time_SetTrusted(time_ok);
   }
 
   // 2b) Архив начинается заново в двух случаях:

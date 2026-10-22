@@ -122,5 +122,27 @@ typedef struct {
 uint8_t Policy_SensorsPowerAllowed(const Policy_Quarantine *q);
 void    Policy_QuarantineUpdate(Policy_Quarantine *q, uint8_t powered,
                                 uint8_t all_failed, uint32_t skip_cycles);
+/* Можно ли верить часам (A6), колонка time_ok.
+ *
+ * Внешнего источника времени у прибора нет: часы ставятся на время сборки
+ * при прошивке и дальше идут от кварца. VBAT на плате посажен на VDD, так что
+ * при замене банки календарь теряется, и часы снова встают на время сборки —
+ * может быть, многомесячной давности. Раньше такие строки ничем не
+ * отличались от настоящих, и порядок в архиве молча ломался.
+ *   sync      — что сделал Time_SyncToBuildIfNeeded;
+ *   stored    — отметка, оставленная прошлым стартом (Time_GetTrusted);
+ *   archive_read — архив прочитан (том смонтирован, файл открылся или его нет);
+ *   last_ts   — метка последней строки архива ("" — строк нет);
+ *   build_ts  — время сборки в том же формате.
+ * Потеря календаря и самая первая прошивка выглядят одинаково (backup-домен
+ * пуст), поэтому их различает архив: если в нём уже есть строки не раньше
+ * времени сборки, часы заведомо отстали — не доверять. Метки сравниваются
+ * строкой: формат "YYYY-MM-DD hh:mm:ss" упорядочен так же, как время. */
+#define POLICY_TIME_SYNC_NONE       0U   /* часы не трогали */
+#define POLICY_TIME_SYNC_NEW_BUILD  1U   /* новая сборка, календарь был жив */
+#define POLICY_TIME_SYNC_LOST       2U   /* календарь потерян — часы на время сборки */
+
+uint8_t Policy_TimeTrusted(uint8_t sync, uint8_t stored, uint8_t archive_read,
+                           const char *last_ts, const char *build_ts);
 
 #endif

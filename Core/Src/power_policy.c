@@ -1,5 +1,7 @@
 #include "power_policy.h"
 
+#include <string.h>
+
 uint8_t Policy_ButtonKeepsAwake(Policy_Button *b, uint8_t key_held,
                                 uint32_t dt_ms, uint32_t hold_max_ms)
 {
@@ -111,4 +113,29 @@ void Policy_QuarantineUpdate(Policy_Quarantine *q, uint8_t powered,
         q->fails++;
     if (q->fails >= POLICY_QUARANTINE_FAILS)
         q->skip_left = skip_cycles;
+}
+
+uint8_t Policy_TimeTrusted(uint8_t sync, uint8_t stored, uint8_t archive_read,
+                           const char *last_ts, const char *build_ts)
+{
+    if (sync == POLICY_TIME_SYNC_NONE)
+        return stored ? 1U : 0U;
+
+    /* Новая сборка при живом календаре — это прошивка с компьютера: время
+     * сборки отстаёт от настоящего на минуты, этому можно верить. */
+    if (sync == POLICY_TIME_SYNC_NEW_BUILD)
+        return 1U;
+
+    /* Календарь потерян. Не знаем, что в архиве, — не верим. */
+    if (!archive_read)
+        return 0U;
+
+    /* В архиве уже есть строки не раньше времени сборки — прибор жил после
+     * прошивки, и часы откатились назад. */
+    if (last_ts[0] != '\0' && strcmp(last_ts, build_ts) >= 0)
+        return 0U;
+
+    /* Архив пуст или кончается раньше сборки — так выглядит прошивка свежей
+     * сборкой на обесточенной плате: время сборки — лучшее, что есть. */
+    return 1U;
 }

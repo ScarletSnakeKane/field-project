@@ -257,6 +257,51 @@ static inline uint32_t Storage_PickOldArchiveName(Storage_NameTaken taken, void 
     return 0;
 }
 
+/* Метка времени последней строки архива — для Policy_TimeTrusted (A6).
+ * tail — последние n байт файла; from_start — tail начинается с начала
+ * файла (иначе первая строка в нём, скорее всего, обрезана и не в счёт).
+ * Ищется последняя строка, которая начинается с "YYYY-MM-DD hh:mm:ss";
+ * заголовок и обрывки не подходят. Метка (19 символов и ноль) — в out[20].
+ * Возвращает 1, если нашлась. */
+#define STORAGE_TS_LEN  19U
+
+static inline uint8_t Storage_IsTimestamp(const char *p)
+{
+    static const char pat[] = "dddd-dd-dd dd:dd:dd";
+    for (uint32_t i = 0; i < STORAGE_TS_LEN; i++)
+    {
+        if (pat[i] == 'd' ? (p[i] < '0' || p[i] > '9') : (p[i] != pat[i]))
+            return 0;
+    }
+    return 1;
+}
+
+static inline uint8_t Storage_LastTimestamp(const char *tail, uint32_t n, uint8_t from_start,
+                                            char *out)
+{
+    /* С конца: начало строки — сразу после '\n' (или начало файла). */
+    for (uint32_t i = n; i > 0U; i--)
+    {
+        uint32_t start = i;   /* кандидат: tail[i] — сразу после tail[i - 1] */
+        if (tail[i - 1U] != '\n')
+            continue;
+        if (n - start >= STORAGE_TS_LEN && Storage_IsTimestamp(tail + start))
+        {
+            memcpy(out, tail + start, STORAGE_TS_LEN);
+            out[STORAGE_TS_LEN] = '\0';
+            return 1;
+        }
+    }
+    if (from_start && n >= STORAGE_TS_LEN && Storage_IsTimestamp(tail))
+    {
+        memcpy(out, tail, STORAGE_TS_LEN);
+        out[STORAGE_TS_LEN] = '\0';
+        return 1;
+    }
+    out[0] = '\0';
+    return 0;
+}
+
 /* Можно ли MSC (из прерывания OTG) читать флеш прямо сейчас. Не готова —
  * значит не инициализирована или спит, и будить её из прерывания нельзя:
  * задержки там не идут. Занята — основной поток посреди операции FatFs, и

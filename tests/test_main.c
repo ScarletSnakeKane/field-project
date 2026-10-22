@@ -887,6 +887,59 @@ static void test_archive_rename(void)
     ok(out[0] == '\0', "имя пустое");
 }
 
+static void test_time_trust(void)
+{
+    const char *B = "2026-10-22 10:00:00";   /* время сборки */
+    char ts[20];
+
+    puts("Достоверность часов");
+
+    /* Обычный сброс — как было. */
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NONE, 1, 0, "", B), 1, "сброс, часы шли и им верили — верим");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NONE, 0, 1, "", B), 0, "сброс после недоверия — не верим и дальше");
+
+    /* Прошивка с компьютера при живом календаре. */
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NEW_BUILD, 0, 0, "2027-01-01 00:00:00", B), 1,
+        "новая сборка, календарь жив — верим");
+
+    /* Замена банки в поле (A6): календарь потерян, часы на времени сборки,
+     * а в архиве уже месяцы строк после неё. */
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_LOST, 1, 1, "2027-03-05 14:00:01", B), 0,
+        "календарь потерян, в архиве строки позже сборки — не верим");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_LOST, 1, 1, B, B), 0,
+        "последняя строка ровно во время сборки — тоже не верим");
+
+    /* Свежая прошивка на обесточенной плате: строки только от старых сборок. */
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_LOST, 0, 1, "2026-09-01 08:00:00", B), 1,
+        "архив кончается раньше сборки — свежая прошивка, верим");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_LOST, 0, 1, "", B), 1, "архив пуст — верим времени сборки");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_LOST, 1, 0, "", B), 0, "архив не прочитан — не верим");
+
+    /* Метка последней строки из хвоста файла. */
+    const char *t1 = "4.20,1,1,0,0,0,0\n2026-10-22 11:00:00,21.5,40.0\n2026-10-22 12:00:00,21.7,41.0\n";
+    equ(Storage_LastTimestamp(t1, (uint32_t)strlen(t1), 0, ts), 1, "метка последней строки нашлась");
+    ok(strcmp(ts, "2026-10-22 12:00:00") == 0, "это именно последняя строка");
+
+    /* Хвост оборван посреди последней строки — берём её начало, если метка целиком. */
+    const char *t2 = "x\n2026-10-22 11:00:00,21.5\n2026-10-22 12:0";
+    equ(Storage_LastTimestamp(t2, (uint32_t)strlen(t2), 0, ts), 1, "оборванная последняя — берём предыдущую");
+    ok(strcmp(ts, "2026-10-22 11:00:00") == 0, "метка предыдущей строки");
+
+    /* Файл из одного заголовка — строк нет. */
+    const char *t3 = "timestamp,air_temp,air_hum\n";
+    equ(Storage_LastTimestamp(t3, (uint32_t)strlen(t3), 1, ts), 0, "только заголовок — меток нет");
+    ok(ts[0] == '\0', "метка пустая");
+
+    /* Хвост с начала файла, где первая строка — уже данные (заголовка нет). */
+    const char *t4 = "2026-10-22 09:00:00,1,2";
+    equ(Storage_LastTimestamp(t4, (uint32_t)strlen(t4), 1, ts), 1, "с начала файла — первая строка в счёт");
+    equ(Storage_LastTimestamp(t4, (uint32_t)strlen(t4), 0, ts), 0, "не с начала — обрывок не в счёт");
+
+    /* Похоже, но не метка. */
+    const char *t5 = "\n2026-1O-22 12:00:00,1\n";   /* буква O вместо нуля */
+    equ(Storage_LastTimestamp(t5, (uint32_t)strlen(t5), 0, ts), 0, "буква вместо цифры — не метка");
+}
+
 int main(void)
 {
     test_ds18b20();
@@ -900,6 +953,7 @@ int main(void)
     test_storage_policy();
     test_mbr_restore();
     test_archive_rename();
+    test_time_trust();
 
     printf("\n%d проверок, %d провалов\n", checks, failures);
     return failures ? 1 : 0;

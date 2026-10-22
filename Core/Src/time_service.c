@@ -1,4 +1,5 @@
 #include "time_service.h"
+#include "power_policy.h"
 #include <stdio.h>
 
 /* Время сборки, разобранное из __DATE__ ("Mmm dd yyyy") и __TIME__ ("hh:mm:ss").
@@ -56,11 +57,39 @@ uint8_t Time_SyncToBuildIfNeeded(void)
     uint8_t new_build     = (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0) != BUILD_STAMP);
 
     if (!calendar_lost && !new_build)
-        return 0;   /* та же прошивка и часы идут — не трогаем */
+        return POLICY_TIME_SYNC_NONE;   /* та же прошивка и часы идут — не трогаем */
 
     Time_InitOnce();
     HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, BUILD_STAMP);
-    return 1;       /* часы переставлены на время сборки */
+
+    /* Потеря календаря и прошивка «с нуля» выглядят одинаково: VBAT сидит
+     * на VDD, и при пропадании питания backup-домен обнуляется вместе с
+     * отпечатком. Различает их уже main.c по архиву (Policy_TimeTrusted). */
+    return calendar_lost ? POLICY_TIME_SYNC_LOST : POLICY_TIME_SYNC_NEW_BUILD;
+}
+
+void Time_BuildTimestamp(char *buf, uint16_t len)
+{
+    snprintf(buf, len, "%04d-%02d-%02d %02d:%02d:%02d",
+             BUILD_YEAR, BUILD_MONTH, BUILD_DAY, BUILD_HOUR, BUILD_MIN, BUILD_SEC);
+}
+
+/* DR3: метка в старших 16 битах — чтобы ноль обнулённого backup-домена не
+ * читался как «не доверять» и мусор не читался как «доверять». */
+#define TIME_TRUST_MAGIC  0x71530000UL
+
+uint8_t Time_GetTrusted(void)
+{
+    uint32_t v = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR3);
+    if ((v & 0xFFFF0000UL) != TIME_TRUST_MAGIC)
+        return 0;
+    return (v & 1UL) ? 1U : 0U;
+}
+
+void Time_SetTrusted(uint8_t trusted)
+{
+    HAL_PWR_EnableBkUpAccess();
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR3, TIME_TRUST_MAGIC | (trusted ? 1UL : 0UL));
 }
 
 void Time_GetTimestamp(char *buf, uint16_t len)
