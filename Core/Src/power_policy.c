@@ -82,3 +82,33 @@ uint16_t Policy_ResetCause(uint32_t rcc_csr, uint32_t bkp_fault)
     }
     return c;
 }
+
+uint8_t Policy_SensorsPowerAllowed(const Policy_Quarantine *q)
+{
+    return (q->skip_left == 0U) ? 1U : 0U;
+}
+
+void Policy_QuarantineUpdate(Policy_Quarantine *q, uint8_t powered,
+                             uint8_t all_failed, uint32_t skip_cycles)
+{
+    if (!powered)
+    {
+        if (q->skip_left > 0U)
+            q->skip_left--;
+        return;
+    }
+
+    if (!all_failed)
+    {
+        q->fails = 0;
+        return;
+    }
+
+    /* Счётчик не сбрасывается после карантина: пробная попытка, которая
+     * тоже не удалась, сразу возвращает в карантин, а не даёт ещё два цикла
+     * на полном токе. */
+    if (q->fails < POLICY_QUARANTINE_FAILS)
+        q->fails++;
+    if (q->fails >= POLICY_QUARANTINE_FAILS)
+        q->skip_left = skip_cycles;
+}

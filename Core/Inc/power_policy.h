@@ -102,4 +102,25 @@ uint32_t Policy_SleepChunkSec(uint32_t left_sec, uint32_t kick_sec);
  * не три события. bkp_fault — содержимое backup-регистра как есть. */
 uint16_t Policy_ResetCause(uint32_t rcc_csr, uint32_t bkp_fault);
 
+/* Карантин питания датчиков (дизайн v2, ТЗ п. 16).
+ *
+ * Все датчики сидят на одной рельсе за ключом PB0. Залитый разъём или
+ * пробитый датчик каждый час сажает её в ограничение тока LDO — за недели
+ * это съедает бюджет, а данных всё равно нет. Отказ рельсы отличаем от
+ * отказа одного датчика так: в цикле нет ни воздуха (AHT20), ни почвы
+ * (DS18B20) — all_failed. POLICY_QUARANTINE_FAILS таких циклов подряд —
+ * питание не подаётся skip_cycles циклов; затем одна попытка: удалась —
+ * всё по-старому, нет — снова карантин, то есть одна попытка в M часов.
+ *   powered — подавали ли питание в этом цикле (Policy_SensorsPowerAllowed). */
+#define POLICY_QUARANTINE_FAILS  3U
+
+typedef struct {
+    uint8_t  fails;       /* циклов подряд без воздуха и почвы */
+    uint32_t skip_left;   /* сколько ещё циклов не подавать питание */
+} Policy_Quarantine;
+
+uint8_t Policy_SensorsPowerAllowed(const Policy_Quarantine *q);
+void    Policy_QuarantineUpdate(Policy_Quarantine *q, uint8_t powered,
+                                uint8_t all_failed, uint32_t skip_cycles);
+
 #endif

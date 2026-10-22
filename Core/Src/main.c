@@ -62,6 +62,16 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 #define I2C_REC_DEAD         3U
 #define I2C_POWER_CYCLE_MS   200U
 
+/* Карантин питания датчиков: сколько часов не подавать питание после трёх
+ * отказов подряд (Policy_QuarantineUpdate). В циклах — по текущему
+ * интервалу, но не меньше одного. Колонка sens_off: 0 — датчики запитаны,
+ * N > 0 — карантин, осталось N циклов; коды датчиков в такой строке — «не
+ * опрашивались»: aht_*_st = 1 (HAL_ERROR), ds_err = DS_ERR_NOT_POLLED. */
+#define SENSOR_QUARANTINE_HOURS   6U
+#define SENSOR_QUARANTINE_CYCLES  ((SENSOR_QUARANTINE_HOURS * 3600U / RTC_WAKEUP_INTERVAL_SEC) ? \
+                                   (SENSOR_QUARANTINE_HOURS * 3600U / RTC_WAKEUP_INTERVAL_SEC) : 1U)
+#define DS_ERR_NOT_POLLED         8U
+
 /* Пока кнопка удерживается, МК не уходит в STOP — так USB-сессия не рвётся на время сна.
  * BTN_HOLD_MAX_MS — страховка на случай залипшей/залитой кнопки в поле: по истечении
  * этого времени засыпаем принудительно и больше не ждём кнопку, пока её не отпустят
@@ -134,6 +144,7 @@ static Policy_Button btn_policy;  /* удержание KEY через все ц
 static uint16_t reset_cause = 0;  /* почему стартовали — Policy_ResetCause */
 static uint32_t boot_count  = 0;  /* стартов с последней подачи питания */
 static uint8_t  i2c_rec     = 0;  /* как освобождали шину в этом цикле (B6) */
+static Policy_Quarantine sens_quarantine;  /* карантин питания датчиков */
 static Policy_Usb    usb_policy;  /* VBUS без хоста через все циклы сна (A9) */
 static volatile uint8_t woke_by_vbus = 0;    /* фронт VBUS: вставили кабель */
 /* USER CODE END PV */
@@ -757,80 +768,102 @@ int main(void)
 	  first_pass = 0;
 	  Watchdog_Kick();
 
-	  /* --- включаем датчики (LOW) --- */
-	  HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
-	  /* Полная пауза на выход датчиков в режим, а не символические 50 мс.
-	   * Константа SENSOR_POWERUP_DELAY_MS была заведена ровно под это, но в коде
-	   * не использовалась, и AHT20 опрашивался слишком рано: адрес он
-	   * подтверждает почти сразу, а на самокалибровку ему нужно заметно больше,
-	   * и AHT20_Init не укладывался в свой бюджет попыток. За двое суток
-	   * боевого прогона так потерялись две трети замеров воздуха.
-	   * Цена паузы: 450 мс раз в час при токе активной фазы порядка 20 мА —
-	   * это около 2.5 мкА среднего против бюджета в 377 мкА. */
-	  HAL_Delay(SENSOR_POWERUP_DELAY_MS);
+	  /* Карантин питания датчиков (дизайн v2, ТЗ п. 16). Залитый разъём или
+	   * пробитый датчик каждый час сажает ключ и LDO в ограничение тока и
+	   * съедает бюджет за недели, а данных всё равно нет. Три цикла подряд без
+	   * воздуха И без почвы — признак отказа рельсы, а не одного датчика;
+	   * тогда питание не подаётся SENSOR_QUARANTINE_HOURS часов, а потом —
+	   * одна попытка. Правило — Policy_QuarantineUpdate. Батарея и запись
+	   * строки идут как обычно: архив показывает, что прибор жив. */
+	  uint8_t  sens_powered = Policy_SensorsPowerAllowed(&sens_quarantine);
+	  uint32_t sens_off = sens_powered ? 0U : sens_quarantine.skip_left;
+	  (void)sens_off;   /* колонка sens_off — в изменении заголовка CSV */
 
-	  /* Датчик на шине I2C1 только что был полностью обесточен. Жёстко сбрасываем саму
-	   * периферию I2C1 через RCC перед повторным использованием — иначе она может остаться
-	   * в залипшем BUSY-состоянии после неудачной транзакции прошлого цикла и больше
-	   * никогда не восстановиться сама (обычный DeInit/Init этого не гарантирует). */
-	  HAL_I2C_DeInit(&hi2c1);
-	  __HAL_RCC_I2C1_FORCE_RESET();
-	  __HAL_RCC_I2C1_RELEASE_RESET();
+	  AHT20_Data aht = { NAN, NAN };
+	  HAL_StatusTypeDef aht_init_st = HAL_ERROR, aht_read_st = HAL_ERROR;
+	  float   soil_temp = NAN, soil_hum = NAN;
+	  uint8_t ds_err = DS_ERR_NOT_POLLED;
+	  i2c_rec = 0;
 
-	  /* Сброс периферии не отпускает ведомого, который держит SDA (B6), —
-	   * шину освобождаем тактами SCL. Не помогло — ведомый завис глубже:
-	   * снимаем питание датчиков ещё раз и повторяем, один раз. Выводы шины
-	   * на это время — в вход, чтобы не питать модуль через подтяжки. */
-	  i2c_rec = I2C1_BusRecover();
-	  if (i2c_rec == I2C_BUS_STUCK)
+	  if (sens_powered)
 	  {
-	      HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8 | GPIO_PIN_9);
-	      HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_SET);
-	      HAL_Delay(I2C_POWER_CYCLE_MS);
+	      /* --- включаем датчики (LOW) --- */
 	      HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
+	      /* Полная пауза на выход датчиков в режим, а не символические 50 мс.
+	       * Константа SENSOR_POWERUP_DELAY_MS была заведена ровно под это, но в коде
+	       * не использовалась, и AHT20 опрашивался слишком рано: адрес он
+	       * подтверждает почти сразу, а на самокалибровку ему нужно заметно больше,
+	       * и AHT20_Init не укладывался в свой бюджет попыток. За двое суток
+	       * боевого прогона так потерялись две трети замеров воздуха.
+	       * Цена паузы: 450 мс раз в час при токе активной фазы порядка 20 мА —
+	       * это около 2.5 мкА среднего против бюджета в 377 мкА. */
 	      HAL_Delay(SENSOR_POWERUP_DELAY_MS);
-	      i2c_rec = (I2C1_BusRecover() == I2C_BUS_STUCK) ? I2C_REC_DEAD : I2C_REC_POWER;
+
+	      /* Датчик на шине I2C1 только что был полностью обесточен. Жёстко сбрасываем саму
+	       * периферию I2C1 через RCC перед повторным использованием — иначе она может остаться
+	       * в залипшем BUSY-состоянии после неудачной транзакции прошлого цикла и больше
+	       * никогда не восстановиться сама (обычный DeInit/Init этого не гарантирует). */
+	      HAL_I2C_DeInit(&hi2c1);
+	      __HAL_RCC_I2C1_FORCE_RESET();
+	      __HAL_RCC_I2C1_RELEASE_RESET();
+
+	      /* Сброс периферии не отпускает ведомого, который держит SDA (B6), —
+	       * шину освобождаем тактами SCL. Не помогло — ведомый завис глубже:
+	       * снимаем питание датчиков ещё раз и повторяем, один раз. Выводы шины
+	       * на это время — в вход, чтобы не питать модуль через подтяжки. */
+	      i2c_rec = I2C1_BusRecover();
+	      if (i2c_rec == I2C_BUS_STUCK)
+	      {
+	          HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8 | GPIO_PIN_9);
+	          HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_SET);
+	          HAL_Delay(I2C_POWER_CYCLE_MS);
+	          HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
+	          HAL_Delay(SENSOR_POWERUP_DELAY_MS);
+	          i2c_rec = (I2C1_BusRecover() == I2C_BUS_STUCK) ? I2C_REC_DEAD : I2C_REC_POWER;
+	      }
+	      MX_I2C1_Init();
+
+	      /* Ждём, пока AHT20 реально начнёт подтверждать свой адрес на шине, вместо
+	       * слепой фиксированной паузы: время выхода на режим зависит от температуры
+	       * и от того, насколько успел разрядиться его питающий конденсатор. */
+	      for (uint16_t i = 0; i < 80; i++)   /* до ~2 секунд ожидания */
+	      {
+	          if (HAL_I2C_IsDeviceReady(&hi2c1, AHT20_ADDR, 1, 10) == HAL_OK)
+	              break;
+	          HAL_Delay(25);
+	      }
+
+	      /* AHT20 теряет калибровку при каждом отключении питания — обязательно
+	       * заново инициализировать после каждого включения PA0, иначе показания мусорные. */
+	      aht_init_st = AHT20_Init(&hi2c1);
+
+	      /* Если датчик не откалибровался, читать его бессмысленно: транзакции
+	       * пройдут успешно, а в кадре будут нули. Раньше чтение выполнялось
+	       * независимо от исхода инициализации, и такой кадр однажды разобрался
+	       * в -50.00 °C и ушёл в архив как настоящее измерение. */
+	      aht_read_st = (aht_init_st == HAL_OK)
+	                  ? AHT20_ReadData(&hi2c1, &aht)
+	                  : HAL_ERROR;
+	      if (aht_read_st != HAL_OK)
+	      {
+	          /* Не нули, а NAN. Ноль градусов в теплице — совершенно правдоподобное
+	           * значение, и отказ датчика выглядел в архиве как настоящий заморозок;
+	           * ровно на этом однажды уже обожглись с DS18B20. NAN спутать не с чем,
+	           * и почва рядом помечается им же. */
+	          aht.temperature = NAN;
+	          aht.humidity    = NAN;
+	      }
+
+	      if (!DS18B20_ReadTemp(GPIOA, GPIO_PIN_8, &soil_temp))
+	          soil_temp = NAN; // датчик не ответил или CRC не сошёлся
+	      ds_err = (uint8_t)DS18B20_LastError();   /* почему 1-Wire не ответил */
+
+	      soil_hum = Soil_ReadMoisture();
 	  }
-	  MX_I2C1_Init();
 
-	  /* Ждём, пока AHT20 реально начнёт подтверждать свой адрес на шине, вместо
-	   * слепой фиксированной паузы: время выхода на режим зависит от температуры
-	   * и от того, насколько успел разрядиться его питающий конденсатор. */
-	  for (uint16_t i = 0; i < 80; i++)   /* до ~2 секунд ожидания */
-	  {
-	      if (HAL_I2C_IsDeviceReady(&hi2c1, AHT20_ADDR, 1, 10) == HAL_OK)
-	          break;
-	      HAL_Delay(25);
-	  }
-
-	  /* AHT20 теряет калибровку при каждом отключении питания — обязательно
-	   * заново инициализировать после каждого включения PA0, иначе показания мусорные. */
-	  HAL_StatusTypeDef aht_init_st = AHT20_Init(&hi2c1);
-
-	  /* Если датчик не откалибровался, читать его бессмысленно: транзакции
-	   * пройдут успешно, а в кадре будут нули. Раньше чтение выполнялось
-	   * независимо от исхода инициализации, и такой кадр однажды разобрался
-	   * в -50.00 °C и ушёл в архив как настоящее измерение. */
-	  AHT20_Data aht;
-	  HAL_StatusTypeDef aht_read_st = (aht_init_st == HAL_OK)
-	                               ? AHT20_ReadData(&hi2c1, &aht)
-	                               : HAL_ERROR;
-	  if (aht_read_st != HAL_OK)
-	  {
-	      /* Не нули, а NAN. Ноль градусов в теплице — совершенно правдоподобное
-	       * значение, и отказ датчика выглядел в архиве как настоящий заморозок;
-	       * ровно на этом однажды уже обожглись с DS18B20. NAN спутать не с чем,
-	       * и почва рядом помечается им же. */
-	      aht.temperature = NAN;
-	      aht.humidity    = NAN;
-	  }
-
-	  float soil_temp;
-	  	  if (!DS18B20_ReadTemp(GPIOA, GPIO_PIN_8, &soil_temp))
-	  	      soil_temp = NAN; // датчик не ответил или CRC не сошёлся
-	  uint8_t ds_err = (uint8_t)DS18B20_LastError();   /* почему 1-Wire не ответил */
-
-	  float soil_hum  = Soil_ReadMoisture();
+	  Policy_QuarantineUpdate(&sens_quarantine, sens_powered,
+	                          (aht_read_st != HAL_OK) && isnan(soil_temp),
+	                          SENSOR_QUARANTINE_CYCLES);
 
 	  Battery_Data bat;
 	  Battery_Read(&bat);

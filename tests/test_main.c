@@ -408,6 +408,49 @@ static void test_watchdog_policy(void)
         "код вне диапазона — не код");
 }
 
+/* Прогон одного цикла карантина так, как это делает main.c. */
+static uint8_t quarantine_cycle(Policy_Quarantine *q, uint8_t rail_dead, uint32_t skip)
+{
+    uint8_t powered = Policy_SensorsPowerAllowed(q);
+    Policy_QuarantineUpdate(q, powered, powered && rail_dead, skip);
+    return powered;
+}
+
+static void test_quarantine_policy(void)
+{
+    const uint32_t SKIP = 6U;   /* 6 часов при часовом интервале */
+    Policy_Quarantine q = {0};
+
+    puts("Карантин питания датчиков");
+
+    equ(quarantine_cycle(&q, 1, SKIP), 1, "1-й отказ — питание подаём");
+    equ(quarantine_cycle(&q, 1, SKIP), 1, "2-й отказ — подаём");
+    equ(quarantine_cycle(&q, 1, SKIP), 1, "3-й отказ — подаём, но это последний");
+
+    /* Дальше SKIP циклов без питания — и ровно SKIP, не больше и не меньше. */
+    unsigned off = 0;
+    while (!Policy_SensorsPowerAllowed(&q) && off < 100U) { quarantine_cycle(&q, 1, SKIP); off++; }
+    equ(off, SKIP, "карантин длится ровно SKIP циклов");
+
+    /* Пробная попытка не удалась — сразу обратно в карантин, без двух
+     * лишних циклов на полном токе. */
+    equ(quarantine_cycle(&q, 1, SKIP), 1, "после карантина — одна попытка");
+    equ(Policy_SensorsPowerAllowed(&q), 0, "попытка не удалась — снова карантин");
+
+    /* Отработали карантин, попытка удалась — всё по-старому: следующий
+     * одиночный отказ карантина не вызывает. */
+    for (unsigned i = 0; i < SKIP; i++) quarantine_cycle(&q, 1, SKIP);
+    equ(quarantine_cycle(&q, 0, SKIP), 1, "рельса ожила — питание есть");
+    equ(quarantine_cycle(&q, 1, SKIP), 1, "одиночный отказ после выздоровления — питание есть");
+    equ(Policy_SensorsPowerAllowed(&q), 1, "одиночный отказ карантина не включает");
+
+    /* Отказы не подряд — не карантин. */
+    Policy_Quarantine r = {0};
+    for (unsigned i = 0; i < 20U; i++)
+        quarantine_cycle(&r, (i % 3U) != 2U, SKIP);   /* два отказа, успех, два отказа… */
+    equ(Policy_SensorsPowerAllowed(&r), 1, "два отказа и успех вперемешку — карантина нет");
+}
+
 /* ----------------------------------------------------------------- AHT20 */
 
 /* Кадры AHT20: статус, пять байт данных, CRC-8 (полином 0x31, начало 0xFF).
@@ -785,6 +828,7 @@ int main(void)
     test_sleep_policy();
     test_usb_policy();
     test_watchdog_policy();
+    test_quarantine_policy();
     test_storage_policy();
     test_mbr_restore();
 
