@@ -44,7 +44,14 @@ static void RTC_StartClockSource(void)
   osc.OscillatorType = RCC_OSCILLATORTYPE_LSE;
   osc.LSEState = RCC_LSE_ON;
   osc.PLL.PLLState = RCC_PLL_NONE;
-  if (HAL_RCC_OscConfig(&osc) == HAL_OK)
+  /* Ожидание LSE — до 10 с, а при переходе LSI → LSE HAL после сброса
+   * backup-домена ждёт его ещё раз столько же: вместе это у самого края
+   * худшего периода сторожа (~22 с). Пинок между ожиданиями — напрямую,
+   * как в обработчиках сбоев. */
+  IWDG->KR = 0x0000AAAAU;
+  HAL_StatusTypeDef st = HAL_RCC_OscConfig(&osc);
+  IWDG->KR = 0x0000AAAAU;
+  if (st == HAL_OK)
   {
     rtc_lse_ok = 1;
     return;

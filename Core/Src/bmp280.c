@@ -45,7 +45,7 @@ HAL_StatusTypeDef BMP280_Init(I2C_HandleTypeDef *hi2c)
     bmp_addr = 0;
     for (uint32_t i = 0; i < 2U; i++)
     {
-        if (BMP280_ReadReg(hi2c, addrs[i], BMP280_REG_ID, &id, 1) == HAL_OK && id == BMP280_CHIP_ID)
+        if (BMP280_ReadReg(hi2c, addrs[i], BMP280_REG_ID, &id, 1) == HAL_OK && Bmp280_IdOk(id))
         {
             bmp_addr = addrs[i];
             break;

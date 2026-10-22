@@ -839,6 +839,15 @@ static uint8_t all_taken(const char *name, void *ctx)
     return 1;
 }
 
+/* Том отвечает ошибкой на втором вопросе. */
+static uint8_t error_on_2(const char *name, void *ctx)
+{
+    int *calls = (int *)ctx;
+    (*calls)++;
+    if (strcmp(name, "data_2.txt") == 0) return STORAGE_NAME_ERROR;
+    return STORAGE_NAME_TAKEN;
+}
+
 static void test_archive_rename(void)
 {
     const char *H = "timestamp,air_temp,write_fails";
@@ -877,6 +886,12 @@ static void test_archive_rename(void)
     equ(Storage_PickOldArchiveName(names_taken, &u, out), 3, "1 и 2 заняты — data_3 (дыра раньше 4)");
     ok(strcmp(out, "data_3.txt") == 0, "имя data_3.txt");
 
+    /* Ошибка тома — перебор прекращается сразу, а не 999 медленных f_stat. */
+    int calls = 0;
+    equ(Storage_PickOldArchiveName(error_on_2, &calls, out), 0, "ошибка тома — имени нет");
+    equ((unsigned)calls, 2, "после ошибки больше не спрашиваем");
+    ok(out[0] == '\0', "после ошибки имя пустое");
+
     Storage_OldArchiveName(999, out);
     ok(strcmp(out, "data_999.txt") == 0 && strlen(out) == 12, "data_999.txt — ещё 8.3 и влезает в 13 байт");
     Storage_OldArchiveName(10, out);
@@ -900,8 +915,14 @@ static void test_time_trust(void)
     equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NONE, 0, 1, "", B), 0, "сброс после недоверия — не верим и дальше");
 
     /* Прошивка с компьютера при живом календаре. */
-    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NEW_BUILD, 0, 0, "2027-01-01 00:00:00", B), 1,
-        "новая сборка, календарь жив — верим");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NEW_BUILD, 0, 1, "2026-10-21 09:00:00", B), 1,
+        "новая сборка, календарь жив, архив раньше сборки — верим");
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NEW_BUILD, 0, 0, "", B), 1,
+        "новая сборка, архив не прочитан — верим (календарь жив)");
+    /* Инкрементальная сборка со старым time_service.o: «новая» по отпечатку,
+     * а время сборки — месяцы назад. Архив уже ушёл дальше — не верим. */
+    equ(Policy_TimeTrusted(POLICY_TIME_SYNC_NEW_BUILD, 1, 1, "2027-01-01 00:00:00", B), 0,
+        "новая сборка старше архива (старый .o) — не верим");
 
     /* Замена банки в поле (A6): календарь потерян, часы на времени сборки,
      * а в архиве уже месяцы строк после неё. */
@@ -958,6 +979,8 @@ static void test_bmp280(void)
     ok(!Bmp280_CalibOk(0, 0, 0), "нулевая калибровка — непригодна");
     ok(!Bmp280_CalibOk(0xFFFF, -1, -1), "стёртая калибровка (0xFF) — непригодна");
     ok(!Bmp280_CalibOk(27504, 0, -1000), "dig_T2 = 0 — непригодна");
+    ok(Bmp280_IdOk(0x58) && Bmp280_IdOk(0x60) && Bmp280_IdOk(0x56), "BMP280, BME280 и образцы — свои");
+    ok(!Bmp280_IdOk(0x00) && !Bmp280_IdOk(0xFF) && !Bmp280_IdOk(0x55), "0x00/0xFF/чужой ID — не датчик");
 
     /* Правило сверки (порог 2.0 °C — обоснование в sensor_policy.h). */
     equ(Sensor_AirCrossCheck(21.0f, 21.9f), SENSOR_XCHK_OK, "расхождение 0.9 °C — сошлись");

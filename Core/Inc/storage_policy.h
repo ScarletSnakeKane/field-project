@@ -226,10 +226,17 @@ static inline uint8_t Storage_HeaderAction(uint8_t read_ok, const char *line,
 
 /* Имя для старого архива: data_N.txt с первым свободным N от 1. Имена 8.3 —
  * FatFs собран без длинных имён, поэтому N не больше 999. taken(name, ctx)
- * — занято ли имя (в прошивке — f_stat; любая ошибка, кроме «нет файла»,
- * считается «занято», чтобы ничего не затереть). Возвращает N, а имя
+ * — занято ли имя (в прошивке — f_stat; ошибка тома — STORAGE_NAME_ERROR:
+ * ничего не переименовываем и ничего не затираем). Возвращает N, а имя
  * кладёт в out (13 байт); 0 — свободных имён нет, out пуст. */
 #define STORAGE_OLD_ARCHIVE_MAX  999U
+
+/* Ответ taken: 0 — имя свободно, 1 — занято, 2 — том не ответил: перебор
+ * прекращается (на сбоящей флеш каждый f_stat ждёт секундами, и 999 таких
+ * вызовов без пинка сторожа кончились бы сбросом на каждом старте). */
+#define STORAGE_NAME_FREE   0U
+#define STORAGE_NAME_TAKEN  1U
+#define STORAGE_NAME_ERROR  2U
 
 typedef uint8_t (*Storage_NameTaken)(const char *name, void *ctx);
 
@@ -250,8 +257,11 @@ static inline uint32_t Storage_PickOldArchiveName(Storage_NameTaken taken, void 
     for (uint32_t n = 1; n <= STORAGE_OLD_ARCHIVE_MAX; n++)
     {
         Storage_OldArchiveName(n, out);
-        if (!taken(out, ctx))
+        uint8_t t = taken(out, ctx);
+        if (t == STORAGE_NAME_FREE)
             return n;
+        if (t != STORAGE_NAME_TAKEN)
+            break;
     }
     out[0] = '\0';
     return 0;
