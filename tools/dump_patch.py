@@ -1,60 +1,58 @@
 # -*- coding: utf-8 -*-
-"""Временная правка main.c для снятия архива и живых напряжений через отладчик.
+"""Временная правка main.c: снять сырой образ журнала и живые напряжения по SWD.
 
-Плата отдаёт данные наружу только как USB-накопитель, то есть нужен физически
-воткнутый в компьютер кабель. Когда его нет (например, разработка идёт по
-одному лишь ST-Link), архив забирается так: прошивается сборка с этой правкой,
-она читает файл в ОЗУ и останавливается, а содержимое ОЗУ вычитывается по SWD.
+Обычный путь снять архив — USB самой платы: том FIELDSENSOR отдаёт data.txt
+целиком (read_data.sh без ключей просто копирует его). Дампер нужен, когда
+USB нет или он не поднимается, для диагностики самой флеш и для --wipe.
 
-Заодно снимаются сырые показания, которых в CSV нет: напряжение датчика
-влажности почвы до пересчёта в проценты, напряжение банки и реальное VDD.
-Сырое напряжение почвы снималось потому, что в CSV его не было: пересчёт
-прижимает результат к нулю, и «датчик в сухом воздухе» выглядит там ровно так
-же, как «датчик оторван». Теперь сырые отсчёты есть и в CSV (soil_raw,
-bat_raw, vdd), а здесь остаются живым замером в момент снятия.
-
-Сырой образ флеш. Если том не смонтирован (fs_ok = 0) — или нужен образ
-целиком, — архив через FatFs не прочитать. После обычного дампа дампер не
-просто стоит, а отдаёт флеш кусками по 32 КБ в тот же буфер, без FatFs:
-хост пишет в dump_info.raw_req номер куска + 1, дампер читает его
-SPI_Flash_Read, считает хеш и выставляет raw_done = raw_req. Слова raw_*
-идут после прежних тринадцати — read_data.sh, читающий 13 слов, их не видит
-и работает как раньше. Куски на диске собирает unpack_dump.py --raw.
+Архив на флеш — кольцевой журнал двоичных записей (Core/Inc/log_ring.h),
+файловой системы там больше нет. Дампер встаёт перед открытием журнала в
+main(), то есть до всего, что могло бы писать во флеш (импорт старого тома,
+стирание запасного сектора), и дальше по main() не идёт: флеш снимается
+такой, какой её оставила рабочая прошивка. Он
+  1. считает FNV-1a по всей флеш (flash_hash, hash_ok) — хост сверит с ним
+     собранный образ целиком;
+  2. только в проходе --wipe: стирает всю флеш, если её размер и хеш
+     совпали с образом, сохранённым на хосте (см. ниже);
+  3. снимает живые напряжения почвы и банки (в CSV их нет в момент снятия);
+  4. ставит magic и отдаёт флеш кусками по 32 КБ по запросу хоста, пиная
+     сторожа (dump_serve_raw). Куски на диске собирает unpack_dump.py --raw,
+     CSV из образа — tools/log_image.py.
 
 Всё поле кладётся в одну структуру: раскладку отдельных переменных по .bss
-линкерволен менять, а у структуры смещения фиксированы, и читать её по SWD
-можно одним запросом.
+линкер волен менять, а у структуры смещения фиксированы, и читать её по SWD
+можно одним запросом. Слова dump_info_t (по 4 байта, номер — смещение / 4):
+    0 magic 0xD00DFEED   1 raw_total   2 soil_mv   3 bat_mv   4 vdd_mv
+    5 bat_pct   6 flash_hash   7 hash_ok   8 wipe   9 raw_req (0x24)
+    10 raw_done (0x28)   11 raw_off   12 raw_len   13 raw_hash
 
 Правка НЕ предназначена для коммита — её накладывает и откатывает read_data.sh.
 
-    python tools/dump_patch.py                       только читает архив
-    python tools/dump_patch.py --wipe <размер> <хеш> второй проход очистки
+    python tools/dump_patch.py                       только снимает
+    python tools/dump_patch.py --wipe <размер> <хеш> второй проход: стереть
     python tools/dump_patch.py --revert [файл]       убрать вставку из main.c
                                                      (или из его копии)
 
-Сырой образ (после того как дамп выполнился, magic = 0xD00DFEED), кусок N
-(0..63). Все команды программатора — с «-c port=SWD mode=HOTPLUG»: режим
-по умолчанию сбрасывает плату, дампер стартует заново, и запрос пропадает.
-    -w32 <адрес dump_info + 0x34> N+1     запросить кусок
-    -r32 <адрес dump_info> 76             ждать raw_done == N+1; raw_off, raw_len, raw_hash
+Кусок N (0..), вручную. Все команды программатора — с «-c port=SWD
+mode=HOTPLUG»: режим по умолчанию сбрасывает плату, дампер стартует заново,
+и запрос пропадает.
+    -w32 <адрес dump_info + 0x24> N+1     запросить кусок
+    -r32 <адрес dump_info> 56             ждать raw_done == N+1; raw_off, raw_len, raw_hash
     -r <адрес dump_buf> <raw_len> <файл>  забрать байты
     python tools/unpack_dump.py --raw <файл> build/flash.img <raw_off> <raw_hash>
+    python tools/log_image.py build/flash.img build/data.txt build/data_old.txt
 Слова -r32 печатает шестнадцатеричными без 0x — unpack_dump.py --raw так их
 и принимает. raw_len = 0 — кусок за краем или чтение не удалось. Повторная
 запись того же N+1 ничего не делает: чтобы перечитать кусок, сначала
-запросить другой. Учёт снятых кусков — на хосте: пропущенный кусок остаётся
-в образе нулями (или дырой), а не 0xFF.
-Архив из образа: раздел начинается с LBA 63 (смещение 32256), а BPB заявляет
-4 МБ при 2 МБ образа — mtools надо пустить без проверки размера:
-    MTOOLS_SKIP_CHECK=1 mcopy -i build/flash.img@@32256 ::data.txt build/
-read_data.sh этот путь сам не проходит (он в конце перешивает рабочую
-прошивку) — снимать вручную: dump_patch.py, сборка, прошивка, и обязательно
---revert до любого коммита.
+записать 0 в raw_done (+0x28). read_data.sh --swd проходит всё это сам.
 
-Очистка — всегда второй, отдельный проход. Первый только читает; хост
-сохраняет файл на диск и сверяет его с тем, что было на флеш. Второй дампер
-перечитывает файл заново и удаляет его, только если размер и хеш совпали с
-сохранённым на хосте, — то есть удаляется ровно то, что уже лежит на диске.
+Стирание — всегда второй, отдельный проход. Первый только читает; хост
+собирает образ, сверяет его с flash_hash, разбирает журнал без ошибок и
+кладёт несменяемую копию. Второй дампер заново считает хеш всей флеш и
+стирает её, только если размер и хеш совпали с переданными с хоста, — то
+есть стирается ровно то, что уже лежит на диске. Каждый сектор проверяется
+чтением после стирания. Рабочая прошивка на стёртой флеш начинает журнал с
+нуля.
 """
 import io
 import re
@@ -63,7 +61,9 @@ import sys
 PATH = "Core/Src/main.c"
 
 DECL_ANCHOR = "static uint32_t write_fails = 0;"
-DUMP_ANCHOR = "  // 2b) Архив начинается заново в двух случаях:"
+# Строка открытия журнала при старте: дампер встаёт перед ней (вставка —
+# с начала этой строки). Ищется по коду, а не по комментарию.
+DUMP_ANCHOR_RE = r"^[ \t]*fs_ok = Archive_Open\(boot_power_ok\);"
 
 BEGIN = "/* ==== ВРЕМЕННЫЙ ДАМПЕР (tools/dump_patch.py) — НЕ КОММИТИТЬ ===="
 END = "/* ==== КОНЕЦ ВРЕМЕННОГО ДАМПЕРА ==== */"
@@ -73,45 +73,96 @@ DECL = """
 
 """ + BEGIN + """ */
 #define DUMP_MAX    32768U
-#define DUMP_WIN    1024U    /* размер одного окна при разреженном снятии */
 
-/* Коды status: младший байт — где сломалось, следующий — FRESULT. */
-#define DUMP_ST_OK       0U
-#define DUMP_ST_NO_FS    1U  /* том не смонтирован */
-#define DUMP_ST_OPEN     2U  /* f_open не открыл файл (FR_NO_FILE = 4 — файла нет) */
-#define DUMP_ST_READ     3U  /* f_read вернул ошибку */
-#define DUMP_ST_SEEK     4U  /* f_lseek вернул ошибку */
-
-/* Коды wipe. */
-#define DUMP_WIPE_NONE    0U /* очистку не просили */
-#define DUMP_WIPE_DONE    1U /* файл удалён */
-#define DUMP_WIPE_REFUSED 2U /* файл не совпал с сохранённым на хосте — не тронут */
-#define DUMP_WIPE_FAILED  3U /* f_unlink вернул ошибку (код в старшем байте) */
+/* Коды wipe: младший байт — итог, следующие — сколько секторов не стёрлось. */
+#define DUMP_WIPE_NONE    0U /* стирание не просили */
+#define DUMP_WIPE_DONE    1U /* вся флеш стёрта и проверена чтением */
+#define DUMP_WIPE_REFUSED 2U /* флеш не та, что сохранена на хосте, — не тронута */
+#define DUMP_WIPE_FAILED  3U /* защита не снялась или секторы не стёрлись */
+#define DUMP_WIPE_NOREAD  4U /* флеш не прочиталась при сверке — не тронута */
 
 typedef struct {
     uint32_t magic;      /* 0xD00DFEED — дамп действительно выполнился */
-    uint32_t fsize;      /* размер data.txt на флеш */
-    uint32_t len;        /* сколько байт реально снято в буфер */
-    uint32_t win_bytes;  /* размер окна; 0 — файл снят целиком, подряд */
-    uint32_t win_count;  /* сколько окон лежит в буфере подряд */
-    uint32_t win_step;   /* шаг между началами окон в файле */
+    uint32_t raw_total;  /* размер флеш, байт */
     uint32_t soil_mv;    /* напряжение датчика почвы ДО пересчёта, мВ */
     uint32_t bat_mv;     /* напряжение банки, мВ */
     uint32_t vdd_mv;     /* реальное VDD через VREFINT, мВ */
     uint32_t bat_pct;    /* заряд по кривой, % */
-    uint32_t status;     /* DUMP_ST_*: почему снято 0 байт — нет тома, файла или чтения */
-    uint32_t hash;       /* FNV-1a по len байтам буфера: хост сверяет, что прочёл то же */
+    uint32_t flash_hash; /* FNV-1a по всей флеш */
+    uint32_t hash_ok;    /* 1 — вся флеш прочиталась при подсчёте хеша */
     uint32_t wipe;       /* DUMP_WIPE_* */
-    /* Сырой образ флеш, слова 13..18 (смещения 0x34..0x48). */
     uint32_t raw_req;    /* хост: номер куска + 1 (0 — ничего не надо) */
-    uint32_t raw_done;   /* дампер: какой запрос выполнен */
+    uint32_t raw_done;   /* дампер: какой запрос выполнен; хост пишет 0, чтобы повторить */
     uint32_t raw_off;    /* смещение куска на флеш */
     uint32_t raw_len;    /* сколько байт куска в буфере; 0 — за краем или отказ */
     uint32_t raw_hash;   /* FNV-1a по raw_len байтам буфера */
-    uint32_t raw_total;  /* размер флеш, байт */
 } dump_info_t;
 static volatile dump_info_t dump_info;
 static uint8_t dump_buf[DUMP_MAX];
+
+static uint32_t dump_fnv(uint32_t h, const uint8_t *p, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++)
+    {
+        h ^= p[i];
+        h *= 16777619U;
+    }
+    return h;
+}
+
+/* Хеш всей флеш порциями по 4 КБ: у одной транзакции SPI таймаут 100 мс
+ * на всю длину, а мегабайты побайтовым опросом идут секунды. Между
+ * порциями — пинок сторожу (запущен с первой строки main, ~22–32 с). */
+static void dump_hash_flash(void)
+{
+    uint32_t h = 2166136261U;
+    dump_info.hash_ok = 0;
+    for (uint32_t off = 0; off < (uint32_t)FLASH_SIZE_BYTES; off += 4096U)
+    {
+        IWDG->KR = 0x0000AAAAU;
+        if (!SPI_Flash_Read(off, dump_buf, 4096U))
+            return;
+        h = dump_fnv(h, dump_buf, 4096U);
+    }
+    dump_info.flash_hash = h;
+    dump_info.hash_ok = 1;
+}
+
+/* Стереть всю флеш и проверить чтением каждый сектор: запертая SST26
+ * отвечает на стирание «успехом», ничего не стерев (T2 отчёта П5а). */
+static void dump_wipe(uint32_t size, uint32_t hash)
+{
+    if (!dump_info.hash_ok)
+    {
+        dump_info.wipe = DUMP_WIPE_NOREAD;
+        return;
+    }
+    if (dump_info.raw_total != size || dump_info.flash_hash != hash)
+    {
+        dump_info.wipe = DUMP_WIPE_REFUSED;
+        return;
+    }
+    if (!SPI_Flash_Unlock())
+    {
+        dump_info.wipe = DUMP_WIPE_FAILED;
+        return;
+    }
+    uint32_t bad = 0;
+    for (uint32_t off = 0; off < (uint32_t)FLASH_SIZE_BYTES; off += 4096U)
+    {
+        IWDG->KR = 0x0000AAAAU;
+        uint8_t ok = SPI_Flash_EraseSector(off);   /* у SST26 до 25 мс */
+        IWDG->KR = 0x0000AAAAU;
+        if (ok)
+            ok = SPI_Flash_Read(off, dump_buf, 4096U);
+        for (uint32_t i = 0; ok && i < 4096U; i++)
+            if (dump_buf[i] != 0xFFU)
+                ok = 0;
+        if (!ok)
+            bad++;
+    }
+    dump_info.wipe = bad ? (DUMP_WIPE_FAILED | (bad << 8)) : DUMP_WIPE_DONE;
+}
 
 /* Один запрос сырого куска. Отдельной функцией — её зовёт и самопроверка
  * (tools/test_tools.py) без вечного цикла. */
@@ -128,9 +179,6 @@ static void dump_raw_step(void)
         n = (uint32_t)FLASH_SIZE_BYTES - off;
         if (n > DUMP_MAX)
             n = DUMP_MAX;
-        /* Порциями по 4 КБ: у одной транзакции SPI таймаут 100 мс на всю
-         * длину, а 32 КБ побайтовым опросом на HSI 16 МГц — того же порядка.
-         * Между порциями — пинок сторожу. */
         for (uint32_t done = 0; done < n; done += 4096U)
         {
             uint32_t part = (n - done > 4096U) ? 4096U : n - done;
@@ -143,25 +191,17 @@ static void dump_raw_step(void)
         }
     }
 
-    uint32_t h = 2166136261U;
-    for (uint32_t i = 0; i < n; i++)
-    {
-        h ^= dump_buf[i];
-        h *= 16777619U;
-    }
     dump_info.raw_off  = off;
     dump_info.raw_len  = n;
-    dump_info.raw_hash = h;
+    dump_info.raw_hash = dump_fnv(2166136261U, dump_buf, n);
     dump_info.raw_done = req;   /* последним: по нему хост понимает, что готово */
 }
 
 /* Дальше по main() не идём и в STOP не уходим: пока ядро крутится здесь,
- * SWD остаётся живым и дамп читается без гонки с циклом сна. Сторож IWDG
- * запущен с первой строки main() и остановить его нельзя — кормим, иначе
- * через ~30 с плата перезагрузилась бы посреди снятия. */
+ * SWD остаётся живым и образ читается без гонки с циклом сна, а журнал не
+ * открывается и ничего во флеш не пишет. Сторож кормится в цикле. */
 static void dump_serve_raw(void)
 {
-    dump_info.raw_total = (uint32_t)FLASH_SIZE_BYTES;
     for (;;)
     {
         IWDG->KR = 0x0000AAAAU;
@@ -171,88 +211,16 @@ static void dump_serve_raw(void)
 """ + END
 
 DUMP = "  " + BEGIN + """
-   * Стоит строго ДО блока сверки заголовка ниже: тот при несовпадении
-   * переименовывает data.txt в data_N.txt, и снят был бы уже новый файл.
-   * При fs_ok = 0 файл не читается, но сырой образ флеш отдаётся всё равно
-   * (dump_serve_raw). */
+   * Стоит строго ДО открытия журнала: оно на первом старте переносит старый
+   * том (пишет), а первая запись стирает запасной сектор. Снимается флеш
+   * такой, какой её оставила рабочая прошивка. */
   {
-      FIL df;
-      FRESULT dr;
-      if (!fs_ok)
-      {
-          dump_info.status = DUMP_ST_NO_FS;
-      }
-      else if ((dr = f_open(&df, DATA_FILE, FA_READ)) != FR_OK)
-      {
-          dump_info.status = DUMP_ST_OPEN | ((uint32_t)dr << 8);
-      }
-      else
-      {
-          UINT br = 0;
-          uint32_t fsize = (uint32_t)f_size(&df);
-          dump_info.fsize = fsize;
-
-          if (fsize <= DUMP_MAX)
-          {
-              /* Влезает целиком — снимаем подряд, без потерь. */
-              dr = f_read(&df, dump_buf, DUMP_MAX, &br);
-              if (dr != FR_OK)
-                  dump_info.status = DUMP_ST_READ | ((uint32_t)dr << 8);
-              dump_info.len = (uint32_t)br;
-          }
-          else
-          {
-              /* Не влезает. Хвост брать нельзя: за сутки архив перерастает буфер
-               * в несколько раз, и по одному хвосту не увидеть ни тренда батареи,
-               * ни того, что происходило ночью. Поэтому берём окна, равномерно
-               * разложенные по всей длине файла: каждое — десяток целых строк,
-               * а вместе они покрывают весь период. Первое окно начинается с
-               * нуля, так что заголовок всегда на месте. */
-              const uint32_t count = DUMP_MAX / DUMP_WIN;
-              const uint32_t step  = (fsize - DUMP_WIN) / (count - 1);
-              uint32_t got = 0;
-
-              for (uint32_t i = 0; i < count; i++)
-              {
-                  UINT part = 0;
-                  if ((dr = f_lseek(&df, i * step)) != FR_OK)
-                  {
-                      dump_info.status = DUMP_ST_SEEK | ((uint32_t)dr << 8);
-                      break;
-                  }
-                  if ((dr = f_read(&df, dump_buf + got, DUMP_WIN, &part)) != FR_OK)
-                  {
-                      dump_info.status = DUMP_ST_READ | ((uint32_t)dr << 8);
-                      break;
-                  }
-                  got += part;
-                  if (part < DUMP_WIN)
-                      break;
-              }
-
-              dump_info.len       = got;
-              dump_info.win_bytes = DUMP_WIN;
-              dump_info.win_count = count;
-              dump_info.win_step  = step;
-              br = got;
-          }
-          f_close(&df);
-      }
-
-      {
-          uint32_t h = 2166136261U;
-          for (uint32_t i = 0; i < dump_info.len; i++)
-          {
-              h ^= dump_buf[i];
-              h *= 16777619U;
-          }
-          dump_info.hash = h;
-      }
-
+      dump_info.raw_total = (uint32_t)FLASH_SIZE_BYTES;
+      dump_hash_flash();
       DUMP_WIPE_HOOK
 
-      /* Питание датчиков в этой точке ещё включено (его снимает MX_GPIO_Init),
-       * но ёмкостному датчику нужно время на выход в режим. */
+      /* Питание датчиков в этой точке включено (выше по main), но
+       * ёмкостному датчику нужно время на выход в режим. */
       HAL_GPIO_WritePin(SENSOR_PWR_GPIO_Port, SENSOR_PWR_Pin, GPIO_PIN_RESET);
       HAL_Delay(SENSOR_POWERUP_DELAY_MS);
 
@@ -283,26 +251,12 @@ DUMP = "  " + BEGIN + """
 """
 
 
-# Удаляется только файл, который хост уже сохранил целиком: снят подряд (не
-# окнами), прочитан без ошибок, и размер с хешем совпали с переданными с хоста.
-# Раньше удаление стояло безусловно сразу после чтения — и стирало весь архив,
-# даже когда в буфер попали лишь окна по 1 КБ, f_read вернул ошибку или хост
-# так и не дочитал ОЗУ (D1).
-WIPE = """/* Здесь файл только исчезает: дампер ниже останавливается и до кода,
-       * создающего заголовок, не доходит. Заново файл появится при следующей
-       * загрузке рабочей прошивки — с заголовком и первым замером. */
-      if (dump_info.status == DUMP_ST_OK && dump_info.win_bytes == 0U
-          && dump_info.len == dump_info.fsize
-          && dump_info.fsize == %(size)uU && dump_info.hash == 0x%(hash)08XU)
-      {
-          FRESULT ur = f_unlink(DATA_FILE);
-          dump_info.wipe = (ur == FR_OK) ? DUMP_WIPE_DONE
-                                         : (DUMP_WIPE_FAILED | ((uint32_t)ur << 8));
-      }
-      else
-      {
-          dump_info.wipe = DUMP_WIPE_REFUSED;
-      }"""
+# Стирается только флеш, образ которой хост уже сохранил целиком: дампер
+# второго прохода сам пересчитывает хеш всей флеш и сверяет его и размер с
+# вписанными сюда значениями сохранённого образа (D1 в новом виде: раньше
+# так же сверялся файл перед f_unlink).
+WIPE = """/* Стереть, только если флеш — ровно сохранённый на хосте образ. */
+      dump_wipe(%(size)uU, 0x%(hash)08XU);"""
 
 
 def read_src(path=PATH):
@@ -346,7 +300,7 @@ def main():
     wipe = None
     if args[:1] == ["--wipe"]:
         if len(args) != 3:
-            sys.exit("--wipe требует размер и хеш сохранённого на хосте файла")
+            sys.exit("--wipe требует размер и хеш сохранённого на хосте образа")
         wipe = {"size": int(args[1]), "hash": int(args[2], 0)}
     elif args:
         sys.exit("неизвестные аргументы: %s" % " ".join(args))
@@ -354,18 +308,23 @@ def main():
     s = read_src()
     if "dump_info" in s:
         sys.exit("main.c уже пропатчен — сначала откатите правку")
-    for a in (DECL_ANCHOR, DUMP_ANCHOR):
-        if s.count(a) != 1:
-            sys.exit("не найден якорь: %s" % a)
+    if s.count(DECL_ANCHOR) != 1:
+        sys.exit("не найден якорь: %s" % DECL_ANCHOR)
+    spots = list(re.finditer(DUMP_ANCHOR_RE, s, re.M))
+    if len(spots) != 1:
+        sys.exit("не найден якорь (или найден не один): %s" % DUMP_ANCHOR_RE)
+    at = spots[0].start()
 
-    hook = WIPE % wipe if wipe else ""
+    # Без --wipe функция стирания не вызывается, но упоминается: иначе сборка
+    # с -Wall предупреждает о неиспользуемой static-функции.
+    hook = WIPE % wipe if wipe else "(void)dump_wipe;   /* стирание не просили */"
     nl = eol_of(s)
     decl = DECL.replace("\n", nl)
     dump = DUMP.replace("DUMP_WIPE_HOOK", hook).replace("\n", nl)
+    s = s[:at] + dump + s[at:]
     s = s.replace(DECL_ANCHOR, DECL_ANCHOR + decl, 1)
-    s = s.replace(DUMP_ANCHOR, dump + DUMP_ANCHOR, 1)
     write_src(s)
-    print("дампер вставлен" + (" (очистка, если файл совпадёт с сохранённым)" if wipe else ""))
+    print("дампер вставлен" + (" (стирание, если флеш совпадёт с сохранённым образом)" if wipe else ""))
 
 
 if __name__ == "__main__":
