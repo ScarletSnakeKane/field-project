@@ -116,6 +116,39 @@ class PatchEol(unittest.TestCase):
             t.close()
 
 
+@unittest.skipUnless(GCC and os.path.isdir(os.path.join(ROOT, "Drivers")),
+                     "нет gcc или исходников HAL — компиляция вставки в main.c пропущена")
+class PatchCompiles(unittest.TestCase):
+    """Вставка дампера встаёт в текущий main.c и компилируется с настоящими
+    заголовками HAL/FatFs — теми же флагами, что tools/syncheck.sh (П4: якоря
+    и вызовы вроде dump_serve_raw уходили бы иначе незамеченными до сборки
+    у владельца)."""
+
+    def compile(self, *patch_args):
+        sync = open(os.path.join(TOOLS, "syncheck.sh"), encoding="utf-8").read()
+        inc = re.search(r'^INC="([^"]*)"', sync, re.M).group(1).split()
+        t = SrcTree("\n")
+        try:
+            self.assertEqual(t.patch(*patch_args)[0], 0)
+            p = subprocess.run([GCC, "-fsyntax-only", "-std=gnu11", "-DSTM32F401xE", "-DUSE_HAL_DRIVER",
+                                "-Wall", "-Wno-pointer-to-int-cast", "-Wno-int-to-pointer-cast",
+                                "-Wno-overflow"] + inc + [t.path],
+                               cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            err = p.stderr.decode("utf-8", "replace")
+            self.assertEqual(p.returncode, 0, err)
+            self.assertNotIn("warning", err)
+            self.assertEqual(t.patch("--revert")[0], 0)
+            self.assertEqual(t.read(), t.orig)
+        finally:
+            t.close()
+
+    def test_read_only(self):
+        self.compile()
+
+    def test_wipe(self):
+        self.compile("--wipe", "1000", "0x1234ABCD")
+
+
 # Заглушки ровно под то, что использует вставка дампера.
 STUBS = r"""
 #include <stdint.h>
@@ -148,6 +181,14 @@ static FRESULT f_read(FIL *f, void *b, UINT n, UINT *br)
 static FRESULT f_lseek(FIL *f, uint32_t p) { f->pos = p; return FR_OK; }
 static FRESULT f_close(FIL *f) { (void)f; return FR_OK; }
 static FRESULT f_unlink(const char *n) { (void)n; g_unlinked = 1; g_exists = 0; return FR_OK; }
+/* Сырой образ: флеш нарочно не кратна куску, чтобы проверить хвост. */
+#define FLASH_SIZE_BYTES 40000
+static uint8_t g_flash[FLASH_SIZE_BYTES];
+static int g_flash_fail = 0;
+static uint8_t SPI_Flash_Read(uint32_t a, uint8_t *b, uint32_t n)
+{ if (g_flash_fail) return 0; memcpy(b, g_flash + a, n); return 1; }
+static struct { volatile uint32_t KR; } g_iwdg;
+#define IWDG (&g_iwdg)
 #define HAL_GPIO_WritePin(a, b, c) ((void)0)
 #define HAL_Delay(x) ((void)0)
 #define SENSOR_POWERUP_DELAY_MS 0
@@ -173,10 +214,25 @@ int main(int argc, char **argv)
     g_fail_full = atoi(argv[5]);
     g_bat_valid = atoi(argv[6]);
     for (uint32_t i = 0; i < g_size; i++) g_file[i] = (uint8_t)('a' + i % 26);
+    for (uint32_t i = 0; i < FLASH_SIZE_BYTES; i++) g_flash[i] = (uint8_t)(i * 7 + 3);
     run_dump();
     printf("%u %u %u %u %u %d %u %u %u\n", (unsigned)dump_info.len, (unsigned)dump_info.win_bytes,
            (unsigned)dump_info.status, (unsigned)dump_info.hash, (unsigned)dump_info.wipe, g_unlinked,
            (unsigned)dump_info.bat_mv, (unsigned)dump_info.vdd_mv, (unsigned)dump_info.bat_pct);
+    /* Дальше — запросы сырых кусков, как их шлёт хост: "N" или "!N" (чтение
+     * флеш откажет). Шаг без нового запроса не должен ничего менять. */
+    for (int i = 7; i < argc; i++)
+    {
+        g_flash_fail = (argv[i][0] == '!');
+        dump_info.raw_req = (uint32_t)atoi(argv[i] + g_flash_fail);
+        dump_raw_step();
+        uint32_t len = dump_info.raw_len;
+        dump_info.raw_len = 0xDEADU;
+        dump_raw_step();   /* повтор того же запроса — ничего не трогает */
+        int untouched = (dump_info.raw_len == 0xDEADU);
+        printf("R %u %u %u %u %d\n", (unsigned)dump_info.raw_off, (unsigned)len,
+               (unsigned)dump_info.raw_hash, (unsigned)dump_info.raw_done, untouched);
+    }
     return 0;
 }
 """
@@ -208,7 +264,9 @@ class DumperWipe(unittest.TestCase):
         blocks = re.findall(re.escape(dump_patch.BEGIN) + r".*?" + re.escape(dump_patch.END), s, re.S)
         self.assertEqual(len(blocks), 2)
         decl, dump = blocks
-        dump = dump.replace("while (1) { __NOP(); }", "return;")
+        self.assertIn("dump_serve_raw();", dump)
+        # Вечный цикл раздачи сырых кусков проверяется по шагам (dump_raw_step).
+        dump = dump.replace("dump_serve_raw();", "if (0) { dump_serve_raw(); }\n      return;")
         src = STUBS + decl + "\nstatic void run_dump(void)\n{\n  " + dump + "\n}\n" + MAIN
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
@@ -221,7 +279,7 @@ class DumperWipe(unittest.TestCase):
     def run_exe(self, exe, size, exists=1, fs=1, read_fail=-1, fail_full=0, bat=1):
         out = subprocess.check_output([exe, str(size), str(exists), str(fs),
                                        str(read_fail), str(fail_full), str(bat)])
-        ln, win, st, h, wipe, unlinked, bmv, vmv, pct = map(int, out.split())
+        ln, win, st, h, wipe, unlinked, bmv, vmv, pct = map(int, out.split()[:9])
         return dict(len=ln, win=win, status=st, hash=h, wipe=wipe, unlinked=unlinked,
                     bat=(bmv, vmv, pct))
 
@@ -279,6 +337,52 @@ class DumperWipe(unittest.TestCase):
         exe = self.build()
         self.assertEqual(self.run_exe(exe, 1000, fs=0)["status"], 1)
         self.assertEqual(self.run_exe(exe, 1000, exists=0)["status"], 2 | (4 << 8))
+
+    def raw(self, exe, *reqs, fs=0):
+        out = subprocess.check_output([exe, "1000", "1", str(fs), "-1", "0", "1"] + list(reqs))
+        return [tuple(map(int, l.split()[1:])) for l in out.decode().splitlines() if l.startswith("R ")]
+
+    def test_raw_image_when_not_mounted(self):
+        # П1 R3: том не смонтирован — файл не читается, но флеш отдаётся
+        # кусками без FatFs, и из них собирается образ байт в байт.
+        exe = self.build()
+        flash = bytes((i * 7 + 3) & 0xFF for i in range(40000))
+        r = self.raw(exe, "1", "2", "3")
+        self.assertEqual(r[0], (0, 32768, fnv1a(flash[:32768]), 1, 1))
+        self.assertEqual(r[1], (32768, 40000 - 32768, fnv1a(flash[32768:]), 2, 1), "хвост флеш")
+        self.assertEqual(r[2][:2], (65536, 0), "кусок за краем — 0 байт")
+        self.assertEqual(r[2][3], 3)
+
+        # Собранный unpack_dump.py --raw образ совпадает с флеш.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        img = os.path.join(d, "flash.img")
+        for (off, ln, h, _, _), part in ((r[1], flash[32768:]), (r[0], flash[:32768])):
+            src = os.path.join(d, "part.bin")
+            spit(src, part)
+            self.assertEqual(run_tool("unpack_dump.py", "--raw", src, img, str(off), hex(h))[0], 0)
+        self.assertEqual(slurp(img), flash)
+
+        # Испорченный кусок в образ не попадает.
+        spit(os.path.join(d, "bad.bin"), b"x" * 10)
+        rc = run_tool("unpack_dump.py", "--raw", os.path.join(d, "bad.bin"), img, "0", hex(r[0][2]))[0]
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(slurp(img), flash)
+
+    def test_raw_read_failure_and_repeat(self):
+        exe = self.build()
+        r = self.raw(exe, "!1", "2", "1")
+        # Отказ чтения — 0 байт и хеш пустого куска, а не чужой буфер.
+        self.assertEqual(r[0][:4], (0, 0, fnv1a(b""), 1))
+        self.assertTrue(all(x[4] == 1 for x in r), "повтор того же запроса не перечитывает")
+        # Следующие запросы — снова честно.
+        self.assertEqual(r[2][1], 32768)
+
+    def test_dump_status_unchanged_for_read_data(self):
+        # Слова 0..12 — те, что читает read_data.sh, — при fs_ok = 0 прежние:
+        # статус 1, 0 байт; сырой образ их не трогает.
+        r = self.run_exe(self.build(), 1000, fs=0)
+        self.assertEqual((r["status"], r["len"]), (1, 0))
 
 
 class BatteryCurve(unittest.TestCase):
@@ -369,6 +473,100 @@ class DsErrCodes(unittest.TestCase):
             self.assertRegex(out, r"код 5 \([^)]*\) x2")
             self.assertIn("код 6 (85.00 °C по сбросу", out)
             self.assertIn("код 7 (вне шкалы", out)
+
+
+def main_c():
+    return io.open(os.path.join(ROOT, "Core", "Src", "main.c"), encoding="utf-8").read()
+
+
+def firmware_header():
+    m = re.search(r'#define CSV_HEADER((?:\s*"[^"]*"\s*\\?)+)', main_c())
+    return "".join(re.findall(r'"([^"]*)"', m.group(1))).split(",")
+
+
+class HeaderColumns(unittest.TestCase):
+    """Заголовок прошивки, формат строки и разбор — одно и то же (П4)."""
+
+    def test_format_matches_header(self):
+        # Число полей в snprintf строки CSV — ровно число колонок заголовка.
+        src = main_c()
+        m = re.search(r'snprintf\(line, sizeof\(line\),\s*((?:"[^"]*"\s*)+),', src)
+        self.assertTrue(m, "не нашёл snprintf строки CSV в main.c")
+        fmt = "".join(re.findall(r'"([^"]*)"', m.group(1)))
+        convs = re.findall(r"%[-+ #0]*\d*(?:\.\d+)?(?:l|ll|h)?[sdufxX]", fmt)
+        self.assertEqual(len(convs), len(firmware_header()), fmt)
+
+    def test_parser_knows_columns(self):
+        import summarize_data
+        head = set(firmware_header())
+        legacy = {"aht_i2c_err"}   # колонка старых архивов
+        for n in summarize_data.ERROR_COLS + summarize_data.FLAG_COLS + tuple(summarize_data.CODE_TEXT):
+            if n not in legacy:
+                self.assertIn(n, head, "разбор ждёт колонку, которой в прошивке нет")
+        for n in ("reset_cause", "boot_count", "time_ok", "soil_raw", "bat_raw", "vdd"):
+            self.assertIn(n, head)
+
+
+NEW_HEAD = ("timestamp,air_temp,air_hum,soil_temp,soil_hum,bat_pct,vbat,vdd,soil_valid,lse_ok,"
+            "time_ok,aht_init_st,aht_read_st,ds_err,air_xchk,i2c_rec,sens_off,write_fails,"
+            "lowpower_skips,reset_cause,boot_count,soil_raw,bat_raw")
+
+
+def new_row(ts, time_ok=1, ds_err=0, xchk=0, i2c=0, sens=0, cause=7, boot=1, air="21.00"):
+    return ("%s,%s,40.00,18.00,35.00,60,3.75,3.300,1,1,%d,0,0,%d,%d,%d,%d,0,0,%d,%d,2048,2300"
+            % (ts, air, time_ok, ds_err, xchk, i2c, sens, cause, boot))
+
+
+class NewColumns(unittest.TestCase):
+    """Разбор архива с колонками П4: недоверенные метки, коды, старты."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        self.path = os.path.join(d, "new.txt")
+        rows = [new_row("2026-10-01 %02d:00:00" % h) for h in range(10)]
+        rows[3] = new_row("2026-10-01 03:00:00", xchk=1)
+        rows[4] = new_row("2026-10-01 04:00:00", xchk=2, i2c=2)
+        # Замена банки: календарь потерян, часы встали на время сборки (раньше),
+        # прибор перезапустился от питания; метки этих строк не в счёт.
+        rows[5] = new_row("2026-09-01 00:00:00", time_ok=0, boot=1, cause=7)
+        rows[6] = new_row("2026-09-01 01:00:00", time_ok=0, boot=1, cause=7)
+        # Затем — HardFault и программный перезапуск (boot_count 2).
+        rows[7] = new_row("2026-10-01 07:00:00", boot=2, cause=8 | (1 << 8))
+        rows[8] = new_row("2026-10-01 08:00:00", boot=2, cause=8 | (1 << 8), ds_err=8, sens=5, air="nan")
+        rows[9] = new_row("2026-10-01 09:00:00", boot=2, cause=8 | (1 << 8))
+        spit(self.path, ("\r\n".join([NEW_HEAD] + rows) + "\r\n").encode())
+
+    def test_summarize(self):
+        rc, out, err = run_tool("summarize_data.py", self.path)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("меткам 2 строк не верить (time_ok = 0)", out)
+        self.assertNotIn("время шло назад", out, "откат часов по замене банки — не перепрошивка")
+        self.assertIn("time_ok == 0 в 2 строках", out)
+        self.assertIn("код 1 (AHT20 и BMP280 разошлись", out)
+        self.assertIn("код 2 (BMP280 не ответил", out)
+        self.assertIn("код 2 (шину освободило только снятие питания", out)
+        self.assertIn("код 8 (не опрашивался — карантин", out)
+        self.assertIn("sens_off != 0 в 1 строках", out)
+        self.assertIn("стартов в архиве: 2", out)
+        self.assertIn("программный, HardFault x1", out)
+        self.assertIn("питание x1", out)
+        self.assertNotIn("reset_cause ", out, "код причины — не диапазон")
+
+    def test_analyze(self):
+        rc, out, err = run_tool("analyze_run.py", self.path)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("отброшено строк с time_ok = 0", out)
+        self.assertNotIn("время шло назад", out)
+        self.assertIn("стартов: 2", out)
+        self.assertIn("код 1 (AHT20 и BMP280 разошлись", out)
+        self.assertIn("8 строк", out)
+
+    def test_old_archive_still_parsed(self):
+        # Старый архив (data_N.txt после смены заголовка) разбирается как раньше.
+        rc, out, _ = run_tool("summarize_data.py", DATA)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("стартов", out)
 
 
 class UnpackHash(unittest.TestCase):

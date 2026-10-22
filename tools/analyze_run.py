@@ -24,7 +24,8 @@ import re
 import statistics as st
 import sys
 
-# Расшифровка кодов ds_err живёт в одном месте — в summarize_data.py.
+# Расшифровка кодов (ds_err, air_xchk, i2c_rec, reset_cause) и списки
+# колонок-отказов живут в одном месте — в summarize_data.py.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import summarize_data  # noqa: E402
 
@@ -61,21 +62,27 @@ def volts_to_pct(v):
             return p0 + (p1 - p0) * (v - v0) / (v1 - v0)
     return CURVE[-1][1]
 
-ERROR_COLS = ("aht_init_st", "aht_read_st", "ds_err", "write_fails", "aht_i2c_err")
-FLAG_COLS = ("soil_valid", "lse_ok")
+ERROR_COLS = summarize_data.ERROR_COLS
+FLAG_COLS = summarize_data.FLAG_COLS
 
 
 def load(path, lo=None, hi=None):
+    """Строки окна. Строки с time_ok = 0 (часы откатились на время сборки,
+    A6) отбрасываются целиком: их метки врут, а регрессия разряда и
+    интервалы по ним дали бы чушь. Сколько отброшено — четвёртый элемент."""
     raw = open(path, "rb").read()
     text = raw.decode("ascii", "replace").replace("\r\n", "\n").replace("\r", "\n")
     lines = [l for l in text.split("\n") if l.strip()]
     head = lines[0].split(",")
     rows = [l.split(",") for l in lines[1:] if len(l.split(",")) == len(head)]
     col = {n: [r[i] for r in rows] for i, n in enumerate(head)}
-    ts = [dt.datetime.strptime(x, "%Y-%m-%d %H:%M:%S") for x in col["timestamp"]]
-    keep = [i for i in range(len(ts))
-            if (lo is None or ts[i] >= lo) and (hi is None or ts[i] <= hi)]
-    return head, {n: [col[n][i] for i in keep] for n in head}, [ts[i] for i in keep], raw
+    bad_time = summarize_data.time_untrusted(col)
+    ts = [None if i in bad_time else dt.datetime.strptime(x, "%Y-%m-%d %H:%M:%S")
+          for i, x in enumerate(col["timestamp"])]
+    keep = [i for i in range(len(ts)) if ts[i] is not None and
+            (lo is None or ts[i] >= lo) and (hi is None or ts[i] <= hi)]
+    return (head, {n: [col[n][i] for i in keep] for n in head}, [ts[i] for i in keep], raw,
+            len(bad_time))
 
 
 # Значение DS18B20 по сбросу: преобразование не выполнилось, а не 85 °C почвы.
@@ -143,7 +150,7 @@ def days_left(pct_per_hour, pct_now):
     return pct_now / -pct_per_hour / 24.0
 
 
-def ranges(head, col, nrows, skip=()):
+def ranges(head, col, nrows, skip=summarize_data.NOT_RANGES):
     """Диапазоны колонок без nan и без заведомого мусора; nan считаются отдельно."""
     for n in head:
         if n == "timestamp" or n in skip:
@@ -171,30 +178,26 @@ def ranges(head, col, nrows, skip=()):
 
 
 def report(path, lo, hi):
-    head, col, ts, raw = load(path, lo, hi)
+    head, col, ts, raw, untrusted = load(path, lo, hi)
     if not ts:
-        print("в заданном окне нет строк")
+        print("в заданном окне нет строк" + (" (с time_ok = 0 отброшено %d)" % untrusted
+                                             if untrusted else ""))
         return
     print("%s: %d строк, %s .. %s" % (path, len(ts), ts[0], ts[-1]))
+    if untrusted:
+        print("  отброшено строк с time_ok = 0 (метки часов, откатившихся на время сборки): %d"
+              % untrusted)
 
     if raw.count(b"\r") != raw.count(b"\n"):
         print("  !! CR (%d) != LF (%d) — двойной перевод строки"
               % (raw.count(b"\r"), raw.count(b"\n")))
 
-    bad = []
-    for n in ERROR_COLS:
-        if n in col:
-            k = sum(1 for v in col[n] if v.strip() not in ("0", "0x00", ""))
-            if k:
-                bad.append("%s != 0 в %d из %d" % (n, k, len(ts)))
-                if n == "ds_err":
-                    bad[-1] += " (%s)" % summarize_data.ds_err_detail(col[n])
-    for n in FLAG_COLS:
-        if n in col:
-            k = sum(1 for v in col[n] if v.strip() in ("0", ""))
-            if k:
-                bad.append("%s == 0 в %d из %d" % (n, k, len(ts)))
+    bad = summarize_data.failures(col, len(ts))
     print("  отказы: " + ("; ".join(bad) if bad else "нет"))
+    st_ = summarize_data.starts(col)
+    if st_:
+        print("  стартов: %d (%s)" % (sum(st_.values()),
+              ", ".join("%s x%d" % (t, n) for t, n in st_.most_common())))
 
     # Значения, которые физически невозможны и означают мусор, а не измерение.
     for n, lim, why in (("air_temp", -40.0, "пустой кадр AHT20 даёт -50.00"),
@@ -244,7 +247,7 @@ def compare(a, b):
     """Сравнение двух режимов на одной банке: систематика сокращается."""
     out = []
     for p in (a, b):
-        head, col, ts, _ = load(p, None, None)
+        head, col, ts, _, _ = load(p, None, None)
         hours = [(t - ts[0]).total_seconds() / 3600.0 for t in ts]
         r = regress(hours, num(col, "vbat"))
         c = charge(hours, num(col, "vbat"))
