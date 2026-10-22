@@ -20,6 +20,8 @@
 #include "soil_curve.h"
 #include "storage_policy.h"
 
+#define BTN_TEST_POLL_MS 100U   /* шаг опроса кнопки в прошивке */
+
 static int checks = 0, failures = 0;
 
 static void ok(int cond, const char *what)
@@ -263,32 +265,53 @@ static void test_soil(void)
 static void test_sleep_policy(void)
 {
     const uint32_t MAX = 300000U;   /* тот же потолок, что и в прошивке: 5 минут */
+    Policy_Button b = {0};
 
-    puts("Уход в сон");
+    puts("Уход в сон: кнопка");
 
-    equ(Policy_MayEnterSleep(0, 0, 0, MAX), 1, "ничего не держит — спим");
-
-    equ(Policy_MayEnterSleep(1, 0, 0, MAX),       0, "кнопку зажали — не спим");
-    equ(Policy_MayEnterSleep(1, 0, MAX - 1, MAX), 0, "кнопка зажата, потолок не достигнут");
+    equ(Policy_ButtonKeepsAwake(&b, 0, 0, MAX), 0, "кнопку не держат — спать можно");
+    equ(Policy_ButtonKeepsAwake(&b, 1, 0, MAX), 1, "кнопку зажали — не спим");
+    equ(Policy_ButtonKeepsAwake(&b, 1, MAX - 1, MAX), 1, "потолок не достигнут — не спим");
 
     /* Потолок нужен на случай залипшей или залитой водой кнопки: без него
      * прибор не уснул бы никогда и высадил бы батарею за несколько дней. */
-    equ(Policy_MayEnterSleep(1, 0, MAX, MAX),     1, "кнопка залипла — потолок сработал");
-    equ(Policy_MayEnterSleep(1, 0, MAX + 1, MAX), 1, "потолок перейдён — спим");
+    equ(Policy_ButtonKeepsAwake(&b, 1, 1, MAX), 0, "кнопка залипла — потолок сработал");
+    equ(b.stuck, 1, "залипание запомнено");
 
-    /* А вот на USB потолок не распространяется, и это не оговорка: пока кабель
-     * воткнут, плата питается от хоста, бодрствование батарею не расходует,
-     * а уход в STOP оборвал бы чтение и оставил хосту недочитанный файл. */
-    equ(Policy_MayEnterSleep(0, 1, 0, MAX),           0, "USB воткнут — не спим");
-    equ(Policy_MayEnterSleep(0, 1, MAX * 10, MAX),    0, "USB воткнут давно — всё равно не спим");
-    equ(Policy_MayEnterSleep(1, 1, MAX * 10, MAX),    0, "USB важнее потолка по кнопке");
+    /* Ради этого правило и переписано (A1). Раньше потолок отсчитывался
+     * заново в каждом цикле удержания, и залипшая кнопка держала плату по
+     * 5 минут КАЖДЫЙ час. Новый цикл начинается с dt = 0 — проверяем, что
+     * ни в одном следующем цикле она больше не держит. */
+    for (int cycle = 0; cycle < 24; cycle++)
+    {
+        uint8_t awake = Policy_ButtonKeepsAwake(&b, 1, 0, MAX);
+        awake |= Policy_ButtonKeepsAwake(&b, 1, BTN_TEST_POLL_MS, MAX);
+        if (awake) { ok(0, "залипшая кнопка снова держит в следующем цикле"); break; }
+    }
+    equ(b.stuck, 1, "сутки циклов — кнопка всё ещё признана залипшей");
 
-    /* Отпустили кнопку и выдернули кабель — прибор обязан уснуть сразу,
-     * не дожидаясь никаких таймеров. */
-    equ(Policy_MayEnterSleep(0, 0, MAX * 10, MAX), 1, "всё отпущено — спим немедленно");
+    /* Отпустили — следующее нажатие снова честное, с полным потолком. */
+    equ(Policy_ButtonKeepsAwake(&b, 0, 0, MAX), 0, "отпустили — спим");
+    equ(b.stuck, 0, "отпускание снимает залипание");
+    equ(b.held_ms, 0, "отпускание обнуляет счёт удержания");
+    equ(Policy_ButtonKeepsAwake(&b, 1, 0, MAX), 1, "после отпускания нажатие снова держит");
+
+    /* Удержание копится через циклы: две половины потолка в разных циклах —
+     * это один потолок, а не два. */
+    Policy_Button c = {0};
+    Policy_ButtonKeepsAwake(&c, 1, 0, MAX);
+    equ(Policy_ButtonKeepsAwake(&c, 1, MAX / 2, MAX), 1, "половина потолка — ещё держит");
+    Policy_ButtonKeepsAwake(&c, 1, 0, MAX);   /* следующий цикл, dt = 0 */
+    equ(Policy_ButtonKeepsAwake(&c, 1, MAX / 2, MAX), 0, "вторая половина в другом цикле — потолок");
+
+    /* Огромный dt не переполняет счёт и не «обнуляет» его. */
+    Policy_Button d = {0};
+    Policy_ButtonKeepsAwake(&d, 1, MAX - 10, MAX);
+    equ(Policy_ButtonKeepsAwake(&d, 1, 0xFFFFFFF0U, MAX), 0, "dt у края uint32 — потолок, не переполнение");
 
     /* Потолок задаётся снаружи; нулевой означает «не ждать вовсе». */
-    equ(Policy_MayEnterSleep(1, 0, 0, 0), 1, "нулевой потолок не заставляет ждать");
+    Policy_Button z = {0};
+    equ(Policy_ButtonKeepsAwake(&z, 1, 0, 0), 0, "нулевой потолок не заставляет ждать");
 }
 
 /* ----------------------------------------------------------------- AHT20 */

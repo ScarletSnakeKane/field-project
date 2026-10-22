@@ -185,4 +185,43 @@ void MX_GPIO_SleepRestore(void)
   /* PA5/PA6/PA7 вернёт MX_SPI1_Init(), PB8/PB9 — MX_I2C1_Init(). */
 }
 
+void MX_GPIO_ButtonPark(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* Замкнутая кнопка через внутреннюю подтяжку (~40 кОм) гонит ~80 мкА весь
+   * сон — пятую часть бюджета. В аналоге подтяжки нет и входной триггер
+   * отключён. DeInit, а не просто Init: только он снимает с линии EXTI маску
+   * и фронты — Init в аналог настройку прерывания оставил бы как была. */
+  HAL_GPIO_DeInit(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin);
+  GPIO_InitStruct.Pin = WAKE_BTN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(WAKE_BTN_GPIO_Port, &GPIO_InitStruct);
+}
+
+void MX_GPIO_ButtonRestore(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* Как в MX_GPIO_Init. Пока подтяжка заряжает линию, уровень на ней ползёт
+   * вверх — спада нет, но флаг сбрасываем на всякий случай: ложное «нажали»
+   * разбудило бы плату на замер вне расписания. */
+  GPIO_InitStruct.Pin = WAKE_BTN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(WAKE_BTN_GPIO_Port, &GPIO_InitStruct);
+  __HAL_GPIO_EXTI_CLEAR_IT(WAKE_BTN_Pin);
+}
+
+void MX_GPIO_ButtonSettle(void)
+{
+  /* ~40 кОм на десятки пФ линии — доли микросекунды; ждём с запасом в
+   * сотню раз. Циклом, а не HAL_Delay: вызывается и с остановленным тиком
+   * (короткое пробуждение для сторожа). */
+  for (volatile uint32_t i = 0U; i < 400U; i++)
+  {
+  }
+}
+
 /* USER CODE END 2 */

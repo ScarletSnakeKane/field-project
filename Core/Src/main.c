@@ -56,7 +56,8 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* Пока кнопка удерживается, МК не уходит в STOP — так USB-сессия не рвётся на время сна.
  * BTN_HOLD_MAX_MS — страховка на случай залипшей/залитой кнопки в поле: по истечении
- * этого времени засыпаем принудительно, иначе устройство молча высадит батарею. */
+ * этого времени засыпаем принудительно и больше не ждём кнопку, пока её не отпустят
+ * (счёт идёт через все циклы, см. Policy_ButtonKeepsAwake). */
 #define BTN_HOLD_POLL_MS   100U
 #define BTN_HOLD_MAX_MS    300000U   /* 5 минут */
 
@@ -110,6 +111,7 @@ static uint8_t lse_ok = 0;   /* запустился ли LSE-кварц (ина
 static volatile uint8_t woke_by_button = 0;  /* выставляется в EXTI-колбэке кнопки */
 static uint8_t fs_ok = 0;    /* смонтирована ли файловая система */
 static uint32_t write_fails = 0;  /* накопленное число неудачных записей строки */
+static Policy_Button btn_policy;  /* удержание KEY через все циклы сна (A1) */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -130,23 +132,27 @@ static void SleepUntilNextSample(void)
    * Уход в STOP рвёт USB-сессию и портит файл на стороне хоста, поэтому оба
    * признака означают одно: устройство обязано остаться на шине. Кнопка —
    * ручной способ, VBUS — то же самое автоматически, без нажатий.
-   * Датчики к этому моменту уже обесточены, лишнего тока не тратим. */
-  uint32_t t_hold0 = HAL_GetTick();
-  uint32_t hold_ms = 0;
+   * Датчики к этому моменту уже обесточены, лишнего тока не тратим.
+   * Правило кнопки — в power_policy.c: её потолок считается через все
+   * циклы (btn_policy живёт вне этой функции), иначе залипшая KEY держала бы
+   * плату по 5 минут каждый час. */
+  uint32_t t_prev = HAL_GetTick();
   while (1)
   {
       uint8_t btn_held    = (HAL_GPIO_ReadPin(WAKE_BTN_GPIO_Port, WAKE_BTN_Pin) == GPIO_PIN_RESET);
       uint8_t usb_present = (HAL_GPIO_ReadPin(VBUS_GPIO_Port, VBUS_Pin) == GPIO_PIN_SET);
 
-      hold_ms = HAL_GetTick() - t_hold0;
+      uint32_t now = HAL_GetTick();
+      uint8_t btn_awake = Policy_ButtonKeepsAwake(&btn_policy, btn_held, now - t_prev, BTN_HOLD_MAX_MS);
+      t_prev = now;
 
-      /* Само правило — в power_policy.c, вместе с объяснением, почему потолок
-       * по времени действует только на кнопку и не действует на USB. Здесь
-       * остаётся лишь опрос выводов. */
-      if (Policy_MayEnterSleep(btn_held, usb_present, hold_ms, BTN_HOLD_MAX_MS))
+      if (!btn_awake && !usb_present)
           break;
 
-      HAL_Delay(BTN_HOLD_POLL_MS);
+      /* Ждём во сне ядра (WFI), а не в занятом цикле HAL_Delay: SysTick будит
+       * каждую миллисекунду, а между тиками ядро не жжёт ток впустую. */
+      while (HAL_GetTick() - now < BTN_HOLD_POLL_MS)
+          __WFI();
   }
 
   /* Флеш — на постоянном питании, гасить её нечем, кроме Deep Power-Down.
@@ -192,6 +198,13 @@ static void SleepUntilNextSample(void)
 
   woke_by_button = 0;   /* сбрасываем перед сном: интересен источник ЭТОГО пробуждения */
 
+  /* Залипшую кнопку на время сна отключаем от подтяжки и EXTI (A1): через
+   * замкнутый контакт иначе тёк бы ток весь час, а её «нажатие» больше
+   * ничего не значит. Будит только RTC; отпущена ли она — проверим после. */
+  uint8_t btn_parked = btn_policy.stuck;
+  if (btn_parked)
+      MX_GPIO_ButtonPark();
+
   /* Отладочный блок не должен переживать STOP. Программатор при подключении
    * выставляет DBG_STOP, чтобы можно было ставить точки останова в спящем МК,
    * и этот бит держит отладочную логику и тактирование живыми весь сон —
@@ -222,6 +235,15 @@ static void SleepUntilNextSample(void)
    * перенастраивать SysTick не нужно: достаточно вернуть его прерывание. */
   HAL_ResumeTick();
   SystemClock_Config();
+
+  /* В аналоге PA0 читается нулём, то есть «зажата», — вернуть подтяжку до
+   * того, как цикл удержания спросит кнопку, иначе залипание не кончилось
+   * бы никогда. */
+  if (btn_parked)
+  {
+      MX_GPIO_ButtonRestore();
+      MX_GPIO_ButtonSettle();
+  }
 
   /* Возвращаем выводы 1-Wire из аналога и поднимаем SPI — обязательно до
    * любого обращения к флеш, иначе команду пробуждения будет некому послать. */
