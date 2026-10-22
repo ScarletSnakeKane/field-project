@@ -2371,8 +2371,29 @@ static void test_log_import(void)
 
 /* ------------------------------------------------ виртуальный том (П5б) */
 
+/* Эталон самопроверки vfat.h: при vf_break «другая libc» печатает иначе. */
+static int vf_break;
+#define VFAT_CHECK_LINE vf_check_line
+static int vf_check_line(const LogRecord *r, char *out);
 #define VFAT_IMPLEMENTATION
 #include "vfat.h"
+
+static int vf_check_line(const LogRecord *r, char *out)
+{
+    int n = VFat_FormatMeasSlow(r, out);
+    if (vf_break && n > 0)
+        out[0] ^= 1;
+    return n;
+}
+
+/* Счёт чтений флеш — сколько стоит сектор при копировании подряд. */
+static long vf_reads;
+static uint8_t vf_count_read(uint32_t a, uint8_t *b, uint32_t n)
+{
+    vf_reads++;
+    return fm_read(a, b, n);
+}
+static const LogFlashOps VF_COUNT_OPS = { vf_count_read, fm_program, fm_erase, NULL, fm_unlock };
 
 /* Эталон: строка LogRecord_FormatCsv (буфер VFAT_LINE_BUF - 1) с \r\n вместо \n. */
 static int vf_ref_line(const LogRecord *r, char *out)
@@ -2788,6 +2809,52 @@ static void test_vfat_volume(void)
     ok(VFat_Read(&vf_vol, lba, vf_img) == 0, "запись испортилась после сборки — отказ, а не сдвиг");
     fm[10U * 64U + 30U] ^= 0x01U;
     ok(VFat_Read(&vf_vol, lba, vf_img) == 1, "вернулась — сектор читается");
+
+    /* Копирование подряд держится на курсоре: на сектор — несколько
+     * чтений журнала, а не проход от начала сектора журнала (до 64). */
+    {
+        LogRing rc = r;
+        rc.ops = &VF_COUNT_OPS;
+        (void)VFat_Build(&vf_vol, &rc, "test");
+        uint32_t nsec = (vf_vol.size[VFAT_FILE_DATA] + VFAT_SECTOR - 1U) / VFAT_SECTOR;
+        vf_reads = 0;
+        int rd = 1;
+        for (uint32_t s = 0; s < nsec; s++)
+            rd &= VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img + s * VFAT_SECTOR);
+        snprintf(what, sizeof(what), "подряд: %.1f чтения журнала на сектор (не больше 8)",
+                 (double)vf_reads / nsec);
+        ok(rd && vf_reads <= 8L * (long)nsec, what);
+        /* Хост повторяет чтение после ошибки или сброса: тот же сектор
+         * второй раз подряд — те же байты (курсор стоит внутри него). */
+        int same = 1;
+        for (uint32_t s = 0; s < nsec; s++)
+        {
+            (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img2);
+            (void)VFat_Read(&vf_vol, VFAT_PART_LBA + VFAT_DATA + s, vf_img2 + VFAT_SECTOR);
+            same &= memcmp(vf_img2, vf_img + s * VFAT_SECTOR, VFAT_SECTOR) == 0 &&
+                    memcmp(vf_img2 + VFAT_SECTOR, vf_img + s * VFAT_SECTOR, VFAT_SECTOR) == 0;
+        }
+        ok(same, "повторное чтение того же сектора — те же байты");
+    }
+
+    /* Форматтеры разошлись (другая libc в сборке) — том переходит на
+     * LogRecord_FormatCsv целиком, файл по-прежнему верен. */
+    {
+        uint32_t dlen, olen;
+        vf_expect(&r, &dlen, &olen);
+        vf_break = 1;
+        (void)VFat_Build(&vf_vol, &r, "test");
+        vf_break = 0;
+        ok(vf_vol.slow == 1 && vf_vol.state == VFAT_OK, "самопроверка: расхождение — медленный путь");
+        for (uint32_t s = 0; s < VFAT_DISK_SECTORS; s++)
+            (void)VFat_Read(&vf_vol, s, vf_img + s * VFAT_SECTOR);
+        ok(vf_check_file(vf_img, "DATA    TXT", vf_exp_data, dlen), "медленный путь: data.txt байт в байт");
+        long il = vf_extract(vf_img, "INFO    TXT", vf_got, NULL);
+        vf_got[il > 0 ? il : 0] = 0;
+        ok(il > 0 && strstr((const char *)vf_got, "self-check failed") != NULL, "info.txt говорит о медленном пути");
+        (void)VFat_Build(&vf_vol, &r, "test");
+        ok(vf_vol.slow == 0, "без расхождения — быстрый путь");
+    }
 
     /* Медленный путь даёт тот же файл. */
     (void)VFat_Build(&vf_vol, &r, "test");

@@ -57,9 +57,9 @@ class Images(unittest.TestCase):
         subprocess.run(["gcc", "-std=c11", "-O1", "-ICore/Inc", "-o", exe] + SOURCES + ["-lm"],
                        cwd=ROOT, check=True)
         env = dict(os.environ, VFAT_ONLY="1", VFAT_DUMP_DIR=cls.tmp)
-        out = subprocess.run([exe], cwd=ROOT, env=env, capture_output=True, text=True)
-        if out.returncode != 0:
-            raise AssertionError("C-тест тома упал:\n" + out.stdout[-2000:])
+        # Итог C-теста — отдельной проверкой: образы читатели проверяют и
+        # тогда, когда он упал, — чтобы видеть, что ловят они сами.
+        cls.c_run = subprocess.run([exe], cwd=ROOT, env=env, capture_output=True, text=True)
         print("\n  читатели FAT: " + ", ".join(cls.readers), file=sys.stderr)
 
     @classmethod
@@ -127,6 +127,9 @@ class Images(unittest.TestCase):
             self.assertIn("info.txt", names, name)
         finally:
             fs.close()
+
+    def test_c_side(self):
+        self.assertEqual(self.c_run.returncode, 0, "C-тест тома упал:\n" + self.c_run.stdout[-2000:])
 
     def test_images(self):
         for name in SCENARIOS:

@@ -304,6 +304,12 @@ int VFat_FormatMeas(const LogRecord *r, char *out)
     return ((uint32_t)(n - 1) >= VFAT_LINE_BUF - 1U) ? -1 : n;
 }
 
+/* Эталон самопроверки при сборке. Хостовый тест подменяет его, чтобы
+ * проверить переход на медленный путь; в прошивке — LogRecord_FormatCsv. */
+#ifndef VFAT_CHECK_LINE
+#define VFAT_CHECK_LINE VFat_FormatMeasSlow
+#endif
+
 /* Строка записи для файла which; 0 — запись не из этого файла. */
 static int VFat_Line(const VFat *v, uint32_t which, const LogRecord *rec, char *line,
                      const uint8_t **text)
@@ -426,7 +432,7 @@ static uint8_t VFat_Scan(VFat *v, uint8_t check)
              * snprintf, ~0.2 с на плате. */
             if (check && (v->n_meas == 0U || i % 512U == 0U))
             {
-                int m = VFat_FormatMeasSlow(&rec, ref);
+                int m = VFAT_CHECK_LINE(&rec, ref);
                 if (m != n || (n > 0 && memcmp(line, ref, (size_t)n) != 0))
                     return 0xFFU;
             }
