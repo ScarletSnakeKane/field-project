@@ -52,6 +52,14 @@ uint8_t Policy_MeasureDue(uint32_t awake_ms, uint32_t interval_ms)
     return (awake_ms >= interval_ms) ? 1U : 0U;
 }
 
+uint8_t Policy_SkipMeasureForUsb(uint8_t woke_by_vbus, uint8_t woke_by_button,
+                                 uint8_t host_session)
+{
+    if (host_session)
+        return 1U;
+    return (woke_by_vbus && !woke_by_button) ? 1U : 0U;
+}
+
 uint32_t Policy_SleepChunkSec(uint32_t left_sec, uint32_t kick_sec)
 {
     if (kick_sec == 0U || left_sec < kick_sec)

@@ -371,6 +371,13 @@ static void test_usb_policy(void)
     /* Замер по расписанию, пока плата держится на шине (C8). */
     equ(Policy_MeasureDue(3599999U, 3600000U), 0, "интервал не прошёл — замера нет");
     equ(Policy_MeasureDue(3600000U, 3600000U), 1, "прошёл интервал — замер, не засыпая");
+
+    /* Вокруг USB-сессии не меряем: прибор в этот момент вынут из земли. */
+    equ(Policy_SkipMeasureForUsb(1, 0, 0), 1, "разбудила вставка кабеля — замера нет");
+    equ(Policy_SkipMeasureForUsb(0, 0, 1), 1, "хост держит сессию, подошёл час — замера нет");
+    equ(Policy_SkipMeasureForUsb(1, 1, 0), 0, "кнопка вместе с кабелем — человек просит замер");
+    equ(Policy_SkipMeasureForUsb(0, 1, 0), 0, "кнопка — замер");
+    equ(Policy_SkipMeasureForUsb(0, 0, 0), 0, "будильник, кабеля нет или это зарядка — замер");
 }
 
 static void test_watchdog_policy(void)
