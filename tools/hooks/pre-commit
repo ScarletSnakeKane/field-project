@@ -1,0 +1,26 @@
+#!/bin/sh
+# Не дать закоммитить временный дампер из tools/dump_patch.py.
+#
+# Если read_data.sh прервался так, что trap не отработал (kill, закрытое окно,
+# обесточенный ПК), в main.c остаётся вставка, на которой плата зависает в
+# while(1). При core.autocrlf=true в коммит уходит только она, и в общем диффе
+# её легко не заметить (D5). Хук проверяет то, что реально индексировано.
+#
+# Ставится вручную, один раз:  cp tools/hooks/pre-commit .git/hooks/pre-commit
+# Обойти осознанно:            git commit --no-verify
+bad=$(git diff --cached --name-only --diff-filter=ACM -- 'Core/*' 'FATFS/*' 'USB_DEVICE/*' |
+    while IFS= read -r f; do
+        git show ":$f" | grep -q "ВРЕМЕННЫЙ ДАМПЕР" && echo "$f"
+    done)
+if [ -n "$bad" ]; then
+    echo "pre-commit: в индексе временный дампер (tools/dump_patch.py):" >&2
+    echo "$bad" | sed 's/^/  /' >&2
+    echo "Уберите его: python tools/dump_patch.py --revert  (или git checkout -- <файл>)" >&2
+    exit 1
+fi
+# Правки вне USER CODE, которые CubeMX затирает при перегенерации (A3, A5, V1).
+sh tools/cubemx_guard.sh >&2 || {
+    echo "pre-commit: похоже, проект перегенерирован CubeMX — верните правки выше" >&2
+    exit 1
+}
+exit 0

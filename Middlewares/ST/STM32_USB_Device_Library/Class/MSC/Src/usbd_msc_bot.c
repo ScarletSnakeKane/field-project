@@ -198,7 +198,14 @@ void MSC_BOT_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
     case USBD_BOT_DATA_IN:
       if (SCSI_ProcessCmd(pdev, hmsc->cbw.bLUN, &hmsc->cbw.CB[0]) < 0)
       {
-        MSC_BOT_SendCSW(pdev, USBD_CSW_CMD_FAILED);
+        /* FieldSensor (П5б+, V1): правка вне USER CODE — CubeMX при
+         * перегенерации вернёт MSC_BOT_SendCSW(FAILED). Отказ Read посреди
+         * READ10: хост ждёт ещё данных, CSW вместо них он примет за
+         * короткий пакет данных и будет ждать настоящего CSW до таймаута
+         * (~30 с), потом сбросит устройство. По BOT ошибка в фазе данных —
+         * STALL конечной точки IN; CSW FAILED уйдёт после CLEAR_FEATURE
+         * (MSC_BOT_CplClrFeature), остаток в dDataResidue уже посчитан. */
+        MSC_BOT_Abort(pdev);
       }
       break;
 
@@ -283,6 +290,14 @@ static void  MSC_BOT_CBW_Decode(USBD_HandleTypeDef *pdev)
   }
   else
   {
+    /* FieldSensor (приёмка П5б+): Bulk-Only Mass Storage Reset (MSC_BOT_Reset)
+     * оставляет статус RECOVERY, а в NORMAL его возвращает только MSC_BOT_Init.
+     * Тогда MSC_BOT_CplClrFeature после STALL не шлёт CSW, и хост висит до
+     * таймаута при каждой ошибке чтения до переподключения кабеля. Корректный
+     * CBW означает, что восстановление позади. CubeMX эту правку затрёт —
+     * проверка: python3 -I tests/test_vfat_image.py MscBot. */
+    hmsc->bot_status = USBD_BOT_STATUS_NORMAL;
+
     if (SCSI_ProcessCmd(pdev, hmsc->cbw.bLUN, &hmsc->cbw.CB[0]) < 0)
     {
       if (hmsc->bot_state == USBD_BOT_NO_DATA)

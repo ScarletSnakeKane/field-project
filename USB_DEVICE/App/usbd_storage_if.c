@@ -30,11 +30,17 @@ extern FATFS USERFatFS;
 extern char USERPath[];
 
 #include "spiflash.h"   // наш драйвер SPI Flash
+#include "storage_policy.h"
 #include <string.h>
+/* Хост видит не флеш, а виртуальный том, собранный из журнала (П5б).
+ * Реализация vfat.h включена здесь — в прошивке ровно один раз. */
+#define VFAT_DEVICE_UID(w) \
+  ((w)[0] = HAL_GetUIDw0(), (w)[1] = HAL_GetUIDw1(), (w)[2] = HAL_GetUIDw2())
+#define VFAT_IMPLEMENTATION
+#include "vfat.h"
 
-/* Размеры тома живут в spiflash.h: заявленный объём больше физического. */
-#define SECTOR_SIZE     FLASH_SECTOR_BYTES
-#define SECTOR_COUNT    FLASH_VIRT_SECTORS
+#define SECTOR_SIZE     VFAT_SECTOR
+#define SECTOR_COUNT    VFAT_DISK_SECTORS
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -142,7 +148,17 @@ const int8_t STORAGE_Inquirydata_FS[] = {/* 36 */
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
 /* USER CODE BEGIN EXPORTED_VARIABLES */
+/* Собирает main.c (Usb_Start) до подъёма стека, читает только Read ниже. */
+VFat usb_vfat;
 
+/* Сколько секторов ушло хосту за всё время. Единственный честный признак
+ * того, что хост на месте: состояние CONFIGURED он оставляет за собой и
+ * пропав (vbus_sensing выключен), а TEST UNIT READY ещё ничего не говорит о
+ * том, что кто-то читает данные. По изменению этого счётчика цикл удержания
+ * в main.c отличает идущее копирование от брошенной сессии
+ * (Policy_UsbKeepsAwake, idle_max_ms). Растёт только в прерывании USB; слово
+ * читается одной инструкцией, поэтому сверх volatile защиты не нужно. */
+volatile uint32_t usb_host_blocks = 0;
 /* USER CODE END EXPORTED_VARIABLES */
 
 /**
@@ -192,7 +208,11 @@ int8_t STORAGE_Init_FS(uint8_t lun)
 {
   /* USER CODE BEGIN 2 */
   UNUSED(lun);
-  f_mount(&USERFatFS, USERPath, 1);
+  /* Здесь когда-то стоял f_mount в прерывании OTG — он ломал том основного
+   * потока и мог повиснуть в HAL_Delay. Том теперь виртуальный (vfat.h) и
+   * собран до подъёма стека. Отметка сессии осталась от FatFs-пути: с П5а её
+   * никто не забирает, вреда от неё нет. */
+  SPI_Flash_NoteHostSession();
   return USBD_OK;
   /* USER CODE END 2 */
 }
@@ -225,6 +245,13 @@ int8_t STORAGE_IsReady_FS(uint8_t lun)
   /* USER CODE BEGIN 4 */
   UNUSED(lun);
 
+  /* Не готова или занята основным потоком — «не готов», хост повторит
+   * TEST UNIT READY сам. Правило — в storage_policy.h. Том без архива
+   * (один info.txt с причиной) флеш не читает — он готов всегда. */
+  if ((usb_vfat.present[VFAT_FILE_DATA] || usb_vfat.present[VFAT_FILE_OLD]) &&
+      !Storage_MscMayAccess(SPI_Flash_IsReady(), SPI_Flash_IsBusy()))
+    return (USBD_FAIL);
+
   return (USBD_OK);
   /* USER CODE END 4 */
 }
@@ -239,10 +266,11 @@ int8_t STORAGE_IsWriteProtected_FS(uint8_t lun)
   /* USER CODE BEGIN 5 */
   UNUSED(lun);
 
-  /* Том намеренно только для чтения: архив нельзя испортить с хоста.
-   * Признак «защищён от записи» возвращён на место — причина отказа Android
-   * оказалась в другом (FAT12, см. FLASH_VIRT_SECTORS в spiflash.h), а
-   * незащищённый том Windows пытается «чинить» при каждом подключении. */
+  /* Том намеренно только для чтения: архив нельзя испортить с хоста (G3).
+   * Класс MSC по этому ответу ставит бит WP в MODE SENSE и отвечает на
+   * WRITE10 «защищён от записи», не вызывая Write. Android FAT16 принимает
+   * (FAT12 — нет, поэтому том 16 МБ, см. vfat.h), а незащищённый том Windows
+   * пытается «чинить» при каждом подключении. */
   return (USBD_FAIL);
   /* USER CODE END 5 */
 }
@@ -263,23 +291,34 @@ int8_t STORAGE_Read_FS(uint8_t lun, uint8_t *buf, uint32_t blk_addr, uint16_t bl
   if ((blk_addr + blk_len) > SECTOR_COUNT)
 	return USBD_FAIL;
 
-  /* Заявленный тому объём вдвое больше физического (см. spiflash.h).
-   * Несуществующие сектора отдаём хосту нулями — читать по завёрнутому адресу
-   * нельзя, флеш вернула бы содержимое начала кристалла. */
-  if (blk_addr >= FLASH_PHYS_SECTORS)
-  {
-      memset(buf, 0, blk_len * SECTOR_SIZE);
-      return USBD_OK;
-  }
 
-  uint16_t phys = blk_len;
-  if ((blk_addr + blk_len) > FLASH_PHYS_SECTORS)
+  /* Сектор собирается из журнала (vfat.h): служебные — арифметикой, файлы
+   * — форматированием записей. Класс MSC просит по одному сектору
+   * (MSC_MEDIA_PACKET 512). Прерывание держится: подряд (копирование) —
+   * ~3 мс на сектор, в худшем случае (произвольное чтение конца сектора
+   * журнала) — ~40 мс; оценка — в отчёте П5б. Отказ флеш или расхождение
+   * журнала с индексом — ошибка чтения: сдвинутых байт хост не получит.
+   * Windows чтение повторит, Linux/Android вернут ошибку (04/11 они не
+   * повторяют). Отказ посреди READ10 класс MSC отбивает STALL конечной
+   * точки IN (правка в usbd_msc_bot.c, V1) — без неё хост висел бы до
+   * таймаута команды. */
+  for (uint16_t k = 0; k < blk_len; k++)
   {
-      phys = (uint16_t)(FLASH_PHYS_SECTORS - blk_addr);
-      memset(buf + (phys * SECTOR_SIZE), 0, (blk_len - phys) * SECTOR_SIZE);
-  }
+    /* IsReady проверяется только в начале команды, а длинный READ10 идёт
+     * пакетами по 512 Б в разных прерываниях — между ними основной поток
+     * успевает занять флеш. Проверяем перед каждым сектором, которому она
+     * нужна; служебные секторы и info.txt — из RAM, их хост прочтёт всегда
+     * (info.txt объясняет, почему архива нет). */
+    if (VFat_UsesFlash(&usb_vfat, blk_addr + k) &&
+        !Storage_MscMayAccess(SPI_Flash_IsReady(), SPI_Flash_IsBusy()))
+      return USBD_FAIL;
+    if (!VFat_Read(&usb_vfat, blk_addr + k, buf + (uint32_t)k * SECTOR_SIZE))
+      return USBD_FAIL;
 
-  SPI_Flash_Read(blk_addr * SECTOR_SIZE, buf, phys * SECTOR_SIZE);
+    /* Отметка живой сессии — здесь, а не на входе в команду: сектор
+     * действительно собран и уходит хосту. */
+    usb_host_blocks++;
+  }
 
   return USBD_OK;
   /* USER CODE END 6 */

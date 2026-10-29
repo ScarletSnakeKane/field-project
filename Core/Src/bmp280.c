@@ -1,101 +1,103 @@
+/* BMP280 — сверка температуры воздуха с AHT20 (решение владельца).
+ *
+ * Прежняя версия модуля не вызывалась и была непригодна к включению (П2):
+ * Init не проверял коды возврата I2C, калибровка читалась без проверки, и
+ * нулевые dig_T* давали ровно 0.00 °C; режим был normal — непрерывные
+ * измерения и лишний ток. Теперь: каждый вызов I2C проверяется, калибровка
+ * отвергается по Bmp280_CalibOk, а пересчёт — Bmp280_CompensateT с окном
+ * правдоподобия (sensor_policy.h, под тестами). Один замер на цикл в forced
+ * mode, давление не измеряется вовсе. */
 #include "bmp280.h"
+#include "sensor_policy.h"
+#include <math.h>
 
-#define BMP280_REG_ID        0xD0
-#define BMP280_REG_RESET     0xE0
-#define BMP280_REG_CTRL_MEAS 0xF4
-#define BMP280_REG_CONFIG    0xF5
 #define BMP280_REG_CALIB     0x88
-#define BMP280_REG_PRESS_MSB 0xF7
+#define BMP280_REG_ID        0xD0
+#define BMP280_REG_STATUS    0xF3
+#define BMP280_REG_CTRL_MEAS 0xF4
+#define BMP280_REG_TEMP_MSB  0xFA
 
+#define BMP280_STATUS_MEASURING  0x08U
+
+/* ctrl_meas: osrs_t = x1, osrs_p = пропуск, режим forced. */
+#define BMP280_CTRL_T1_FORCED    ((1U << 5) | (0U << 2) | 1U)
+
+/* Замер температуры x1 по даташиту — до 5.5 мс; ждём с запасом. */
+#define BMP280_MEAS_TIMEOUT_MS   20U
+
+#define BMP280_I2C_TIMEOUT_MS    100U
+
+static uint16_t bmp_addr;
 static uint16_t dig_T1;
 static int16_t  dig_T2, dig_T3;
-static uint16_t dig_P1;
-static int16_t  dig_P2, dig_P3, dig_P4, dig_P5, dig_P6, dig_P7, dig_P8, dig_P9;
 
-static int32_t t_fine;
-
-static void BMP280_ReadCalibration(I2C_HandleTypeDef *hi2c)
+static HAL_StatusTypeDef BMP280_ReadReg(I2C_HandleTypeDef *hi2c, uint16_t addr, uint8_t reg,
+                                        uint8_t *buf, uint16_t len)
 {
-    uint8_t calib[24];
-    HAL_I2C_Mem_Read(hi2c, BMP280_ADDR, BMP280_REG_CALIB, 1, calib, 24, 100);
+    return HAL_I2C_Mem_Read(hi2c, addr, reg, I2C_MEMADD_SIZE_8BIT, buf, len, BMP280_I2C_TIMEOUT_MS);
+}
+
+HAL_StatusTypeDef BMP280_Init(I2C_HandleTypeDef *hi2c)
+{
+    static const uint16_t addrs[2] = { BMP280_ADDR_LOW, BMP280_ADDR_HIGH };
+    uint8_t id = 0;
+
+    bmp_addr = 0;
+    for (uint32_t i = 0; i < 2U; i++)
+    {
+        if (BMP280_ReadReg(hi2c, addrs[i], BMP280_REG_ID, &id, 1) == HAL_OK && Bmp280_IdOk(id))
+        {
+            bmp_addr = addrs[i];
+            break;
+        }
+    }
+    if (bmp_addr == 0U)
+        return HAL_ERROR;
+
+    uint8_t calib[6];
+    if (BMP280_ReadReg(hi2c, bmp_addr, BMP280_REG_CALIB, calib, sizeof(calib)) != HAL_OK)
+        return HAL_ERROR;
 
     dig_T1 = (uint16_t)(calib[1] << 8 | calib[0]);
     dig_T2 = (int16_t)(calib[3] << 8 | calib[2]);
     dig_T3 = (int16_t)(calib[5] << 8 | calib[4]);
 
-    dig_P1 = (uint16_t)(calib[7] << 8 | calib[6]);
-    dig_P2 = (int16_t)(calib[9] << 8 | calib[8]);
-    dig_P3 = (int16_t)(calib[11] << 8 | calib[10]);
-    dig_P4 = (int16_t)(calib[13] << 8 | calib[12]);
-    dig_P5 = (int16_t)(calib[15] << 8 | calib[14]);
-    dig_P6 = (int16_t)(calib[17] << 8 | calib[16]);
-    dig_P7 = (int16_t)(calib[19] << 8 | calib[18]);
-    dig_P8 = (int16_t)(calib[21] << 8 | calib[20]);
-    dig_P9 = (int16_t)(calib[23] << 8 | calib[22]);
+    return Bmp280_CalibOk(dig_T1, dig_T2, dig_T3) ? HAL_OK : HAL_ERROR;
 }
 
-HAL_StatusTypeDef BMP280_Init(I2C_HandleTypeDef *hi2c)
+HAL_StatusTypeDef BMP280_ReadTemperature(I2C_HandleTypeDef *hi2c, float *t_c)
 {
-    uint8_t id;
-    HAL_I2C_Mem_Read(hi2c, BMP280_ADDR, BMP280_REG_ID, 1, &id, 1, 100);
+    uint8_t ctrl = BMP280_CTRL_T1_FORCED;
+    uint8_t st = 0;
+    uint8_t raw[3];
 
-    if (id != 0x58)
+    *t_c = NAN;
+    if (bmp_addr == 0U)
         return HAL_ERROR;
 
-    uint8_t reset_cmd = 0xB6;
-    HAL_I2C_Mem_Write(hi2c, BMP280_ADDR, BMP280_REG_RESET, 1, &reset_cmd, 1, 100);
-    HAL_Delay(10);
-
-    BMP280_ReadCalibration(hi2c);
-
-    uint8_t ctrl_meas = 0x27; // temp x1, press x1, normal mode
-    uint8_t config     = 0xA0; // 1000 ms standby
-
-    HAL_I2C_Mem_Write(hi2c, BMP280_ADDR, BMP280_REG_CTRL_MEAS, 1, &ctrl_meas, 1, 100);
-    HAL_I2C_Mem_Write(hi2c, BMP280_ADDR, BMP280_REG_CONFIG, 1, &config, 1, 100);
-
-    return HAL_OK;
-}
-
-HAL_StatusTypeDef BMP280_ReadData(I2C_HandleTypeDef *hi2c, BMP280_Data *out)
-{
-    uint8_t buf[6];
-
-    if (HAL_I2C_Mem_Read(hi2c, BMP280_ADDR, BMP280_REG_PRESS_MSB, 1, buf, 6, 100) != HAL_OK)
+    if (HAL_I2C_Mem_Write(hi2c, bmp_addr, BMP280_REG_CTRL_MEAS, I2C_MEMADD_SIZE_8BIT,
+                          &ctrl, 1, BMP280_I2C_TIMEOUT_MS) != HAL_OK)
         return HAL_ERROR;
 
-    int32_t adc_P = (int32_t)((buf[0] << 12) | (buf[1] << 4) | (buf[2] >> 4));
-    int32_t adc_T = (int32_t)((buf[3] << 12) | (buf[4] << 4) | (buf[5] >> 4));
+    /* Бит measuring поднимается не сразу после записи режима — первая
+     * проверка через миллисекунду, иначе прочли бы прошлый (сбросовый)
+     * отсчёт как готовый. */
+    uint32_t t0 = HAL_GetTick();
+    do
+    {
+        HAL_Delay(1);
+        if (BMP280_ReadReg(hi2c, bmp_addr, BMP280_REG_STATUS, &st, 1) != HAL_OK)
+            return HAL_ERROR;
+        if ((st & BMP280_STATUS_MEASURING) == 0U)
+            break;
+    } while (HAL_GetTick() - t0 < BMP280_MEAS_TIMEOUT_MS);
+    if (st & BMP280_STATUS_MEASURING)
+        return HAL_TIMEOUT;
 
-    // Temperature compensation
-    int32_t var1 = ((((adc_T >> 3) - ((int32_t)dig_T1 << 1))) * ((int32_t)dig_T2)) >> 11;
-    int32_t var2 = (((((adc_T >> 4) - ((int32_t)dig_T1)) *
-                      ((adc_T >> 4) - ((int32_t)dig_T1))) >> 12) *
-                      ((int32_t)dig_T3)) >> 14;
-
-    t_fine = var1 + var2;
-    out->temperature = (t_fine * 5 + 128) >> 8;
-    out->temperature /= 100.0f;
-
-    // Pressure compensation
-    int64_t pvar1 = ((int64_t)t_fine) - 128000;
-    int64_t pvar2 = pvar1 * pvar1 * (int64_t)dig_P6;
-    pvar2 = pvar2 + ((pvar1 * (int64_t)dig_P5) << 17);
-    pvar2 = pvar2 + (((int64_t)dig_P4) << 35);
-    pvar1 = ((pvar1 * pvar1 * (int64_t)dig_P3) >> 8) +
-            ((pvar1 * (int64_t)dig_P2) << 12);
-    pvar1 = (((((int64_t)1) << 47) + pvar1)) * ((int64_t)dig_P1) >> 33;
-
-    if (pvar1 == 0)
+    if (BMP280_ReadReg(hi2c, bmp_addr, BMP280_REG_TEMP_MSB, raw, sizeof(raw)) != HAL_OK)
         return HAL_ERROR;
 
-    int64_t p = 1048576 - adc_P;
-    p = (((p << 31) - pvar2) * 3125) / pvar1;
-    pvar1 = (((int64_t)dig_P9) * (p >> 13) * (p >> 13)) >> 25;
-    pvar2 = (((int64_t)dig_P8) * p) >> 19;
-
-    p = ((p + pvar1 + pvar2) >> 8);
-    out->pressure = p / 100.0f; // hPa
-
-    return HAL_OK;
+    int32_t adc_t = (int32_t)(((uint32_t)raw[0] << 12) | ((uint32_t)raw[1] << 4) | (raw[2] >> 4));
+    *t_c = Bmp280_CompensateT(adc_t, dig_T1, dig_T2, dig_T3);
+    return isnan(*t_c) ? HAL_ERROR : HAL_OK;
 }

@@ -1,0 +1,2 @@
+# Хук запускается через sh: с CRLF (core.autocrlf=true) шебанг ломается.
+pre-commit text eol=lf
