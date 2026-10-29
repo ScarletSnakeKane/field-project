@@ -134,6 +134,36 @@ uint8_t Policy_MeasureDue(uint32_t awake_ms, uint32_t interval_ms)
     return (awake_ms >= interval_ms) ? 1U : 0U;
 }
 
+void Policy_ScheduleMeasured(Policy_Schedule *s)
+{
+    s->elapsed_ms = 0;
+}
+
+void Policy_ScheduleElapsed(Policy_Schedule *s, uint32_t dt_ms)
+{
+    /* С насыщением: прибор, простоявший без замера 49.7 суток (сессия хоста,
+     * залипшая кнопка, карантин — что угодно), должен остаться «пора мерить»,
+     * а не начать отсчёт заново у края uint32. */
+    s->elapsed_ms = sat_add(s->elapsed_ms, dt_ms);
+}
+
+uint32_t Policy_ScheduleSleepSec(const Policy_Schedule *s, uint32_t interval_ms)
+{
+    uint32_t left_ms, sec;
+
+    if (s->elapsed_ms >= interval_ms)
+        return 0U;   /* интервал истёк — спать нельзя, надо мерить */
+
+    /* Вверх до целой секунды, но без (+999) в числителе: интервал задаётся
+     * снаружи, и у края uint32 такое сложение завернулось бы в почти нуль,
+     * то есть «не спать» вместо «спать 49 суток». */
+    left_ms = interval_ms - s->elapsed_ms;
+    sec = left_ms / 1000U;
+    if (left_ms % 1000U != 0U)
+        sec++;
+    return sec;
+}
+
 uint8_t Policy_SkipMeasureForUsb(Policy_Usb *u, uint8_t woke_by_vbus, uint8_t woke_by_button,
                                  uint8_t usb_session, uint32_t max_skips)
 {

@@ -548,6 +548,131 @@ static void test_usb_policy(void)
     equ(again, 0, "после уступки стек не поднимается снова");
 }
 
+/* ------------------------------------------------------ расписание замеров */
+
+static void test_schedule_policy(void)
+{
+    /* Интервал — полевой: раз в час. В секундах его знает rtc.h, но тот тянет
+     * за собой HAL, поэтому здесь число с тем же смыслом. */
+    const uint32_t INTERVAL_MS = 3600000UL;
+    const uint32_t KICK_SEC    = 15U;   /* WDG_KICK_SEC из main.c */
+    Policy_Schedule s;
+    memset(&s, 0, sizeof s);
+
+    puts("Расписание замеров: остаток сна");
+
+    /* Чистое расписание (так же выглядит старт и сброс) — полный интервал. */
+    equ(Policy_ScheduleSleepSec(&s, INTERVAL_MS), 3600U, "старт — спать полный интервал");
+    equ(Policy_MeasureDue(s.elapsed_ms, INTERVAL_MS), 0, "старт — мерить ещё не пора");
+
+    /* Ради этого правило и заведено. Проспали 50 минут, разбудил фронт VBUS,
+     * замера не было — следующий сон обязан быть ОСТАТКОМ, 10 минут, а не
+     * полным часом. Иначе фронт раз в 50 минут молча стоит часа наблюдений. */
+    Policy_ScheduleElapsed(&s, 50U * 60000U);
+    equ(Policy_ScheduleSleepSec(&s, INTERVAL_MS), 600U, "досрочное пробуждение — спать остаток");
+    equ(Policy_MeasureDue(s.elapsed_ms, INTERVAL_MS), 0, "остаток не истёк — мерить не пора");
+
+    /* Досрочных пробуждений может быть много, и каждое тратит остаток, а не
+     * обнуляет его. */
+    Policy_ScheduleElapsed(&s, 5U * 60000U);
+    equ(Policy_ScheduleSleepSec(&s, INTERVAL_MS), 300U, "второе досрочное — остаток ещё меньше");
+
+    /* Интервал истёк — спать нельзя, пора мерить. */
+    Policy_ScheduleElapsed(&s, 5U * 60000U);
+    equ(Policy_ScheduleSleepSec(&s, INTERVAL_MS), 0U, "интервал истёк — не спать");
+    equ(Policy_MeasureDue(s.elapsed_ms, INTERVAL_MS), 1, "интервал истёк — пора мерить");
+
+    /* Прошло больше интервала (сессия хоста, череда пробуждений) — долг не
+     * копится: один замер и отсчёт с нуля, а не пачка задним числом. */
+    Policy_ScheduleElapsed(&s, 10U * 3600000UL);
+    equ(Policy_MeasureDue(s.elapsed_ms, INTERVAL_MS), 1, "просрочка 10 часов — пора мерить");
+    Policy_ScheduleMeasured(&s);
+    equ(s.elapsed_ms, 0U, "замер обнуляет отсчёт");
+    equ(Policy_ScheduleSleepSec(&s, INTERVAL_MS), 3600U, "после замера — снова полный интервал");
+    equ(Policy_MeasureDue(s.elapsed_ms, INTERVAL_MS), 0, "после замера мерить не пора");
+
+    /* Внеочередной замер (нажали кнопку посреди интервала) расписание
+     * перезапускает: следующий идёт через час после НЕГО. */
+    Policy_Schedule btn;
+    memset(&btn, 0, sizeof btn);
+    Policy_ScheduleElapsed(&btn, 40U * 60000U);
+    Policy_ScheduleMeasured(&btn);
+    equ(Policy_ScheduleSleepSec(&btn, INTERVAL_MS), 3600U, "внеочередной замер перезапускает расписание");
+
+    /* Остаток меньше секунды округляется ВВЕРХ: иначе получился бы сон
+     * нулевой длины — разборка периферии, STOP на нуль секунд и сборка
+     * обратно. Шаг RTC Wakeup Timer — секунда. */
+    Policy_Schedule r;
+    memset(&r, 0, sizeof r);
+    Policy_ScheduleElapsed(&r, INTERVAL_MS - 1U);
+    equ(Policy_ScheduleSleepSec(&r, INTERVAL_MS), 1U, "остаток 1 мс — спать секунду, не нуль");
+    memset(&r, 0, sizeof r);
+    Policy_ScheduleElapsed(&r, INTERVAL_MS - 1500U);
+    equ(Policy_ScheduleSleepSec(&r, INTERVAL_MS), 2U, "остаток 1.5 с — спать две секунды");
+
+    /* Насыщение у края uint32: прибор, простоявший без замера 49.7 суток,
+     * обязан остаться «пора мерить», а не начать отсчёт заново. */
+    Policy_Schedule sat;
+    memset(&sat, 0, sizeof sat);
+    Policy_ScheduleElapsed(&sat, 0xFFFFFF00U);
+    Policy_ScheduleElapsed(&sat, 0xFFFFFF00U);
+    equ(sat.elapsed_ms, 0xFFFFFFFFU, "два огромных приращения — потолок, не переворот");
+    equ(Policy_ScheduleSleepSec(&sat, INTERVAL_MS), 0U, "у края uint32 — не спать");
+    equ(Policy_MeasureDue(sat.elapsed_ms, INTERVAL_MS), 1, "у края uint32 — пора мерить");
+
+    /* Интервал у края uint32 (на такое прошивка не ставится, но именно так
+     * ловится переполнение в округлении вверх: (left + 999) завернулось бы в
+     * почти нуль, то есть «не спать» вместо «спать 49 суток»). */
+    Policy_Schedule big;
+    memset(&big, 0, sizeof big);
+    equ(Policy_ScheduleSleepSec(&big, 0xFFFFFFFFU), 4294968U, "интервал у края uint32 — не переполнение");
+
+    /* А теперь сам цикл сна из main.c: остаток режется на куски по 15 с под
+     * сторожа, и каждый отработавший кусок идёт в расписание. Полный сон без
+     * помех обязан привести ровно к «пора мерить». */
+    Policy_Schedule w;
+    memset(&w, 0, sizeof w);
+    uint32_t left = Policy_ScheduleSleepSec(&w, INTERVAL_MS), chunks = 0;
+    while (left > 0U)
+    {
+        uint32_t chunk = Policy_SleepChunkSec(left, KICK_SEC);
+        left -= chunk;
+        Policy_ScheduleElapsed(&w, chunk * 1000U);
+        chunks++;
+    }
+    equ(chunks, 240U, "час сна — 240 кусков по 15 с");
+    equ(Policy_MeasureDue(w.elapsed_ms, INTERVAL_MS), 1, "сон отработан целиком — пора мерить");
+
+    /* И то же самое с досрочным выходом на 100-м куске (фронт VBUS): отспанное
+     * остаётся зачтённым, и следующий сон — остаток, а не полный интервал.
+     * Это и есть дефект: раньше остаток был локальной переменной и выход из
+     * цикла выбрасывал его целиком. */
+    Policy_Schedule e;
+    memset(&e, 0, sizeof e);
+    left = Policy_ScheduleSleepSec(&e, INTERVAL_MS);
+    for (uint32_t i = 0; i < 100U && left > 0U; i++)
+    {
+        uint32_t chunk = Policy_SleepChunkSec(left, KICK_SEC);
+        left -= chunk;
+        Policy_ScheduleElapsed(&e, chunk * 1000U);
+    }
+    equ(Policy_ScheduleSleepSec(&e, INTERVAL_MS), 3600U - 100U * KICK_SEC,
+        "досрочный выход из сна — остаток сохранён, а не полный интервал");
+    equ(Policy_MeasureDue(e.elapsed_ms, INTERVAL_MS), 0, "досрочный выход — замер не пора");
+
+    /* Второй сон доспит остаток, и замер придёт ровно через интервал после
+     * прошлого — то есть досрочное пробуждение расписание не сдвинуло. */
+    left = Policy_ScheduleSleepSec(&e, INTERVAL_MS);
+    while (left > 0U)
+    {
+        uint32_t chunk = Policy_SleepChunkSec(left, KICK_SEC);
+        left -= chunk;
+        Policy_ScheduleElapsed(&e, chunk * 1000U);
+    }
+    equ(e.elapsed_ms, INTERVAL_MS, "два сна подряд дают ровно интервал, не больше");
+    equ(Policy_MeasureDue(e.elapsed_ms, INTERVAL_MS), 1, "доспали остаток — пора мерить");
+}
+
 /* ------------------------------------------------ связка с главным циклом */
 
 /* Правила по отдельности бывают зелёными и там, где прибор всё равно теряет
@@ -577,6 +702,7 @@ typedef struct {
 
 #define ML_ENUM_LAG_MS  3000U    /* перечисление и монтирование тома хостом */
 #define ML_STEP_MS      10U
+#define ML_KICK_SEC     15U      /* WDG_KICK_SEC из main.c: кусок сна под сторожа */
 
 static const MlScen *ml_sc;
 static uint64_t ml_t, ml_t_stack, ml_next_edge;
@@ -624,10 +750,16 @@ static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
 {
     const uint32_t POLL_MS = 100U, START_MS = 2000U, MEAS_MS = 2000U;
     const uint32_t INTERVAL_MS = 3600000UL;   /* RTC_WAKEUP_INTERVAL_SEC */
-    Policy_Usb    up;
-    Policy_Button bp;
+    Policy_Usb      up;
+    Policy_Button   bp;
+    Policy_Schedule sched;
     memset(&up, 0, sizeof up);
     memset(&bp, 0, sizeof bp);
+    memset(&sched, 0, sizeof sched);
+    /* Отметка «тика» для бодрствования — та же, что meas_sched_tick в main.c:
+     * живёт через все циклы, потому что между выходом из сна и следующим
+     * входом лежит сам замер. */
+    uint64_t t_sched = 0;
 
     ml_sc = sc;
     ml_t = 0; ml_t_stack = 0; ml_blocks = 0; ml_started = 0;
@@ -644,11 +776,25 @@ static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
         if (!first)
         {
             /* --- SleepUntilNextSample() --- */
-            uint64_t t_prev = ml_t, t_awake = ml_t;
-            uint8_t  vbus_edge = ml_woke_vbus, due = 0;
+            uint64_t t_prev = ml_t, hold_start = ml_t;
+            uint8_t  vbus_edge = ml_woke_vbus, due = 0, told = 0;
             ml_woke_vbus = 0;
             for (;;)
             {
+                /* В прошивке цикл удержания кончается самое позднее через
+                 * интервал (Policy_MeasureDue), а обычно раньше — по потолку
+                 * молчания сессии или удержания кнопки. Не кончается он
+                 * только в одном случае: прибор перестал засыпать, то есть
+                 * вернулся исходный отказ «часы идут, архива нет». Модель на
+                 * это не вешается, а говорит прямо — иначе поломанное правило
+                 * расписания выглядело бы просто бесконечным прогоном
+                 * тестов. */
+                if (ml_t - hold_start > 2ULL * INTERVAL_MS)
+                {
+                    if (!told) ok(0, "цикл удержания не кончается: прибор перестал засыпать");
+                    told = 1;
+                    break;
+                }
                 uint8_t  cfg = ml_configured();
                 uint64_t now = ml_t;
                 uint8_t  btn_awake = Policy_ButtonKeepsAwake(&bp, 0, (uint32_t)(now - t_prev),
@@ -659,6 +805,8 @@ static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
                                                           USB_ENUM_MAX_MS,
                                                           USB_SESSION_IDLE_MAX_MS);
                 t_prev = now;
+                Policy_ScheduleElapsed(&sched, (uint32_t)(now - t_sched));
+                t_sched = now;
                 vbus_edge = ml_woke_vbus;
                 ml_woke_vbus = 0;
 
@@ -674,7 +822,7 @@ static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
                     t_prev = ml_t;
                 }
 
-                if (Policy_MeasureDue((uint32_t)(now - t_awake), INTERVAL_MS))
+                if (Policy_MeasureDue(sched.elapsed_ms, INTERVAL_MS))
                 {
                     if (Policy_SessionYieldsToMeasure(&up, ml_started, USB_SESSION_MAX_SKIPS))
                         ml_started = 0;     /* Usb_Stop() */
@@ -687,14 +835,28 @@ static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
             if (!due)
             {
                 ml_started = 0;             /* Usb_Stop() перед сном */
-                uint64_t wake = ml_t + INTERVAL_MS;
+                /* Спим ОСТАТОК расписания, а не полный интервал, и зачитываем
+                 * его так же, как прошивка: кусками по мере отработки. */
+                uint32_t sleep_sec = Policy_ScheduleSleepSec(&sched, INTERVAL_MS);
+                uint64_t wake = ml_t + (uint64_t)sleep_sec * 1000ULL;
                 if (sc->vbus_edge_ms && ml_next_edge < wake)
                 {
                     wake = ml_next_edge;    /* фронт VBUS будит раньше будильника */
                     ml_next_edge += sc->vbus_edge_ms;
                     ml_woke_vbus = 1;
+                    /* Недоспанный кусок в расписание не идёт: измерить его
+                     * прошивке нечем — тик во сне остановлен. Поэтому
+                     * зачитываются только отработавшие куски. */
+                    uint32_t slept = (uint32_t)((wake - ml_t) / 1000ULL);
+                    Policy_ScheduleElapsed(&sched, (slept / ML_KICK_SEC) * ML_KICK_SEC * 1000U);
                 }
+                else
+                    Policy_ScheduleElapsed(&sched, sleep_sec * 1000U);
                 ml_t = wake;
+                /* Тик во сне стоит (HAL_SuspendTick), поэтому отметка
+                 * бодрствования переносится на момент пробуждения: иначе
+                 * отспанное зачлось бы дважды — куском и разностью тика. */
+                t_sched = ml_t;
             }
         }
         first = 0;
@@ -705,6 +867,11 @@ static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
                 out->worst_gap = gap;
             continue;
         }
+
+        /* Замер начинается — расписание с нуля (Schedule_Restart в main.c):
+         * пропуск выше расписание не трогает, а внеочередной замер — трогает. */
+        Policy_ScheduleMeasured(&sched);
+        t_sched = ml_t;
 
         ml_advance(MEAS_MS);
         /* Поднят стек — флеш отдана хосту, и строка уходит в очередь в ОЗУ. */
@@ -784,7 +951,19 @@ static void test_usb_main_loop(void)
 
     /* Фронты на входе VBUS без хоста: зарядка, пауэрбанк, влага на делителе,
      * дребезг фронтового EXTI. Частоту перебираем — именно здесь пропуск
-     * разрешался бесконечно и за двое суток оставалась ОДНА строка. */
+     * разрешался бесконечно и за двое суток оставалась ОДНА строка.
+     *
+     * Здесь же проверяется, что расписание ведётся от прошлого ЗАМЕРА.
+     * Пока остаток сна жил локальной переменной, каждое досрочное
+     * пробуждение выбрасывало отспанное и следующий сон начинался с полного
+     * часа: при фронте раз в 50 минут — 29 строк за двое суток вместо 48, а
+     * «дыра» при этом оставалась равной одному интервалу, то есть потолок
+     * пропусков a4df667 своё требование выполнял и дефекта не показывал. На
+     * редеющий архив смотрит только счёт строк, поэтому он и проверяется
+     * впритык: интервалом реже — и тест падает. Фронты чаще интервала дают
+     * строк БОЛЬШЕ 48 — это не расписание, а потолок пропусков: исчерпав
+     * право на пропуск, прибор меряет на следующем же фронте, и этот замер
+     * расписание законно перезапускает. */
     uint32_t worst_edge = 0, flash_edge_min = 0xFFFFFFFFU;
     for (uint32_t min = 5U; min <= 115U; min += 5U)
     {
@@ -796,7 +975,24 @@ static void test_usb_main_loop(void)
         if (r.flash < flash_edge_min) flash_edge_min = r.flash;
     }
     equ(worst_edge, USB_SESSION_MAX_SKIPS, "фронты VBUS любой частоты — дыра не больше интервала");
-    ok(flash_edge_min >= HOURS / 2U, "фронты VBUS любой частоты — архив всё равно растёт");
+    ok(flash_edge_min >= HOURS - 1U, "фронты VBUS любой частоты — архив по строке в час");
+
+    /* Тот самый случай из отчёта об испытаниях: фронт раз в 50 минут, то есть
+     * чаще интервала. Было 29 строк за двое суток и ~1.8 ч между строками. */
+    memset(&sc, 0, sizeof sc);
+    sc.vbus = 1; sc.host_period_ms = 60000U; sc.host_burst_ms = 2000U;
+    sc.vbus_edge_ms = 50U * 60000U;
+    ml_run(&sc, HOURS, &r);
+    ok(r.flash >= HOURS - 1U, "фронт VBUS раз в 50 минут — 48 строк за двое суток, не 29");
+    equ(r.worst_gap, USB_SESSION_MAX_SKIPS, "фронт раз в 50 минут — дыра не больше интервала");
+
+    /* Кнопка посреди интервала — внеочередной замер по замыслу владельца:
+     * он расписание перезапускает, и архив от этого не редеет. Нажатие
+     * моделируется как пробуждение, после которого замер состоялся. */
+    memset(&sc, 0, sizeof sc);
+    sc.host_period_ms = 60000U; sc.host_burst_ms = 2000U;
+    ml_run(&sc, HOURS, &r);
+    ok(r.flash >= HOURS, "без USB — строка каждый интервал (контроль расписания)");
 }
 
 static void test_watchdog_policy(void)
@@ -3513,6 +3709,7 @@ int main(void)
     test_bmp280();
     test_sleep_policy();
     test_usb_policy();
+    test_schedule_policy();
     test_usb_main_loop();
     test_watchdog_policy();
     test_quarantine_policy();
