@@ -129,9 +129,9 @@ uint8_t Policy_SessionYieldsToMeasure(Policy_Usb *u, uint8_t usb_session, uint32
     return 1U;
 }
 
-uint8_t Policy_MeasureDue(uint32_t awake_ms, uint32_t interval_ms)
+uint8_t Policy_MeasureDue(uint32_t since_measure_ms, uint32_t interval_ms)
 {
-    return (awake_ms >= interval_ms) ? 1U : 0U;
+    return (since_measure_ms >= interval_ms) ? 1U : 0U;
 }
 
 void Policy_ScheduleMeasured(Policy_Schedule *s)

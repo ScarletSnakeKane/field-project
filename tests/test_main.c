@@ -690,6 +690,7 @@ typedef struct {
     uint32_t host_period_ms;  /* как часто хост трогает том */
     uint32_t host_burst_ms;   /* сколько длится обращение */
     uint32_t vbus_edge_ms;    /* период фронтов на входе VBUS (0 — нет) */
+    uint32_t btn_press_ms;    /* период нажатий KEY (0 — нет): внеочередной замер */
 } MlScen;
 
 typedef struct {
@@ -705,9 +706,9 @@ typedef struct {
 #define ML_KICK_SEC     15U      /* WDG_KICK_SEC из main.c: кусок сна под сторожа */
 
 static const MlScen *ml_sc;
-static uint64_t ml_t, ml_t_stack, ml_next_edge;
+static uint64_t ml_t, ml_t_stack, ml_next_edge, ml_next_press;
 static uint32_t ml_blocks;
-static uint8_t  ml_started, ml_woke_vbus;
+static uint8_t  ml_started, ml_woke_vbus, ml_woke_btn;
 
 /* Читает ли хост том прямо сейчас (это и двигает usb_host_blocks). */
 static uint8_t ml_reads(void)
@@ -764,7 +765,9 @@ static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
     ml_sc = sc;
     ml_t = 0; ml_t_stack = 0; ml_blocks = 0; ml_started = 0;
     ml_woke_vbus = sc->vbus;                  /* кабель вставлен в момент ноль */
+    ml_woke_btn  = 0;
     ml_next_edge = sc->vbus_edge_ms;
+    ml_next_press = sc->btn_press_ms;
     memset(out, 0, sizeof *out);
 
     uint32_t gap = 0;
@@ -835,18 +838,37 @@ static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
             if (!due)
             {
                 ml_started = 0;             /* Usb_Stop() перед сном */
+                ml_woke_btn = 0;            /* woke_by_button гасится перед STOP */
                 /* Спим ОСТАТОК расписания, а не полный интервал, и зачитываем
                  * его так же, как прошивка: кусками по мере отработки. */
                 uint32_t sleep_sec = Policy_ScheduleSleepSec(&sched, INTERVAL_MS);
                 uint64_t wake = ml_t + (uint64_t)sleep_sec * 1000ULL;
-                if (sc->vbus_edge_ms && ml_next_edge < wake)
+                /* Кто разбудит раньше — фронт VBUS или нажатие KEY. Кнопка в
+                 * главном цикле снимает пропуск (woke_by_button), то есть
+                 * даёт внеочередной замер по замыслу владельца. */
+                uint8_t early = 0;
+                if (sc->btn_press_ms && ml_next_press < wake &&
+                    (!sc->vbus_edge_ms || ml_next_press <= ml_next_edge))
+                {
+                    wake = ml_next_press;   /* нажатие KEY будит раньше будильника */
+                    ml_next_press += sc->btn_press_ms;
+                    ml_woke_btn = 1;
+                    early = 1;
+                }
+                else if (sc->vbus_edge_ms && ml_next_edge < wake)
                 {
                     wake = ml_next_edge;    /* фронт VBUS будит раньше будильника */
                     ml_next_edge += sc->vbus_edge_ms;
                     ml_woke_vbus = 1;
+                    early = 1;
+                }
+                if (early)
+                {
                     /* Недоспанный кусок в расписание не идёт: измерить его
                      * прошивке нечем — тик во сне остановлен. Поэтому
-                     * зачитываются только отработавшие куски. */
+                     * зачитываются только отработавшие куски, и считает их
+                     * одно место на обе причины досрочного пробуждения —
+                     * в прошивке цикл сна тоже один и причину не разбирает. */
                     uint32_t slept = (uint32_t)((wake - ml_t) / 1000ULL);
                     Policy_ScheduleElapsed(&sched, (slept / ML_KICK_SEC) * ML_KICK_SEC * 1000U);
                 }
@@ -861,7 +883,8 @@ static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
         }
         first = 0;
 
-        if (Policy_SkipMeasureForUsb(&up, ml_woke_vbus, 0, ml_started, USB_SESSION_MAX_SKIPS))
+        if (Policy_SkipMeasureForUsb(&up, ml_woke_vbus, ml_woke_btn, ml_started,
+                                     USB_SESSION_MAX_SKIPS))
         {
             if (++gap > out->worst_gap)
                 out->worst_gap = gap;
@@ -872,6 +895,7 @@ static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
          * пропуск выше расписание не трогает, а внеочередной замер — трогает. */
         Policy_ScheduleMeasured(&sched);
         t_sched = ml_t;
+        ml_woke_btn = 0;   /* прошивка сбрасывает woke_by_button перед сном */
 
         ml_advance(MEAS_MS);
         /* Поднят стек — флеш отдана хосту, и строка уходит в очередь в ОЗУ. */
@@ -986,13 +1010,43 @@ static void test_usb_main_loop(void)
     ok(r.flash >= HOURS - 1U, "фронт VBUS раз в 50 минут — 48 строк за двое суток, не 29");
     equ(r.worst_gap, USB_SESSION_MAX_SKIPS, "фронт раз в 50 минут — дыра не больше интервала");
 
-    /* Кнопка посреди интервала — внеочередной замер по замыслу владельца:
-     * он расписание перезапускает, и архив от этого не редеет. Нажатие
-     * моделируется как пробуждение, после которого замер состоялся. */
+    /* Кнопка посреди интервала — внеочередной замер по замыслу владельца, и
+     * он расписание ПЕРЕЗАПУСКАЕТ: следующий замер идёт через час после
+     * нажатия, а не через час после прошлого замера. Нажатие раз в 40 минут
+     * при часовом интервале поэтому даёт строку ровно на каждое нажатие и
+     * ни одной лишней: 72 нажатия за двое суток плюс одна строка при старте
+     * (первый проход меряет сразу, не засыпая) — 73. Потеряется перезапуск
+     * расписания — к ним добавятся ещё и часовые замеры, поэтому проверка
+     * на равенство, а не на «не меньше». */
+    memset(&sc, 0, sizeof sc);
+    sc.host_period_ms = 60000U; sc.host_burst_ms = 2000U;
+    sc.btn_press_ms = 40U * 60000U;
+    ml_run(&sc, HOURS, &r);
+    equ(r.worst_gap, 0U, "кнопка — ни одного интервала без записи");
+    equ(r.flash, 73U, "кнопка раз в 40 минут — строка на нажатие плюс стартовая, лишних нет");
+
+    /* Верхняя граница на число строк вообще. Правило обязано не только не
+     * прореживать архив, но и не учащать его: лишний замер — это лишние
+     * ~1.5 с на 20 мА каждый час и лишний износ журнала. Без USB интервал
+     * ничем не сбивается, так что строк ровно по интервалу. */
     memset(&sc, 0, sizeof sc);
     sc.host_period_ms = 60000U; sc.host_burst_ms = 2000U;
     ml_run(&sc, HOURS, &r);
-    ok(r.flash >= HOURS, "без USB — строка каждый интервал (контроль расписания)");
+    ok(r.flash >= HOURS && r.flash <= HOURS + 1U,
+       "без USB — ровно по строке на интервал, не чаще");
+
+    /* То же с фронтами VBUS реже интервала: расписание держит час, и ни
+     * пропуск, ни пробуждение лишней строки не добавляют. Фронты ЧАЩЕ
+     * интервала здесь не проверяются верхней границей сознательно: там
+     * строк больше (при фронте раз в 5 минут — 288 за двое суток), и это
+     * потолок пропусков a4df667, а не расписание; регрессии нет, база даёт
+     * столько же. */
+    memset(&sc, 0, sizeof sc);
+    sc.vbus = 1; sc.host_period_ms = 60000U; sc.host_burst_ms = 2000U;
+    sc.vbus_edge_ms = 100U * 60000U;
+    ml_run(&sc, HOURS, &r);
+    ok(r.flash >= HOURS - 1U && r.flash <= HOURS + 1U,
+       "фронт VBUS раз в 100 минут — по строке на интервал, не чаще");
 }
 
 static void test_watchdog_policy(void)
