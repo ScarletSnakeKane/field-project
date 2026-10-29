@@ -411,6 +411,21 @@ static uint32_t VFat_RenderInfo(const VFat *v, char *out, uint32_t size)
                      "data.txt: %lu lines, first %s, last %s%s\r\n"
                      "damaged log slots skipped: %lu\r\n"
                      "last write_fails=%lu lowpower_skips=%lu boot_count=%lu\r\n"
+                     /* Про потолок бездействия сессии (power_policy.h): прибор
+                      * уходит с шины сам, и диск пропадает у хоста на ровном
+                      * месте — без объяснения это выглядит поломкой. Величину
+                      * потолка тут не называем, чтобы она не разошлась с
+                      * константой. Два ограничения на эти строки:
+                      *   — стоят среди постоянных, ДО необязательного хвоста:
+                      *     сектор info.txt пересобирается при каждом чтении, но
+                      *     отдаётся обрезанным по длине, снятой при сборке тома,
+                      *     поэтому меняться после сборки вправе только хвост;
+                      *   — коротки: весь текст в худшем случае должен влезать в
+                      *     сектор, иначе snprintf обрежет строку самодиагностики
+                      *     посередине ровно тогда, когда она и нужна. Запас
+                      *     закреплён тестом «info.txt влезает в сектор». */
+                     "the disk vanishes some minutes after the last read: normal.\r\n"
+                     "Replug the cable to read the archive.\r\n"
                      "%s%s%s%s%s",
                      fw, (unsigned long)v->n_meas,
                      v->first_ts[0] ? v->first_ts : "-", v->last_ts[0] ? v->last_ts : "-",

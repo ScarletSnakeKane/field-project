@@ -26,25 +26,107 @@ uint8_t Policy_ButtonKeepsAwake(Policy_Button *b, uint8_t key_held,
     return 1U;
 }
 
-uint8_t Policy_UsbKeepsAwake(Policy_Usb *u, uint8_t usb_present, uint8_t usb_configured,
-                             uint8_t vbus_edge, uint32_t dt_ms, uint32_t enum_max_ms)
+/* Прибавка, которая упирается в край uint32, а не начинается с нуля:
+ * удержание длиннее 49 суток должно упираться в потолок. */
+static uint32_t sat_add(uint32_t a, uint32_t b)
 {
-    /* Кабель вынули или вставили заново — прошлая неудача не в счёт. */
-    if (!usb_present || vbus_edge)
+    return (b > UINT32_MAX - a) ? UINT32_MAX : a + b;
+}
+
+uint8_t Policy_UsbKeepsAwake(Policy_Usb *u, uint8_t usb_present, uint8_t usb_stack_up,
+                             uint8_t usb_configured, uint8_t vbus_edge, uint32_t host_blocks,
+                             uint32_t dt_ms, uint32_t enum_max_ms, uint32_t idle_max_ms)
+{
+    /* Хост получил данные с прошлого вызова — единственный признак, что он
+     * действительно на месте. Счёт ведём здесь, а не в main.c: это правило,
+     * а правила живут под тестами. */
+    uint8_t host_active = (host_blocks != u->host_blocks);
+    u->host_blocks = host_blocks;
+
+    /* Кабель вынули — забываем про этот VBUS всё, включая израсходованный
+     * шанс. Вставили заново — то же самое, но только если сессии сейчас нет:
+     * во время сессии фронт на входе VBUS — это дребезг, и права продлевать
+     * её у него нет (иначе граница сессии опять оказывается не наша). */
+    if (!usb_present || (vbus_edge && !usb_stack_up))
+    {
         u->unconfigured_ms = 0;
+        u->idle_ms         = 0;
+        u->enumerated      = 0;
+        u->spent           = 0;
+    }
+
+    /* Начало сессии — подъём стека нашей прошивкой, и ничто другое. Счёт
+     * пропущенных интервалов (skipped) здесь не трогаем: он принадлежит
+     * расписанию замеров, а не сессии, и обнуляется только состоявшимся
+     * замером. Иначе дребезг VBUS или хост, перечисляющийся заново каждый
+     * час, выдавали бы себе новое право на пропуск бесконечно. */
+    if (usb_stack_up && !u->stack_up)
+    {
+        u->unconfigured_ms = 0;
+        u->idle_ms         = 0;
+        u->enumerated      = 0;
+    }
+    u->stack_up = usb_stack_up ? 1U : 0U;
 
     if (!usb_present)
         return 0U;
 
-    if (usb_configured)
+    /* Шанс израсходован: ни держать, ни поднимать стек — до пропадания или
+     * нового фронта VBUS. */
+    if (u->spent)
+        return 0U;
+
+    /* Перечисление доказывают и отданные секторы, а не только dev_state в
+     * момент опроса. Зарядка их не выпросит: READ10 приходит лишь от хоста,
+     * который плату перечислил. А вот обратное неверно — при строгом
+     * selective suspend окно CONFIGURED короче шага опроса (100 мс), и хост,
+     * уже получивший сотни секторов, по одному dev_state объявлялся бы
+     * зарядкой: через enum_max_ms шанс помечался израсходованным и стек
+     * гас посреди чтения. Та же болезнь, что и расхождение признака сессии:
+     * живость хоста меряется данными, а не его состоянием. */
+    if (usb_configured || host_active)
+        u->enumerated = 1;
+
+    /* Хост ещё не перечислялся — ждём не дольше enum_max_ms, иначе это
+     * зарядка, пауэрбанк или влага на делителе. */
+    if (!u->enumerated)
     {
-        u->unconfigured_ms = 0;
+        u->unconfigured_ms = sat_add(u->unconfigured_ms, dt_ms);
+        if (u->unconfigured_ms >= enum_max_ms)
+        {
+            u->spent = 1;
+            return 0U;
+        }
         return 1U;
     }
 
-    u->unconfigured_ms = (dt_ms > UINT32_MAX - u->unconfigured_ms)
-                       ? UINT32_MAX : u->unconfigured_ms + dt_ms;
-    return (u->unconfigured_ms < enum_max_ms) ? 1U : 0U;
+    /* Сессия идёт. Порция данных — сессия живая, потолок молчания начинается
+     * заново; без этого обнуления чтение архива рвалось бы на середине. */
+    if (host_active)
+    {
+        u->idle_ms = 0;
+        return 1U;
+    }
+
+    u->idle_ms = sat_add(u->idle_ms, dt_ms);
+    if (u->idle_ms >= idle_max_ms)
+    {
+        u->spent = 1;
+        return 0U;
+    }
+    return 1U;
+}
+
+uint8_t Policy_SessionYieldsToMeasure(Policy_Usb *u, uint8_t usb_session, uint32_t max_skips)
+{
+    if (!usb_session || u->skipped < max_skips)
+        return 0U;
+
+    /* Сессия уступает — и её шанс на этом кончился: иначе стек поднялся бы
+     * снова на следующем же пробуждении, и съеденные интервалы пошли бы по
+     * кругу. */
+    u->spent = 1;
+    return 1U;
 }
 
 uint8_t Policy_MeasureDue(uint32_t awake_ms, uint32_t interval_ms)
@@ -52,12 +134,28 @@ uint8_t Policy_MeasureDue(uint32_t awake_ms, uint32_t interval_ms)
     return (awake_ms >= interval_ms) ? 1U : 0U;
 }
 
-uint8_t Policy_SkipMeasureForUsb(uint8_t woke_by_vbus, uint8_t woke_by_button,
-                                 uint8_t host_session)
+uint8_t Policy_SkipMeasureForUsb(Policy_Usb *u, uint8_t woke_by_vbus, uint8_t woke_by_button,
+                                 uint8_t usb_session, uint32_t max_skips)
 {
-    if (host_session)
-        return 1U;
-    return (woke_by_vbus && !woke_by_button) ? 1U : 0U;
+    /* Причины пропуска две — идёт сессия и плату разбудил вставленный кабель
+     * (а не кнопка), — но потолок у них один. Отдельно взятая причина права
+     * пропускать бесконечно не имеет: на фронтах VBUS без хоста сессии не
+     * возникает вовсе, и ограничить их через Policy_SessionYieldsToMeasure
+     * нечем. */
+    if (!usb_session && !(woke_by_vbus && !woke_by_button))
+        return 0U;
+
+    if (u->skipped >= max_skips)
+        return 0U;   /* право исчерпано — меряем, что бы там ни было с USB */
+
+    u->skipped++;
+    return 1U;
+}
+
+void Policy_MeasureStored(Policy_Usb *u, uint8_t stored)
+{
+    if (stored)
+        u->skipped = 0;
 }
 
 uint32_t Policy_SleepChunkSec(uint32_t left_sec, uint32_t kick_sec)

@@ -331,53 +331,472 @@ static void test_sleep_policy(void)
 
 static void test_usb_policy(void)
 {
-    const uint32_t ENUM = 10000U;   /* USB_ENUM_MAX_MS в прошивке */
+    /* Потолки берём из power_policy.h, а не числами: иначе смена величины
+     * потолка тестами не замечается.
+     * Порядок аргументов Policy_UsbKeepsAwake, он повторяется ниже десятки
+     * раз: &состояние, VBUS, стек поднят прошивкой, хост перечислил, фронт
+     * VBUS, счётчик отданных хосту секторов, dt, ENUM, IDLE. Счётчик двигаем
+     * через ++blk — это и значит «хост получил порцию данных»; blk без
+     * инкремента — молчание. */
+    const uint32_t ENUM = USB_ENUM_MAX_MS;
+    const uint32_t IDLE = USB_SESSION_IDLE_MAX_MS;
+    uint32_t blk = 0;   /* модель usb_host_blocks из usbd_storage_if.c */
     Policy_Usb u = {0};
 
     puts("Уход в сон: USB");
 
-    equ(Policy_UsbKeepsAwake(&u, 0, 0, 0, 0, ENUM), 0, "VBUS нет — USB не держит");
+    /* Величина потолка бездействия — не вкусовщина: обоснование в
+     * power_policy.h, и оно НЕ про «выгрузка занимает секунды» (она занимает
+     * десятки секунд). Потолок стоит на молчании, поэтому длину выгрузки не
+     * ограничивает вовсе; платится он бодрствованием и сдвигом расписания на
+     * каждое подключение. Поднимать его нельзя — тест об этом напоминает. */
+    ok(IDLE <= 120000U, "потолок бездействия не больше 2 минут — иначе бюджет батареи");
+    ok(IDLE >= 30000U, "потолок бездействия не меньше 30 с — иначе рвётся честное чтение");
 
-    /* Хост перечислил — держим сколько угодно: плата питается от него, а
-     * уход в STOP оборвал бы чтение. */
-    equ(Policy_UsbKeepsAwake(&u, 1, 1, 1, 0, ENUM), 1, "хост перечислил — не спим");
-    equ(Policy_UsbKeepsAwake(&u, 1, 1, 0, ENUM * 100, ENUM), 1, "сессия длинная — всё равно не спим");
+    equ(Policy_UsbKeepsAwake(&u, 0, 0, 0, 0, blk, 0, ENUM, IDLE), 0, "VBUS нет — USB не держит");
+
+    /* Хост перечислил и читает — держим: плата питается от него, а уход в
+     * STOP оборвал бы чтение. */
+    equ(Policy_UsbKeepsAwake(&u, 1, 1, 1, 0, ++blk, 0, ENUM, IDLE), 1, "хост перечислил и читает — не спим");
+
+    /* Честное чтение архива: секторы уходят непрерывно, и потолок
+     * бездействия его не трогает, сколько бы оно ни длилось. Пять минут —
+     * вдвое с лишним больше настоящей выгрузки полного журнала (~4 МБ
+     * текста, десятки секунд) и в разы больше потолка. */
+    uint8_t held = 1;
+    for (uint32_t t = 0; t < 5U * 60U * 1000U; t += 100U)
+        held = (uint8_t)(held & Policy_UsbKeepsAwake(&u, 1, 1, 1, 0, ++blk, 100U, ENUM, IDLE));
+    equ(held, 1, "пять минут непрерывного чтения — сессия не прервана");
+
+    /* Ради этого правило и дополнено: хост, пропавший без чистого suspend
+     * (выключили компьютер, выдернули кабель), оставляет CONFIGURED навсегда —
+     * vbus_sensing выключен, узнать об этом нечем. Раньше выход из цикла
+     * удержания был закрыт: 8 ч 42 мин бодрствования без единой записи. */
+    Policy_Usb g = {0};
+    equ(Policy_UsbKeepsAwake(&g, 1, 1, 1, 0, ++blk, 0, ENUM, IDLE), 1, "сессия началась");
+    equ(Policy_UsbKeepsAwake(&g, 1, 1, 1, 0, blk, IDLE - 1, ENUM, IDLE), 1, "хост молчит, потолок не достигнут");
+    equ(Policy_UsbKeepsAwake(&g, 1, 1, 1, 0, blk, 1, ENUM, IDLE), 0, "молчит дольше потолка — спим, хотя CONFIGURED");
+
+    /* Шанс этого VBUS израсходован: пока кабель не тронут, стек больше не
+     * поднимаем. Иначе мёртвый хост в питающемся гнезде каждый час стоил бы
+     * сборки тома (до ~20 с) и ожидания перечисления (10 с) — 30 с на час,
+     * около +83 мкА навсегда и невидимо в данных. */
+    uint8_t raised = 0;
+    for (int hour = 0; hour < 24; hour++)
+    {
+        raised = (uint8_t)(raised | Policy_UsbKeepsAwake(&g, 1, 0, 0, 0, blk, 0, ENUM, IDLE));
+        raised = (uint8_t)(raised | Policy_UsbKeepsAwake(&g, 1, 0, 0, 0, blk, 100U, ENUM, IDLE));
+    }
+    equ(raised, 0, "сутки пробуждений после потолка — стек не поднимается");
+
+    /* А кабель, вставленный заново, — повод попробовать снова. */
+    equ(Policy_UsbKeepsAwake(&g, 1, 0, 0, 1, blk, 0, ENUM, IDLE), 1,
+        "кабель вставили заново — у хоста снова есть шанс");
+
+    /* Потолок считается через все циклы удержания: каждый час цикл
+     * начинается заново с dt = 0 (подошёл замер), и отсчёт молчания не
+     * должен от этого обнуляться — тот же промах, что был у кнопки (A1). */
+    Policy_Usb m = {0};
+    Policy_UsbKeepsAwake(&m, 1, 1, 1, 0, ++blk, 0, ENUM, IDLE);
+    equ(Policy_UsbKeepsAwake(&m, 1, 1, 1, 0, blk, IDLE / 2, ENUM, IDLE), 1, "половина потолка молчания — держим");
+    Policy_UsbKeepsAwake(&m, 1, 1, 1, 0, blk, 0, ENUM, IDLE);   /* следующий цикл, dt = 0 */
+    equ(Policy_UsbKeepsAwake(&m, 1, 1, 1, 0, blk, IDLE / 2, ENUM, IDLE), 0, "вторая половина в другом цикле — потолок");
+
+    /* Одна порция данных — и сессия снова живая: пауза в чтении не копится
+     * в потолок. */
+    Policy_Usb r = {0};
+    Policy_UsbKeepsAwake(&r, 1, 1, 1, 0, ++blk, 0, ENUM, IDLE);
+    Policy_UsbKeepsAwake(&r, 1, 1, 1, 0, blk, IDLE - 1, ENUM, IDLE);
+    equ(Policy_UsbKeepsAwake(&r, 1, 1, 1, 0, ++blk, 1, ENUM, IDLE), 1, "хост снова читает — держим");
+    equ(r.idle_ms, 0U, "порция данных обнуляет отсчёт молчания");
+
+    /* Огромный dt не переполняет счёт и не «обнуляет» его. */
+    Policy_Usb o = {0};
+    Policy_UsbKeepsAwake(&o, 1, 1, 1, 0, ++blk, 0, ENUM, IDLE);
+    Policy_UsbKeepsAwake(&o, 1, 1, 1, 0, blk, IDLE - 10, ENUM, IDLE);
+    equ(Policy_UsbKeepsAwake(&o, 1, 1, 1, 0, blk, 0xFFFFFFF0U, ENUM, IDLE), 0,
+        "dt у края uint32 — потолок, не переполнение");
+
+    /* Границу сессии задаём мы, а не хост. Штатный selective suspend (а
+     * целевой хост — Android) мигает CONFIGURED/SUSPENDED, не передав ни
+     * байта; если считать это новой сессией, потолок не наступит никогда. */
+    Policy_Usb s = {0};
+    Policy_UsbKeepsAwake(&s, 1, 1, 1, 0, ++blk, 0, ENUM, IDLE);
+    uint8_t flap = 1;
+    for (uint32_t t = 0; t <= IDLE + 10000U; t += 1000U)
+        flap = (uint8_t)(flap & Policy_UsbKeepsAwake(&s, 1, 1, (uint8_t)((t / 1000U) & 1U), 0,
+                                                     blk, 1000U, ENUM, IDLE));
+    equ(flap, 0, "мигание CONFIGURED сессию не продлевает");
+
+    /* Вход VBUS сидит на фронтовом EXTI и дребезжит — внутри сессии это тоже
+     * не её продление. */
+    Policy_Usb v = {0};
+    Policy_UsbKeepsAwake(&v, 1, 1, 1, 0, ++blk, 0, ENUM, IDLE);
+    uint8_t dribble = 1;
+    for (uint32_t t = 0; t <= IDLE + 10000U; t += 1000U)
+        dribble = (uint8_t)(dribble & Policy_UsbKeepsAwake(&v, 1, 1, 1, 1, blk, 1000U, ENUM, IDLE));
+    equ(dribble, 0, "дребезг VBUS во время сессии её не продлевает");
+
+    /* Перечисление доказывают и отданные хосту секторы, не только dev_state
+     * в момент опроса. При строгом selective suspend окно CONFIGURED короче
+     * шага опроса (100 мс), и читающий хост по одному dev_state через 10 с
+     * объявлялся бы зарядкой: стек гас бы посреди чтения. */
+    Policy_Usb p = {0};
+    Policy_UsbKeepsAwake(&p, 1, 0, 0, 1, blk, 0, ENUM, IDLE);   /* фронт VBUS, стек внизу */
+    uint8_t reading = 1;
+    for (uint32_t t = 0; t < ENUM * 3U; t += 100U)
+        reading = (uint8_t)(reading & Policy_UsbKeepsAwake(&p, 1, 1, 0, 0, ++blk, 100U, ENUM, IDLE));
+    equ(reading, 1, "секторы идут, а CONFIGURED не поймали — это хост, не зарядка");
+    equ(p.enumerated, 1U, "отданные секторы доказывают перечисление");
+
+    /* И ровно наоборот: без секторов и без CONFIGURED это по-прежнему
+     * зарядка, иначе потолок ожидания перечисления не сработает никогда. */
+    Policy_Usb d2 = {0};
+    Policy_UsbKeepsAwake(&d2, 1, 0, 0, 1, blk, 0, ENUM, IDLE);
+    equ(Policy_UsbKeepsAwake(&d2, 1, 1, 0, 0, blk, ENUM, ENUM, IDLE), 0,
+        "ни секторов, ни CONFIGURED — зарядка, спим");
+    equ(d2.enumerated, 0U, "без данных и без CONFIGURED перечисления не было");
 
     /* VBUS без хоста (A9): зарядка, пауэрбанк, влага на делителе. Ждём
      * перечисления не дольше потолка и уходим спать. */
     Policy_Usb c = {0};
-    equ(Policy_UsbKeepsAwake(&c, 1, 0, 1, 0, ENUM), 1, "VBUS появился — ждём хоста");
-    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, ENUM - 1, ENUM), 1, "хоста ещё нет, потолок не достигнут");
-    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 1, ENUM), 0, "хоста нет 10 с — это зарядка, спим");
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 1, blk, 0, ENUM, IDLE), 1, "VBUS появился — ждём хоста");
+    /* прошивка подняла стек — отсюда и идёт отсчёт перечисления */
+    equ(Policy_UsbKeepsAwake(&c, 1, 1, 0, 0, blk, ENUM - 1, ENUM, IDLE), 1, "хоста ещё нет, потолок не достигнут");
+    equ(Policy_UsbKeepsAwake(&c, 1, 1, 0, 0, blk, 1, ENUM, IDLE), 0, "хоста нет 10 с — это зарядка, спим");
 
     /* Следующие пробуждения с тем же VBUS — сразу спать, без новых 10 с:
      * на ложном VBUS каждое такое ожидание стоило бы батарее. */
-    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 0, ENUM), 0, "зарядка и в следующем цикле — спим сразу");
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 0, blk, 0, ENUM, IDLE), 0, "зарядка и в следующем цикле — спим сразу");
 
     /* Вставили кабель заново (фронт VBUS) — у нового хоста свой шанс. */
-    equ(Policy_UsbKeepsAwake(&c, 1, 0, 1, 0, ENUM), 1, "фронт VBUS — снова ждём хоста");
-    Policy_UsbKeepsAwake(&c, 1, 0, 0, ENUM, ENUM);
-    equ(Policy_UsbKeepsAwake(&c, 0, 0, 0, 0, ENUM), 0, "кабель вынули — спим");
-    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 0, ENUM), 1, "VBUS пропадал — прошлая неудача не в счёт");
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 1, blk, 0, ENUM, IDLE), 1, "фронт VBUS — снова ждём хоста");
+    Policy_UsbKeepsAwake(&c, 1, 1, 0, 0, blk, ENUM, ENUM, IDLE);
+    equ(Policy_UsbKeepsAwake(&c, 0, 0, 0, 0, blk, 0, ENUM, IDLE), 0, "кабель вынули — спим");
+    equ(Policy_UsbKeepsAwake(&c, 1, 0, 0, 0, blk, 0, ENUM, IDLE), 1, "VBUS пропадал — прошлая неудача не в счёт");
 
-    /* Хост ушёл в сон (SUSPENDED, не CONFIGURED) — отсчёт идёт заново. */
+    /* Хост ушёл в сон посреди сессии (SUSPENDED): для нас это просто
+     * молчание и идёт в тот же потолок бездействия — отдельного отсчёта у
+     * него больше нет, иначе мигание обнуляло бы счёт вечно. */
     Policy_Usb h = {0};
-    Policy_UsbKeepsAwake(&h, 1, 0, 1, 0, ENUM);
-    Policy_UsbKeepsAwake(&h, 1, 0, 0, ENUM - 2, ENUM);   /* перечислился в последний миг */
-    Policy_UsbKeepsAwake(&h, 1, 1, 0, 1, ENUM);
-    equ(Policy_UsbKeepsAwake(&h, 1, 0, 0, ENUM - 1, ENUM), 1, "хост уснул — ещё ждём");
-    equ(Policy_UsbKeepsAwake(&h, 1, 0, 0, 1, ENUM), 0, "хост спит дольше потолка — спим и мы");
+    Policy_UsbKeepsAwake(&h, 1, 1, 1, 0, ++blk, 0, ENUM, IDLE);
+    equ(Policy_UsbKeepsAwake(&h, 1, 1, 0, 0, blk, ENUM + 1, ENUM, IDLE), 1,
+        "хост уснул — это молчание сессии, а не ожидание перечисления");
+    equ(Policy_UsbKeepsAwake(&h, 1, 1, 0, 0, blk, IDLE, ENUM, IDLE), 0,
+        "хост спит дольше потолка бездействия — спим и мы");
 
     /* Замер по расписанию, пока плата держится на шине (C8). */
     equ(Policy_MeasureDue(3599999U, 3600000U), 0, "интервал не прошёл — замера нет");
     equ(Policy_MeasureDue(3600000U, 3600000U), 1, "прошёл интервал — замер, не засыпая");
 
-    /* Вокруг USB-сессии не меряем: прибор в этот момент вынут из земли. */
-    equ(Policy_SkipMeasureForUsb(1, 0, 0), 1, "разбудила вставка кабеля — замера нет");
-    equ(Policy_SkipMeasureForUsb(0, 0, 1), 1, "хост держит сессию, подошёл час — замера нет");
-    equ(Policy_SkipMeasureForUsb(1, 1, 0), 0, "кнопка вместе с кабелем — человек просит замер");
-    equ(Policy_SkipMeasureForUsb(0, 1, 0), 0, "кнопка — замер");
-    equ(Policy_SkipMeasureForUsb(0, 0, 0), 0, "будильник, кабеля нет или это зарядка — замер");
+    /* Вокруг USB-сессии не меряем: прибор в этот момент вынут из земли.
+     * Признак сессии — поднятый стек (usb_started), тот же, по которому
+     * главный цикл решает, куда ложится запись. Потолок пропусков здесь
+     * заведомо не мешает — он проверяется ниже отдельно. */
+    const uint32_t MANY = 100U;
+    Policy_Usb k = {0};
+    equ(Policy_SkipMeasureForUsb(&k, 1, 0, 0, MANY), 1, "разбудила вставка кабеля — замера нет");
+    equ(Policy_SkipMeasureForUsb(&k, 0, 0, 1, MANY), 1, "идёт сессия, подошёл час — замера нет");
+    equ(Policy_SkipMeasureForUsb(&k, 1, 1, 0, MANY), 0, "кнопка вместе с кабелем — человек просит замер");
+    equ(Policy_SkipMeasureForUsb(&k, 0, 1, 0, MANY), 0, "кнопка — замер");
+    equ(Policy_SkipMeasureForUsb(&k, 0, 0, 0, MANY), 0, "будильник, кабеля нет или это зарядка — замер");
+
+    /* Счёт интервалов подряд без архива: пропуск считается, а обнуляет его
+     * только строка, ДОШЕДШАЯ ДО ФЛЕШ, — не сам факт замера. Замер при
+     * поднятом стеке уходит в очередь в ОЗУ (A3) и архива не пополняет. */
+    Policy_Usb n = {0};
+    Policy_SkipMeasureForUsb(&n, 0, 0, 1, MANY);
+    equ(n.skipped, 1U, "пропуск посчитан");
+    Policy_SkipMeasureForUsb(&n, 1, 0, 0, MANY);
+    equ(n.skipped, 2U, "пропуск на вставке кабеля тоже посчитан");
+    Policy_MeasureStored(&n, 0);
+    equ(n.skipped, 2U, "замер был, но лёг не на флеш — счёт не обнуляется");
+    Policy_MeasureStored(&n, 1);
+    equ(n.skipped, 0U, "строка легла на флеш — счёт с нуля");
+
+    /* Потолок пропусков действует на ОБЕИХ причинах. Фронты VBUS без хоста
+     * сессии не создают, и ограничить их уступкой нечем — ограничивает сам
+     * пропуск, иначе зарядка или дребезг EXTI отменяли бы архив насовсем. */
+    Policy_Usb e = {0};
+    equ(Policy_SkipMeasureForUsb(&e, 1, 0, 0, USB_SESSION_MAX_SKIPS), 1, "первый фронт VBUS — пропуск");
+    equ(Policy_SkipMeasureForUsb(&e, 1, 0, 0, USB_SESSION_MAX_SKIPS), 0, "фронт VBUS подряд — всё равно меряем");
+    Policy_Usb f = {0};
+    equ(Policy_SkipMeasureForUsb(&f, 0, 0, 1, USB_SESSION_MAX_SKIPS), 1, "первый интервал сессии — пропуск");
+    equ(Policy_SkipMeasureForUsb(&f, 0, 0, 1, USB_SESSION_MAX_SKIPS), 0, "второй интервал сессии — всё равно меряем");
+
+    /* Тип счёта согласован с типом потолка: при потолке больше 255 счёт в
+     * uint8_t завернулся бы, и потолок не сработал бы никогда. */
+    Policy_Usb big = {0};
+    uint32_t skips = 0;
+    for (uint32_t i = 0; i < 400U; i++)
+        if (Policy_SkipMeasureForUsb(&big, 0, 0, 1, 300U))
+            skips++;
+    equ(skips, 300U, "потолок больше 255 — счёт пропусков не заворачивается");
+
+    /* Замер важнее сессии (Р1): право на пропуск не бесконечно. */
+    Policy_Usb y = {0};
+    equ(Policy_SessionYieldsToMeasure(&y, 0, USB_SESSION_MAX_SKIPS), 0, "сессии нет — уступать нечему");
+    equ(Policy_SessionYieldsToMeasure(&y, 1, USB_SESSION_MAX_SKIPS), 0, "право на пропуск не исчерпано — держим");
+    Policy_SkipMeasureForUsb(&y, 0, 0, 1, USB_SESSION_MAX_SKIPS);   /* интервал без записи */
+    equ(Policy_SessionYieldsToMeasure(&y, 1, USB_SESSION_MAX_SKIPS), 1, "право исчерпано — сессия уступает");
+
+    /* Уступив, сессия израсходовала и свой шанс: иначе стек поднялся бы
+     * снова на следующем пробуждении и съеденные интервалы пошли бы по кругу. */
+    uint8_t again = 0;
+    for (int hour = 0; hour < 24; hour++)
+        again = (uint8_t)(again | Policy_UsbKeepsAwake(&y, 1, 0, 0, 0, blk, 100U, ENUM, IDLE));
+    equ(again, 0, "после уступки стек не поднимается снова");
+}
+
+/* ------------------------------------------------ связка с главным циклом */
+
+/* Правила по отдельности бывают зелёными и там, где прибор всё равно теряет
+ * архив: дыра получается на СТЫКЕ — одно правило считало сессию по
+ * dev_state, другое по поднятому стеку, и в SUSPENDED они расходились.
+ * Поэтому здесь модель самого потока main.c (SleepUntilNextSample плюс
+ * главный цикл) поверх настоящих правил: те же ветки и тот же порядок,
+ * включая SUSPENDED посреди сессии (стек поднят, CONFIGURED снят) и фронты
+ * на входе VBUS. Не моделируются просевшее питание и отказы флеш — у них
+ * свои правила (storage_policy.h) и свои тесты. */
+typedef struct {
+    uint8_t  vbus;            /* VBUS есть всё время прогона */
+    uint8_t  host_alive;      /* хост отвечает и читает том */
+    uint8_t  host_stuck;      /* CONFIGURED залип навсегда: хост пропал без suspend */
+    uint32_t host_period_ms;  /* как часто хост трогает том */
+    uint32_t host_burst_ms;   /* сколько длится обращение */
+    uint32_t vbus_edge_ms;    /* период фронтов на входе VBUS (0 — нет) */
+} MlScen;
+
+typedef struct {
+    uint32_t flash;      /* строк, легших на флеш */
+    uint32_t ram;        /* строк, ушедших в очередь в ОЗУ */
+    uint32_t worst_gap;  /* худшая дыра: интервалов подряд без строки на флеш */
+    uint32_t starts;     /* подъёмов стека USB */
+    uint32_t blocks;     /* секторов, отданных хосту */
+} MlOut;
+
+#define ML_ENUM_LAG_MS  3000U    /* перечисление и монтирование тома хостом */
+#define ML_STEP_MS      10U
+
+static const MlScen *ml_sc;
+static uint64_t ml_t, ml_t_stack, ml_next_edge;
+static uint32_t ml_blocks;
+static uint8_t  ml_started, ml_woke_vbus;
+
+/* Читает ли хост том прямо сейчас (это и двигает usb_host_blocks). */
+static uint8_t ml_reads(void)
+{
+    if (!ml_sc->host_alive || !ml_started)
+        return 0;
+    if (ml_t < ml_t_stack + ML_ENUM_LAG_MS)
+        return 1;
+    return (uint8_t)(((uint32_t)(ml_t - ml_t_stack - ML_ENUM_LAG_MS) % ml_sc->host_period_ms)
+                     < ml_sc->host_burst_ms);
+}
+
+/* dev_state == USBD_STATE_CONFIGURED. Между обращениями хост уходит в
+ * selective suspend, то есть CONFIGURED снимается при поднятом стеке. */
+static uint8_t ml_configured(void)
+{
+    if (!ml_started)
+        return 0;
+    if (ml_sc->host_stuck)
+        return 1;
+    return ml_reads();
+}
+
+static void ml_advance(uint32_t dt_ms)
+{
+    for (uint32_t k = 0; k < dt_ms; k += ML_STEP_MS)
+    {
+        if (!ml_sc->host_stuck && ml_reads())
+            ml_blocks++;
+        ml_t += ML_STEP_MS;
+        if (ml_sc->vbus_edge_ms && ml_t >= ml_next_edge)
+        {
+            ml_woke_vbus = 1;
+            ml_next_edge += ml_sc->vbus_edge_ms;
+        }
+    }
+}
+
+static void ml_run(const MlScen *sc, uint32_t hours, MlOut *out)
+{
+    const uint32_t POLL_MS = 100U, START_MS = 2000U, MEAS_MS = 2000U;
+    const uint32_t INTERVAL_MS = 3600000UL;   /* RTC_WAKEUP_INTERVAL_SEC */
+    Policy_Usb    up;
+    Policy_Button bp;
+    memset(&up, 0, sizeof up);
+    memset(&bp, 0, sizeof bp);
+
+    ml_sc = sc;
+    ml_t = 0; ml_t_stack = 0; ml_blocks = 0; ml_started = 0;
+    ml_woke_vbus = sc->vbus;                  /* кабель вставлен в момент ноль */
+    ml_next_edge = sc->vbus_edge_ms;
+    memset(out, 0, sizeof *out);
+
+    uint32_t gap = 0;
+    uint64_t stop = (uint64_t)hours * 3600000ULL;
+    uint8_t  first = 1;
+
+    while (ml_t < stop)
+    {
+        if (!first)
+        {
+            /* --- SleepUntilNextSample() --- */
+            uint64_t t_prev = ml_t, t_awake = ml_t;
+            uint8_t  vbus_edge = ml_woke_vbus, due = 0;
+            ml_woke_vbus = 0;
+            for (;;)
+            {
+                uint8_t  cfg = ml_configured();
+                uint64_t now = ml_t;
+                uint8_t  btn_awake = Policy_ButtonKeepsAwake(&bp, 0, (uint32_t)(now - t_prev),
+                                                             300000U);
+                uint8_t  usb_awake = Policy_UsbKeepsAwake(&up, sc->vbus, ml_started, cfg,
+                                                          vbus_edge, ml_blocks,
+                                                          (uint32_t)(now - t_prev),
+                                                          USB_ENUM_MAX_MS,
+                                                          USB_SESSION_IDLE_MAX_MS);
+                t_prev = now;
+                vbus_edge = ml_woke_vbus;
+                ml_woke_vbus = 0;
+
+                if (!btn_awake && !usb_awake)
+                    break;
+
+                if (usb_awake && !ml_started)
+                {
+                    ml_started = 1;
+                    out->starts++;
+                    ml_t_stack = ml_t;
+                    ml_advance(START_MS);   /* сборка тома и подъём стека */
+                    t_prev = ml_t;
+                }
+
+                if (Policy_MeasureDue((uint32_t)(now - t_awake), INTERVAL_MS))
+                {
+                    if (Policy_SessionYieldsToMeasure(&up, ml_started, USB_SESSION_MAX_SKIPS))
+                        ml_started = 0;     /* Usb_Stop() */
+                    due = 1;
+                    break;
+                }
+                ml_advance(POLL_MS);
+            }
+
+            if (!due)
+            {
+                ml_started = 0;             /* Usb_Stop() перед сном */
+                uint64_t wake = ml_t + INTERVAL_MS;
+                if (sc->vbus_edge_ms && ml_next_edge < wake)
+                {
+                    wake = ml_next_edge;    /* фронт VBUS будит раньше будильника */
+                    ml_next_edge += sc->vbus_edge_ms;
+                    ml_woke_vbus = 1;
+                }
+                ml_t = wake;
+            }
+        }
+        first = 0;
+
+        if (Policy_SkipMeasureForUsb(&up, ml_woke_vbus, 0, ml_started, USB_SESSION_MAX_SKIPS))
+        {
+            if (++gap > out->worst_gap)
+                out->worst_gap = gap;
+            continue;
+        }
+
+        ml_advance(MEAS_MS);
+        /* Поднят стек — флеш отдана хосту, и строка уходит в очередь в ОЗУ. */
+        uint8_t stored = ml_started ? 0U : 1U;
+        Policy_MeasureStored(&up, stored);
+        if (stored)
+        {
+            out->flash++;
+            gap = 0;
+        }
+        else
+        {
+            out->ram++;
+            if (++gap > out->worst_gap)
+                out->worst_gap = gap;
+        }
+    }
+    out->blocks = ml_blocks;
+}
+
+static void test_usb_main_loop(void)
+{
+    const uint32_t HOURS = 48U;
+    MlScen sc;
+    MlOut  r;
+
+    puts("Связка правил с главным циклом main.c");
+
+    /* Контроль: USB нет вовсе — архив должен расти каждый интервал. */
+    memset(&sc, 0, sizeof sc);
+    sc.host_period_ms = 60000U; sc.host_burst_ms = 2000U;
+    ml_run(&sc, HOURS, &r);
+    equ(r.worst_gap, 0U, "USB нет — ни одного интервала без записи");
+    ok(r.flash >= HOURS, "USB нет — строка каждый интервал");
+
+    /* Исходный дефект: хост пропал, не закрыв сессию, CONFIGURED залип. */
+    memset(&sc, 0, sizeof sc);
+    sc.vbus = 1; sc.host_stuck = 1; sc.host_period_ms = 60000U; sc.host_burst_ms = 2000U;
+    ml_run(&sc, HOURS, &r);
+    equ(r.worst_gap, USB_SESSION_MAX_SKIPS, "залипший CONFIGURED — дыра не больше интервала");
+    equ(r.ram, 0U, "залипший CONFIGURED — ни одной строки в ОЗУ");
+
+    /* Честная выгрузка 10 с, потом кабель забыт в живом хосте. Выгрузка
+     * должна пройти целиком: прервать её потолком было бы хуже дефекта. */
+    memset(&sc, 0, sizeof sc);
+    sc.vbus = 1; sc.host_alive = 1;
+    sc.host_period_ms = 3600000UL * HOURS; sc.host_burst_ms = 10000U;
+    ml_run(&sc, HOURS, &r);
+    equ(r.worst_gap, USB_SESSION_MAX_SKIPS, "кабель забыт в живом хосте — дыра не больше интервала");
+    ok(r.blocks >= (ML_ENUM_LAG_MS + 10000U) / ML_STEP_MS,
+       "честная выгрузка 10 с прошла целиком");
+
+    /* Хост читает почти непрерывно — честное долгое чтение. */
+    memset(&sc, 0, sizeof sc);
+    sc.vbus = 1; sc.host_alive = 1; sc.host_period_ms = 60000U; sc.host_burst_ms = 59000U;
+    ml_run(&sc, HOURS, &r);
+    equ(r.worst_gap, USB_SESSION_MAX_SKIPS, "непрерывное чтение — дыра не больше интервала");
+
+    /* Хост трогает том реже потолка бездействия, между обращениями —
+     * selective suspend (целевой хост заказчика, Android). Это та самая
+     * ветка, на которой расхождение признака сессии давало пустой архив и
+     * непрерывное бодрствование; фаза опроса перебирается, потому что
+     * дефект проявлялся не на всех фазах. */
+    uint32_t worst_any = 0, ram_any = 0, flash_min = 0xFFFFFFFFU;
+    for (uint32_t per = 30000U; per <= 115000U; per += 5000U)
+    {
+        memset(&sc, 0, sizeof sc);
+        sc.vbus = 1; sc.host_alive = 1; sc.host_period_ms = per; sc.host_burst_ms = 2000U;
+        ml_run(&sc, HOURS, &r);
+        if (r.worst_gap > worst_any) worst_any = r.worst_gap;
+        ram_any += r.ram;
+        if (r.flash < flash_min) flash_min = r.flash;
+    }
+    equ(worst_any, USB_SESSION_MAX_SKIPS, "SUSPENDED посреди сессии, любая фаза — дыра не больше интервала");
+    equ(ram_any, 0U, "SUSPENDED посреди сессии — ни одной строки в ОЗУ");
+    ok(flash_min >= HOURS - 2U, "SUSPENDED посреди сессии — архив растёт каждый интервал");
+
+    /* Фронты на входе VBUS без хоста: зарядка, пауэрбанк, влага на делителе,
+     * дребезг фронтового EXTI. Частоту перебираем — именно здесь пропуск
+     * разрешался бесконечно и за двое суток оставалась ОДНА строка. */
+    uint32_t worst_edge = 0, flash_edge_min = 0xFFFFFFFFU;
+    for (uint32_t min = 5U; min <= 115U; min += 5U)
+    {
+        memset(&sc, 0, sizeof sc);
+        sc.vbus = 1; sc.host_period_ms = 60000U; sc.host_burst_ms = 2000U;
+        sc.vbus_edge_ms = min * 60000U;
+        ml_run(&sc, HOURS, &r);
+        if (r.worst_gap > worst_edge) worst_edge = r.worst_gap;
+        if (r.flash < flash_edge_min) flash_edge_min = r.flash;
+    }
+    equ(worst_edge, USB_SESSION_MAX_SKIPS, "фронты VBUS любой частоты — дыра не больше интервала");
+    ok(flash_edge_min >= HOURS / 2U, "фронты VBUS любой частоты — архив всё равно растёт");
 }
 
 static void test_watchdog_policy(void)
@@ -2877,6 +3296,34 @@ static void test_vfat_volume(void)
            strstr(info, "old archive did not fit") != NULL, "info.txt: старый архив не влез, data_old.txt не упомянут");
     }
 
+    /* info.txt целиком влезает в сектор, причём в САМОМ худшем случае: все
+     * счётчики по десять цифр, недоверенные часы и весь необязательный хвост
+     * сразу. Сектор отдаётся хосту обрезанным по длине (VFat_Read), и строка
+     * самодиагностики обрубилась бы посередине ровно тогда, когда она и
+     * нужна. Любой новый текст в VFat_RenderInfo упирается в этот тест. */
+    {
+        VFat w = vf_vol;
+        char info[4096];                /* заведомо больше сектора */
+        w.state = VFAT_OK;
+        w.fw = "build Oct 29 2026 12:34:56";   /* __DATE__ " " __TIME__ */
+        w.n_meas = w.n_bad = w.n_skip = 0xFFFFFFFFU;
+        w.last_wf = w.last_lps = w.last_boot = 0xFFFFFFFFU;
+        w.n_import = w.imp_dropped = 0xFFFFFFFFU;
+        w.last_time_ok = 0;
+        w.slow = 1;
+        w.present[VFAT_FILE_OLD] = 1;
+        memcpy(w.first_ts, "2026-10-29 12:34:56", 20);
+        memcpy(w.last_ts, "2026-10-29 12:34:56", 20);
+        uint32_t n = VFat_RenderInfo(&w, info, sizeof(info));
+        ok(n < VFAT_SECTOR - 1U, "info.txt влезает в сектор и в худшем случае");
+        if (n >= VFAT_SECTOR - 1U)
+            printf("    худший info.txt: %lu Б при пределе %lu\n",
+                   (unsigned long)n, (unsigned long)(VFAT_SECTOR - 1U));
+        /* Запас на будущий текст: хотя бы десяток байт, иначе следующая
+         * строка снова упрётся в предел. */
+        ok(n + 16U < VFAT_SECTOR - 1U, "info.txt: остался запас на будущие строки");
+    }
+
     /* Журнал не открыт. */
     vf_scenario("no_archive", NULL, 0);
     LogRing closed = r;
@@ -3066,6 +3513,7 @@ int main(void)
     test_bmp280();
     test_sleep_policy();
     test_usb_policy();
+    test_usb_main_loop();
     test_watchdog_policy();
     test_quarantine_policy();
     test_storage_policy();

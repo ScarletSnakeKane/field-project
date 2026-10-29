@@ -84,12 +84,9 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 #define BTN_HOLD_POLL_MS   100U
 #define BTN_HOLD_MAX_MS    300000U   /* 5 минут */
 
-/* Сколько ждать, пока хост перечислит плату, прежде чем счесть VBUS зарядкой
- * (A9). Windows и Linux укладываются в 1–3 с от подачи подтяжки D+, Android —
- * до ~5 с; 10 с — с запасом. Цена на ложном VBUS — 10 с бодрствования на
- * каждый фронт VBUS (дальше VBUS считается зарядкой до его пропадания),
- * против ~10 мА непрерывно раньше. */
-#define USB_ENUM_MAX_MS    10000U
+/* USB_ENUM_MAX_MS, USB_SESSION_IDLE_MAX_MS и USB_SESSION_MAX_SKIPS — в
+ * power_policy.h, рядом с правилом, которое их применяет, и под хостовыми
+ * тестами: иначе смена величины потолка тестами не замечается. */
 
 /* Шаг пинка сторожа во сне (A4): меньше худшего периода IWDG (~22 с при LSI
  * 47 кГц) с запасом. 3600 и 60 делятся на 15 нацело. Цена — пробуждение на
@@ -174,6 +171,9 @@ static LogOldVolume log_old;       /* разбор старого тома дл�
 static LogRecord    log_pending[LOG_PENDING_MAX];   /* очередь USB-сессии (A3) */
 static uint8_t      log_pending_n = 0;
 extern VFat         usb_vfat;      /* том для хоста (usbd_storage_if.c, vfat.h) */
+/* Секторы, отданные хосту (usbd_storage_if.c): по ним Policy_UsbKeepsAwake
+ * отличает живую сессию от брошенной пропавшим хостом. */
+extern volatile uint32_t usb_host_blocks;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -407,7 +407,12 @@ static uint8_t SleepUntilNextSample(void)
    * (btn_policy живёт вне этой функции), иначе залипшая KEY держала бы
    * плату по 5 минут каждый час; VBUS без хоста держит не дольше
    * USB_ENUM_MAX_MS — иначе USB-зарядка или влага на делителе не давали бы
-   * спать вовсе. */
+   * спать вовсе; перечисленная сессия — не дольше USB_SESSION_IDLE_MAX_MS
+   * молчания, иначе пропавший хост держал бы плату вечно (usb_policy тоже
+   * живёт вне этой функции: цикл перезапускается каждый час, когда подошёл
+   * замер, и счёт молчания не должен начинаться заново). Отсюда в правило
+   * уходят только сырые признаки — уровни, состояние стека и счётчик
+   * отданных секторов; решения не принимаются здесь ни одного. */
   uint32_t t_prev  = HAL_GetTick();
   uint32_t t_awake = t_prev;   /* замер только что был — отсчёт интервала отсюда */
   uint8_t  vbus_edge = woke_by_vbus;
@@ -420,8 +425,10 @@ static uint8_t SleepUntilNextSample(void)
 
       uint32_t now = HAL_GetTick();
       uint8_t btn_awake = Policy_ButtonKeepsAwake(&btn_policy, btn_held, now - t_prev, BTN_HOLD_MAX_MS);
-      uint8_t usb_awake = Policy_UsbKeepsAwake(&usb_policy, usb_present, usb_config,
-                                               vbus_edge, now - t_prev, USB_ENUM_MAX_MS);
+      uint8_t usb_awake = Policy_UsbKeepsAwake(&usb_policy, usb_present, usb_started,
+                                               usb_config, vbus_edge, usb_host_blocks,
+                                               now - t_prev,
+                                               USB_ENUM_MAX_MS, USB_SESSION_IDLE_MAX_MS);
       t_prev = now;
       vbus_edge = woke_by_vbus;   /* фронт за время ожидания — новый шанс хосту */
       woke_by_vbus = 0;
@@ -442,7 +449,22 @@ static uint8_t SleepUntilNextSample(void)
       }
 
       if (Policy_MeasureDue(now - t_awake, RTC_WAKEUP_INTERVAL_SEC * 1000UL))
+      {
+          /* Замер важнее сессии (Р1). Пропустить его вокруг сессии можно, но
+           * считаное число раз: пропуск не кладёт строку ни на флеш, ни в
+           * очередь, и хост, трогающий том чаще потолка бездействия, иначе
+           * повторил бы исходный симптом «часы идут, архива нет». Исчерпав
+           * право на пропуск, сессия гаснет здесь же, и замер уходит на флеш
+           * сразу — не через интервал. Правило и счёт — в
+           * Policy_SessionYieldsToMeasure.
+           * Признак сессии здесь — usb_started, ровно тот же, по которому
+           * ниже запись уходит в очередь в ОЗУ вместо флеш, и НЕ usb_config:
+           * в SUSPENDED стек поднят, а CONFIGURED снят, и по usb_config
+           * уступка не срабатывала бы никогда (см. power_policy.h). */
+          if (Policy_SessionYieldsToMeasure(&usb_policy, usb_started, USB_SESSION_MAX_SKIPS))
+              Usb_Stop();
           return 0;
+      }
 
       /* Ждём во сне ядра (WFI), а не в занятом цикле HAL_Delay: SysTick будит
        * каждую миллисекунду, а между тиками ядро не жжёт ток впустую. */
@@ -450,22 +472,30 @@ static uint8_t SleepUntilNextSample(void)
           __WFI();
   }
 
+  /* Гасим USB-стек, если он поднимался, — ПЕРВЫМ делом, до усыпления флеш.
+   * Досюда мы доходим, когда у хоста больше нет права держать плату: он не
+   * перечислился или исчерпал потолок молчания (USB_SESSION_IDLE_MAX_MS). В
+   * последнем случае CONFIGURED может быть ещё взведено, и гасим мы живое с
+   * виду состояние — иначе выход из цикла удержания закрыт навсегда. Полный
+   * DeInit здесь обязателен именно поэтому: он снимает usb_started и
+   * сбрасывает dev_state, так что следующий подъём стека начинается с чистого
+   * состояния. Порядок важен: пока стек жив, хост вправе прислать READ10, а
+   * усыплённая флеш отвечает на него USBD_FAIL, то есть хост получает STALL и
+   * ошибку ввода-вывода вместо чистого отключения. Сначала уходим с шины,
+   * потом гасим носитель. Аналоговая часть трансивера OTG FS питается от VDD
+   * и продолжает потреблять в STOP, даже когда тактирование снято. */
+  if (usb_started)
+      Usb_Stop();
+
   /* Флеш — на постоянном питании, гасить её нечем, кроме Deep Power-Down.
-   * Делаем это только сейчас: пока шла USB-сессия (условие выше),
-   * хост мог читать диск, и усыплять флеш было нельзя. */
+   * Делаем это только сейчас: пока шла USB-сессия, хост мог читать диск,
+   * и усыплять флеш было нельзя. */
   SPI_Flash_DeepPowerDown();
 
   /* Гасим периферию шин. Порядок важен: SPI деинициализируем строго ПОСЛЕ
    * команды Deep Power-Down выше — иначе её нечем было бы отправить. */
   HAL_SPI_DeInit(&hspi1);
   HAL_I2C_DeInit(&hi2c1);
-
-  /* Гасим USB-стек, если он поднимался. Досюда мы доходим только когда
-   * хост не держит сессию, и рвать нечего. Аналоговая часть трансивера OTG FS
-   * питается от VDD и продолжает потреблять в STOP, даже когда тактирование
-   * снято. */
-  if (usb_started)
-      Usb_Stop();
 
   /* Парковка выводов — строго ПОСЛЕ всех деинициализаций. Каждая из них внутри
    * себя дёргает HAL_GPIO_DeInit и возвращает свои выводы в плавающий вход,
@@ -766,9 +796,15 @@ int main(void)
 	  /* Вокруг USB-сессии не меряем (Policy_SkipMeasureForUsb): к телефону
 	   * прибор подключают вынутым из земли. Разбудила вставка кабеля —
 	   * woke_by_vbus не сбрасываем, его заберёт цикл удержания и поднимет USB;
-	   * хост держит сессию и подошёл час — просто ждём дальше на шине. */
-	  if (Policy_SkipMeasureForUsb(woke_by_vbus, woke_by_button,
-	                               usb_started && hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED))
+	   * хост держит сессию и подошёл час — просто ждём дальше на шине. Там же
+	   * считаются интервалы подряд, кончившиеся без записи, и там же стоит
+	   * потолок на пропуски — по этому счёту цикл удержания гасит
+	   * затянувшуюся сессию (Р1). Признак сессии — usb_started, тот же, что
+	   * решает судьбу записи ниже: по dev_state == CONFIGURED пропуск
+	   * «засчитывался» в SUSPENDED как состоявшийся замер, а строка при этом
+	   * уходила в ОЗУ. */
+	  if (Policy_SkipMeasureForUsb(&usb_policy, woke_by_vbus, woke_by_button,
+	                               usb_started, USB_SESSION_MAX_SKIPS))
 	      continue;
 
 	  /* Карантин питания датчиков (дизайн v2, ТЗ п. 16). Залитый разъём или
@@ -929,11 +965,24 @@ int main(void)
 	  LogRecord rec;
 	  LogRecord_PackMeas(&rec, &meas);
 
+	  /* Легла ли строка этого замера на флеш. Очередь в ОЗУ, пропуск по
+	   * просевшему питанию и отказ записи записью не считаются — на этом
+	   * стоит счёт интервалов без архива (Policy_MeasureStored). */
+	  uint8_t stored = 0;
+
 	  if (usb_started)
 	  {
-	      /* Идёт USB-сессия (замер пришёлся на время, когда хост держит
-	       * плату, C8): флеш отдаётся хосту, журнал её не трогает (A3).
-	       * Запись ждёт в RAM и уйдёт на флеш в первом цикле после сессии.
+	      /* Стек поднят: флеш отдана хосту, журнал её не трогает (A3), и
+	       * запись ждёт в RAM.
+	       * Сессионным путём сюда больше не попадают. При
+	       * USB_SESSION_MAX_SKIPS == 1 замер во время сессии либо
+	       * пропускается (первый интервал), либо приходит уже после того, как
+	       * уступка погасила стек (Policy_SessionYieldsToMeasure), то есть
+	       * usb_started к этому моменту ноль. Ветка остаётся как страховка на
+	       * случай поднятого потолка пропусков или нового пути, где стек
+	       * остался поднятым, — и очередь по-прежнему нужна сама по себе: её
+	       * наполняет отказ записи (Storage_RequeueFailed ниже), а
+	       * опорожняет первый же удачный цикл.
 	       * Очередь полна — замер теряется, и это видно по write_fails. */
 	      if (log_pending_n < LOG_PENDING_MAX)
 	          log_pending[log_pending_n++] = rec;
@@ -987,9 +1036,10 @@ int main(void)
 	      uint8_t was_open = fs_ok;
 	      if (log_pending_n == 0U)
 	      {
-	          if (!Archive_Append(&rec) &&
-	              Storage_RequeueFailed(was_open, log_ring.mounted) &&
-	              log_pending_n < LOG_PENDING_MAX)
+	          if (Archive_Append(&rec))
+	              stored = 1;
+	          else if (Storage_RequeueFailed(was_open, log_ring.mounted) &&
+	                   log_pending_n < LOG_PENDING_MAX)
 	              log_pending[log_pending_n++] = rec;
 	      }
 	      else if (log_pending_n < LOG_PENDING_MAX)
@@ -997,6 +1047,11 @@ int main(void)
 	      else
 	          write_fails++;
 	  }
+
+	  /* Счёт интервалов подряд без архива обнуляет только строка, дошедшая до
+	   * флеш: по нему цикл удержания решает, пора ли гасить сессию, и «замер
+	   * был, но лёг в ОЗУ» этот счёт обнулять не вправе. */
+	  Policy_MeasureStored(&usb_policy, stored);
 
 	  /* Здесь же снимается и флаг, выставленный при старте (см. блок журнала). */
 	  SPI_Flash_SetBusy(0);

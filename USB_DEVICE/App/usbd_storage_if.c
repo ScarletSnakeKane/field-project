@@ -150,6 +150,15 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 /* USER CODE BEGIN EXPORTED_VARIABLES */
 /* Собирает main.c (Usb_Start) до подъёма стека, читает только Read ниже. */
 VFat usb_vfat;
+
+/* Сколько секторов ушло хосту за всё время. Единственный честный признак
+ * того, что хост на месте: состояние CONFIGURED он оставляет за собой и
+ * пропав (vbus_sensing выключен), а TEST UNIT READY ещё ничего не говорит о
+ * том, что кто-то читает данные. По изменению этого счётчика цикл удержания
+ * в main.c отличает идущее копирование от брошенной сессии
+ * (Policy_UsbKeepsAwake, idle_max_ms). Растёт только в прерывании USB; слово
+ * читается одной инструкцией, поэтому сверх volatile защиты не нужно. */
+volatile uint32_t usb_host_blocks = 0;
 /* USER CODE END EXPORTED_VARIABLES */
 
 /**
@@ -305,6 +314,10 @@ int8_t STORAGE_Read_FS(uint8_t lun, uint8_t *buf, uint32_t blk_addr, uint16_t bl
       return USBD_FAIL;
     if (!VFat_Read(&usb_vfat, blk_addr + k, buf + (uint32_t)k * SECTOR_SIZE))
       return USBD_FAIL;
+
+    /* Отметка живой сессии — здесь, а не на входе в команду: сектор
+     * действительно собран и уходит хосту. */
+    usb_host_blocks++;
   }
 
   return USBD_OK;
